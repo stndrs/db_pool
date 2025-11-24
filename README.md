@@ -4,13 +4,32 @@
 [![Hex Docs](https://img.shields.io/badge/hex-docs-ffaff3)](https://hexdocs.pm/db_pool/)
 
 ```sh
-gleam add db_pool@1
+gleam add db_pool
 ```
 ```gleam
-import db_pool
+import database
+import db/pool
+import gleam/erlang/process
 
 pub fn main() -> Nil {
-  // TODO: An example of the project in use
+  let db_pool =
+    pool.new()
+    |> pool.size(5)
+    |> pool.on_open(database.open)
+    |> pool.on_close(database.close)
+    |> pool.on_ping(database.ping)
+
+  let assert Ok(_) = pool.start(db_pool, 1000)
+
+  let self = process.self()
+
+  let assert Ok(conn) = pool.checkout(db_pool, self, 500)
+
+  let assert Ok(users) = database.query("SELECT * FROM users", conn)
+
+  pool.checkin(db_pool, conn, self)
+
+  let assert Ok(_) = pool.shutdown(new_pool, 1000)
 }
 ```
 
