@@ -3,9 +3,6 @@
 [![Package Version](https://img.shields.io/hexpm/v/db_pool)](https://hex.pm/packages/db_pool)
 [![Hex Docs](https://img.shields.io/badge/hex-docs-ffaff3)](https://hexdocs.pm/db_pool/)
 
-```sh
-gleam add db_pool
-```
 ```gleam
 import database
 import db/pool
@@ -32,6 +29,10 @@ pub fn main() -> Nil {
   let assert Ok(_) = pool.shutdown(new_pool, 1000)
 }
 ```
+
+## Installation
+
+TODO
 
 Further documentation can be found at <https://hexdocs.pm/db_pool>.
 
