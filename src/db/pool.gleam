@@ -11,7 +11,6 @@ import gleam/result
 
 pub opaque type Pool(conn) {
   Pool(
-    np: process.Name(Msg(conn)),
     size: Int,
     handle_open: fn() -> Result(conn, String),
     handle_close: fn(conn) -> Nil,
@@ -24,13 +23,7 @@ pub fn new() -> Pool(conn) {
   let handle_close = fn(_) { Nil }
   let handle_ping = fn(_) { Nil }
 
-  Pool(
-    np: process.new_name("db_pool"),
-    size: 5,
-    handle_open:,
-    handle_close:,
-    handle_ping:,
-  )
+  Pool(size: 5, handle_open:, handle_close:, handle_ping:)
 }
 
 pub fn size(pool: Pool(conn), size: Int) -> Pool(conn) {
@@ -52,38 +45,44 @@ pub fn on_ping(pool: Pool(conn), handle_ping: fn(conn) -> Nil) -> Pool(conn) {
   Pool(..pool, handle_ping:)
 }
 
-pub fn start(pool: Pool(conn), timeout: Int) -> actor.StartResult(Pool(conn)) {
-  actor.new_with_initialiser(timeout, fn(subj) {
-    process.new_selector()
-    |> process.select(subj)
-    |> process.select_trapped_exits(PoolExit)
-    |> initialise_pool(pool)
-  })
-  |> actor.named(pool.np)
+pub fn start(
+  pool: Pool(conn),
+  timeout: Int,
+) -> Result(Subject(Msg(conn)), actor.StartError) {
+  actor.new_with_initialiser(timeout, initialise_pool(_, pool))
   |> actor.on_message(handle_message)
   |> actor.start
   |> result.map(fn(started) {
-    let subj = process.named_subject(pool.np)
+    let subj = started.data
 
-    process.send(subj, Ping(subj, timeout))
+    process.send(subj, Ping(subj, 1000))
 
-    started
+    subj
   })
 }
 
 pub fn supervised(
   pool: Pool(conn),
+  name: process.Name(Msg(conn)),
   timeout: Int,
-) -> supervision.ChildSpecification(Pool(conn)) {
-  supervision.worker(fn() { start(pool, timeout) })
+) -> supervision.ChildSpecification(Subject(Msg(conn))) {
+  supervision.worker(fn() {
+    actor.new_with_initialiser(timeout, initialise_pool(_, pool))
+    |> actor.on_message(handle_message)
+    |> actor.named(name)
+    |> actor.start
+  })
   |> supervision.timeout(timeout)
   |> supervision.restart(supervision.Transient)
 }
 
 fn initialise_pool(
-  selector: process.Selector(Msg(conn)),
+  self: Subject(Msg(conn)),
   pool: Pool(conn),
-) -> Result(actor.Initialised(State(conn), Msg(conn), Pool(conn)), String) {
+) -> Result(
+  actor.Initialised(State(conn), Msg(conn), Subject(Msg(conn))),
+  String,
+) {
   let resources = {
     list.repeat("", pool.size)
     |> list.try_map(fn(_) { pool.handle_open() })
@@ -91,6 +90,13 @@ fn initialise_pool(
   }
 
   use resources <- result.map(resources)
+
+  process.trap_exits(True)
+
+  let selector =
+    process.new_selector()
+    |> process.select(self)
+    |> process.select_trapped_exits(PoolExit)
 
   State(
     selector:,
@@ -105,7 +111,7 @@ fn initialise_pool(
   )
   |> actor.initialised
   |> actor.selecting(selector)
-  |> actor.returning(pool)
+  |> actor.returning(self)
 }
 
 type State(conn) {
@@ -163,7 +169,7 @@ type Waiting(conn) {
   )
 }
 
-type Msg(conn) {
+pub opaque type Msg(conn) {
   Ping(subject: Subject(Msg(conn)), timeout: Int)
   CheckIn(conn: conn, caller: Pid)
   CheckOut(client: Subject(Result(conn, String)), caller: Pid)
@@ -173,22 +179,19 @@ type Msg(conn) {
 }
 
 pub fn checkout(
-  pool: Pool(conn),
+  pool: Subject(Msg(conn)),
   caller: Pid,
   timeout: Int,
 ) -> Result(conn, String) {
-  process.named_subject(pool.np)
-  |> process.call(timeout, CheckOut(_, caller:))
+  process.call(pool, timeout, CheckOut(_, caller:))
 }
 
-pub fn checkin(pool: Pool(conn), conn: conn, caller: Pid) -> Nil {
-  process.named_subject(pool.np)
-  |> process.send(CheckIn(conn:, caller:))
+pub fn checkin(pool: Subject(Msg(conn)), conn: conn, caller: Pid) -> Nil {
+  process.send(pool, CheckIn(conn:, caller:))
 }
 
-pub fn shutdown(pool: Pool(conn), timeout: Int) -> Result(Nil, String) {
-  process.named_subject(pool.np)
-  |> process.call(timeout, Shutdown)
+pub fn shutdown(pool: Subject(Msg(conn)), timeout: Int) -> Result(Nil, String) {
+  process.call(pool, timeout, Shutdown)
 }
 
 fn handle_message(
@@ -230,15 +233,15 @@ fn handle_checkin(
 ) -> actor.Next(State(conn), Msg(conn)) {
   let state =
     state
-    |> handle_live_connection(Some(conn), None, caller)
+    |> handle_live_connection(Some(conn), caller)
     |> result.unwrap(state)
 
   actor.continue(state)
   |> actor.with_selector(state.selector)
 }
 
-// Validates `conn` and `monitor` against the `live` value.
-// When either of them have `Some` value, they are compared against the
+// Validates `conn` against the `live` value.
+// When there is `Some(conn)` value, it is compared against the
 // relevant `live` value.
 // After passing validation, deselect the monitor of the current `live`
 // value.
@@ -248,37 +251,45 @@ fn handle_checkin(
 fn handle_live_connection(
   state: State(conn),
   conn: Option(conn),
-  monitor: Option(process.Monitor),
   caller: Pid,
 ) -> Result(State(conn), Nil) {
-  use live <- result.try(dict.get(state.live, caller))
+  case dict.get(state.live, caller) {
+    Error(_) -> Ok(state)
+    Ok(live) -> {
+      use current <- result.map(validate_conn(live, conn))
 
-  use current <- result.try(validate_conn(live, conn))
-  use current <- result.map(validate_monitor(current, monitor))
+      state.queue
+      |> dequeue(
+        with: fn(waiting) {
+          let conn = current.conn
 
-  dequeue(
-    state.queue,
-    with: fn(waiting) {
-      let conn = current.conn
+          actor.send(waiting.client, Ok(conn))
 
-      actor.send(waiting.client, Ok(conn))
+          let live =
+            state.live
+            |> dict.delete(caller)
+            |> dict.insert(
+              waiting.caller,
+              Live(conn:, monitor: waiting.monitor),
+            )
 
-      let live =
-        state.live
-        |> dict.delete(caller)
-        |> dict.insert(waiting.caller, Live(conn:, monitor: waiting.monitor))
+          State(..state, live:)
+        },
+        or_else: fn() {
+          let selector =
+            process.deselect_specific_monitor(state.selector, current.monitor)
 
-      State(..state, live:)
-    },
-    or_else: fn() {
-      let selector =
-        process.deselect_specific_monitor(state.selector, current.monitor)
+          let live =
+            state.live
+            |> dict.delete(caller)
 
-      let idle = list.prepend(state.idle, current.conn)
+          let idle = list.prepend(state.idle, current.conn)
 
-      State(..state, selector:, idle:)
-    },
-  )
+          State(..state, selector:, idle:, live:)
+        },
+      )
+    }
+  }
 }
 
 fn validate_conn(
@@ -288,20 +299,6 @@ fn validate_conn(
   case conn {
     Some(conn) -> {
       use <- bool.guard({ conn == live.conn }, Ok(live))
-
-      Error(Nil)
-    }
-    None -> Ok(live)
-  }
-}
-
-fn validate_monitor(
-  live: Live(conn),
-  monitor: Option(process.Monitor),
-) -> Result(Live(conn), Nil) {
-  case monitor {
-    Some(mon) -> {
-      use <- bool.guard({ mon == live.monitor }, Ok(live))
 
       Error(Nil)
     }
@@ -377,24 +374,15 @@ fn handle_caller_down(
   state: State(conn),
   down: process.Down,
 ) -> actor.Next(State(conn), Msg(conn)) {
-  case down {
-    process.ProcessDown(monitor:, pid:, reason: _) -> {
-      let state =
-        state
-        |> handle_live_connection(None, Some(monitor), pid)
-        |> result.lazy_unwrap(fn() {
-          let selector =
-            process.deselect_specific_monitor(state.selector, monitor)
+  let assert process.ProcessDown(pid:, ..) = down
 
-          State(..state, selector:)
-        })
+  let state =
+    state
+    |> handle_live_connection(None, pid)
+    |> result.unwrap(state)
 
-      actor.continue(state)
-      |> actor.with_selector(state.selector)
-    }
-    process.PortDown(_monitor, _port, _reason) ->
-      panic as "Unexpected down process"
-  }
+  actor.continue(state)
+  |> actor.with_selector(state.selector)
 }
 
 fn handle_shutdown(
