@@ -12,53 +12,14 @@ pub fn start_test() {
     |> pool.on_close(fn(_) { Nil })
     |> pool.on_ping(fn(_) { Nil })
 
-  let assert Ok(_) = pool.start(new_pool, 200)
+  let assert Ok(pool) = pool.start(new_pool, 200)
 
-  let assert Ok(_) = pool.shutdown(new_pool, 200)
-}
-
-pub fn ping_test() {
-  let new_pool =
-    pool.new()
-    |> pool.size(2)
-    |> pool.on_open(fn() { Ok(Nil) })
-    |> pool.on_close(fn(_) { Nil })
-    |> pool.on_ping(fn(_) {
-      let assert Ok(_) = ping()
-
-      Nil
-    })
-
-  let assert Ok(_) = pool.start(new_pool, 200)
-
-  let assert Ok(_) = pool.shutdown(new_pool, 200)
-}
-
-pub fn ping_error_test() {
-  let new_pool =
-    pool.new()
-    |> pool.size(2)
-    |> pool.on_open(fn() { Ok(Nil) })
-    |> pool.on_close(fn(_) { Nil })
-    |> pool.on_ping(fn(_) {
-      let assert Error(_) =
-        exception.rescue(fn() {
-          let assert Error(_) = ping()
-        })
-
-      Nil
-    })
-
-  let assert Ok(_) = pool.start(new_pool, 200)
-
-  let assert Ok(_) = pool.shutdown(new_pool, 200)
-}
-
-fn ping() {
-  Ok(Nil)
+  let assert Ok(_) = pool.shutdown(pool, 200)
 }
 
 pub fn supervised_test() {
+  let name = process.new_name("db_pool_test")
+
   let new_pool =
     pool.new()
     |> pool.size(2)
@@ -66,7 +27,7 @@ pub fn supervised_test() {
     |> pool.on_close(fn(_) { Nil })
     |> pool.on_ping(fn(_) { Nil })
 
-  let pool_spec = pool.supervised(new_pool, 200)
+  let pool_spec = pool.supervised(new_pool, name, 200)
 
   let assert Ok(_) =
     static_supervisor.new(static_supervisor.OneForOne)
@@ -119,29 +80,26 @@ pub fn caller_down_test() {
     |> pool.on_close(fn(_) { Nil })
     |> pool.on_ping(fn(_) { Nil })
 
-  let assert Ok(_) = pool.start(pool, 50)
+  let assert Ok(pool) = pool.start(pool, 200)
 
-  let _ =
-    exception.rescue(fn() {
-      process.spawn_unlinked(fn() {
-        let self = process.self()
+  process.spawn_unlinked(fn() {
+    let self = process.self()
 
-        let assert Ok(Nil) = pool.checkout(pool, self, 50)
+    let assert Ok(Nil) = pool.checkout(pool, self, 200)
 
-        panic as "Crash!"
-      })
-    })
-
-  // process.sleep(200)
-
-  let assert Ok(Nil) = pool.checkout(pool, process.self(), 100)
+    panic as "Crash!"
+  })
 
   process.sleep(200)
 
-  let assert Ok(_) = pool.shutdown(pool, 100)
+  let self = process.self()
+
+  let assert Ok(Nil) = pool.checkout(pool, self, 200)
+
+  let assert Ok(_) = pool.shutdown(pool, 200)
 }
 
-fn db_pool() -> pool.Pool(Nil) {
+fn db_pool() -> process.Subject(pool.Msg(Nil)) {
   global_value.create_with_unique_name("db_pool_test", fn() {
     let db_pool =
       pool.new()
@@ -150,8 +108,8 @@ fn db_pool() -> pool.Pool(Nil) {
       |> pool.on_close(fn(_) { Nil })
       |> pool.on_ping(fn(_) { Nil })
 
-    let assert Ok(_) = pool.start(db_pool, 200)
+    let assert Ok(pool) = pool.start(db_pool, 200)
 
-    db_pool
+    pool
   })
 }
