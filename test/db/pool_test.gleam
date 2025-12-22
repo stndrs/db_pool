@@ -9,8 +9,8 @@ pub fn start_test() {
     pool.new()
     |> pool.size(2)
     |> pool.on_open(fn() { Ok(Nil) })
-    |> pool.on_close(fn(_) { Nil })
-    |> pool.on_ping(fn(_) { Nil })
+    |> pool.on_close(fn(_) { Ok(Nil) })
+    |> pool.on_ping(fn(_) { Ok(Nil) })
 
   let assert Ok(pool) = pool.start(new_pool, 200)
 
@@ -24,8 +24,8 @@ pub fn supervised_test() {
     pool.new()
     |> pool.size(2)
     |> pool.on_open(fn() { Ok(Nil) })
-    |> pool.on_close(fn(_) { Nil })
-    |> pool.on_ping(fn(_) { Nil })
+    |> pool.on_close(fn(_) { Ok(Nil) })
+    |> pool.on_ping(fn(_) { Ok(Nil) })
 
   let pool_spec = pool.supervised(new_pool, name, 200)
 
@@ -43,6 +43,41 @@ pub fn checkout_checkin_test() {
   let assert Ok(Nil) = pool.checkout(pool, self, 200)
 
   pool.checkin(pool, Nil, self)
+}
+
+pub fn checkout_waiting_test() {
+  let db_pool =
+    pool.new()
+    |> pool.size(1)
+    |> pool.on_open(fn() { Ok(Nil) })
+    |> pool.on_close(fn(_) { Ok(Nil) })
+    |> pool.on_ping(fn(_) { Ok(Nil) })
+
+  let assert Ok(pool) = pool.start(db_pool, 200)
+
+  process.spawn_unlinked(fn() {
+    let self = process.self()
+
+    let assert Ok(Nil) = pool.checkout(pool, self, 50)
+
+    process.sleep(100)
+
+    pool.checkin(pool, Nil, self)
+  })
+
+  process.spawn_unlinked(fn() {
+    let self = process.self()
+
+    let assert Ok(Nil) = pool.checkout(pool, self, 200)
+
+    process.sleep(100)
+
+    pool.checkin(pool, Nil, self)
+  })
+
+  process.sleep(200)
+
+  let assert Ok(_) = pool.shutdown(pool, 200)
 }
 
 pub fn checkout_exhaustion_test() {
@@ -77,8 +112,8 @@ pub fn caller_down_test() {
     pool.new()
     |> pool.size(1)
     |> pool.on_open(fn() { Ok(Nil) })
-    |> pool.on_close(fn(_) { Nil })
-    |> pool.on_ping(fn(_) { Nil })
+    |> pool.on_close(fn(_) { Ok(Nil) })
+    |> pool.on_ping(fn(_) { Ok(Nil) })
 
   let assert Ok(pool) = pool.start(pool, 200)
 
@@ -99,14 +134,14 @@ pub fn caller_down_test() {
   let assert Ok(_) = pool.shutdown(pool, 200)
 }
 
-fn db_pool() -> process.Subject(pool.Msg(Nil)) {
+fn db_pool() -> process.Subject(pool.Msg(Nil, err)) {
   global_value.create_with_unique_name("db_pool_test", fn() {
     let db_pool =
       pool.new()
       |> pool.size(2)
       |> pool.on_open(fn() { Ok(Nil) })
-      |> pool.on_close(fn(_) { Nil })
-      |> pool.on_ping(fn(_) { Nil })
+      |> pool.on_close(fn(_) { Ok(Nil) })
+      |> pool.on_ping(fn(_) { Ok(Nil) })
 
     let assert Ok(pool) = pool.start(db_pool, 200)
 

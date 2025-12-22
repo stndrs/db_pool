@@ -1,4 +1,3 @@
-import gleam/bool
 import gleam/dict.{type Dict}
 import gleam/erlang/atom.{type Atom}
 import gleam/erlang/process.{type Pid, type Subject}
@@ -9,46 +8,52 @@ import gleam/otp/actor
 import gleam/otp/supervision
 import gleam/result
 
-pub opaque type Pool(conn) {
+pub opaque type Pool(conn, err) {
   Pool(
     size: Int,
-    handle_open: fn() -> Result(conn, String),
-    handle_close: fn(conn) -> Nil,
-    handle_ping: fn(conn) -> Nil,
+    handle_open: fn() -> Result(conn, err),
+    handle_close: fn(conn) -> Result(Nil, err),
+    handle_ping: fn(conn) -> Result(Nil, err),
   )
 }
 
-pub fn new() -> Pool(conn) {
-  let handle_open = fn() { Error("open not configured") }
-  let handle_close = fn(_) { Nil }
-  let handle_ping = fn(_) { Nil }
+pub fn new() -> Pool(conn, err) {
+  let handle_open = fn() { panic as "Pool not configured" }
+  let handle_close = fn(_) { Ok(Nil) }
+  let handle_ping = fn(_) { Ok(Nil) }
 
   Pool(size: 5, handle_open:, handle_close:, handle_ping:)
 }
 
-pub fn size(pool: Pool(conn), size: Int) -> Pool(conn) {
+pub fn size(pool: Pool(conn, err), size: Int) -> Pool(conn, err) {
   Pool(..pool, size:)
 }
 
 pub fn on_open(
-  pool: Pool(conn),
-  handle_open: fn() -> Result(conn, String),
-) -> Pool(conn) {
+  pool: Pool(conn, err),
+  handle_open: fn() -> Result(conn, err),
+) -> Pool(conn, err) {
   Pool(..pool, handle_open:)
 }
 
-pub fn on_close(pool: Pool(conn), handle_close: fn(conn) -> Nil) -> Pool(conn) {
+pub fn on_close(
+  pool: Pool(conn, err),
+  handle_close: fn(conn) -> Result(Nil, err),
+) -> Pool(conn, err) {
   Pool(..pool, handle_close:)
 }
 
-pub fn on_ping(pool: Pool(conn), handle_ping: fn(conn) -> Nil) -> Pool(conn) {
+pub fn on_ping(
+  pool: Pool(conn, err),
+  handle_ping: fn(conn) -> Result(Nil, err),
+) -> Pool(conn, err) {
   Pool(..pool, handle_ping:)
 }
 
 pub fn start(
-  pool: Pool(conn),
+  pool: Pool(conn, err),
   timeout: Int,
-) -> Result(Subject(Msg(conn)), actor.StartError) {
+) -> Result(Subject(Msg(conn, err)), actor.StartError) {
   actor.new_with_initialiser(timeout, initialise_pool(_, pool))
   |> actor.on_message(handle_message)
   |> actor.start
@@ -62,10 +67,10 @@ pub fn start(
 }
 
 pub fn supervised(
-  pool: Pool(conn),
-  name: process.Name(Msg(conn)),
+  pool: Pool(conn, err),
+  name: process.Name(Msg(conn, err)),
   timeout: Int,
-) -> supervision.ChildSpecification(Subject(Msg(conn))) {
+) -> supervision.ChildSpecification(Subject(Msg(conn, err))) {
   supervision.worker(fn() {
     actor.new_with_initialiser(timeout, initialise_pool(_, pool))
     |> actor.on_message(handle_message)
@@ -77,10 +82,10 @@ pub fn supervised(
 }
 
 fn initialise_pool(
-  self: Subject(Msg(conn)),
-  pool: Pool(conn),
+  self: Subject(Msg(conn, err)),
+  pool: Pool(conn, err),
 ) -> Result(
-  actor.Initialised(State(conn), Msg(conn), Subject(Msg(conn))),
+  actor.Initialised(State(conn, err), Msg(conn, err), Subject(Msg(conn, err))),
   String,
 ) {
   let resources = {
@@ -114,90 +119,61 @@ fn initialise_pool(
   |> actor.returning(self)
 }
 
-type State(conn) {
+type State(conn, err) {
   State(
-    selector: process.Selector(Msg(conn)),
+    selector: process.Selector(Msg(conn, err)),
     max_size: Int,
     current_size: Int,
-    handle_open: fn() -> Result(conn, String),
-    handle_close: fn(conn) -> Nil,
-    handle_ping: fn(conn) -> Nil,
+    handle_open: fn() -> Result(conn, err),
+    handle_close: fn(conn) -> Result(Nil, err),
+    handle_ping: fn(conn) -> Result(Nil, err),
     idle: List(conn),
     live: Dict(Pid, Live(conn)),
-    queue: Queue(Int, #(Int, Waiting(conn))),
+    queue: Queue(Int, #(Int, Waiting(conn, err))),
   )
-}
-
-fn with_idle(
-  state: State(conn),
-  next: fn(conn) -> State(conn),
-) -> Result(State(conn), Nil) {
-  case state.idle {
-    [] -> create_connection(state, next)
-    [conn, ..idle] -> {
-      let state1 = next(conn)
-
-      Ok(State(..state1, idle:))
-    }
-  }
-}
-
-fn create_connection(
-  state: State(conn),
-  next: fn(conn) -> State(conn),
-) -> Result(State(conn), Nil) {
-  use <- bool.guard(state.current_size >= state.max_size, Error(Nil))
-
-  state.handle_open()
-  |> result.replace_error(Nil)
-  |> result.map(fn(conn) {
-    let state1 = next(conn)
-
-    State(..state1, current_size: state1.current_size + 1)
-  })
 }
 
 type Live(conn) {
   Live(conn: conn, monitor: process.Monitor)
 }
 
-type Waiting(conn) {
+type Waiting(conn, err) {
   Waiting(
     caller: Pid,
     monitor: process.Monitor,
-    client: Subject(Result(conn, String)),
+    client: Subject(Result(conn, err)),
   )
 }
 
-pub opaque type Msg(conn) {
-  Ping(subject: Subject(Msg(conn)), timeout: Int)
+pub opaque type Msg(conn, err) {
+  Ping(subject: Subject(Msg(conn, err)), timeout: Int)
   CheckIn(conn: conn, caller: Pid)
-  CheckOut(client: Subject(Result(conn, String)), caller: Pid)
+  CheckOut(client: Subject(Result(conn, err)), caller: Pid)
   PoolExit(process.ExitMessage)
   CallerDown(process.Down)
-  Shutdown(client: process.Subject(Result(Nil, String)))
+  Shutdown(client: process.Subject(Result(Nil, err)))
 }
 
 pub fn checkout(
-  pool: Subject(Msg(conn)),
+  pool: Subject(Msg(conn, err)),
   caller: Pid,
   timeout: Int,
-) -> Result(conn, String) {
+) -> Result(conn, err) {
   process.call(pool, timeout, CheckOut(_, caller:))
 }
 
-pub fn checkin(pool: Subject(Msg(conn)), conn: conn, caller: Pid) -> Nil {
+pub fn checkin(pool: Subject(Msg(conn, err)), conn: conn, caller: Pid) -> Nil {
   process.send(pool, CheckIn(conn:, caller:))
 }
 
-pub fn shutdown(pool: Subject(Msg(conn)), timeout: Int) -> Result(Nil, String) {
+pub fn shutdown(pool: Subject(Msg(conn, err)), timeout: Int) -> Result(Nil, err) {
   process.call(pool, timeout, Shutdown)
 }
 
 fn handle_message(
-  state: State(conn),
-  msg: Msg(conn),
-) -> actor.Next(State(conn), Msg(conn)) {
+  state: State(conn, err),
+  msg: Msg(conn, err),
+) -> actor.Next(State(conn, err), Msg(conn, err)) {
   case msg {
     Ping(subject:, timeout:) -> handle_ping(state, subject, timeout)
     CheckIn(conn:, caller:) -> handle_checkin(state, conn, caller)
@@ -209,13 +185,13 @@ fn handle_message(
 }
 
 fn handle_ping(
-  state: State(conn),
-  subject: process.Subject(Msg(conn)),
+  state: State(conn, err),
+  subject: process.Subject(Msg(conn, err)),
   timeout: Int,
-) -> actor.Next(State(conn), Msg(conn)) {
+) -> actor.Next(State(conn, err), Msg(conn, err)) {
   state.idle
   |> list.each(fn(conn) {
-    state.handle_ping(conn)
+    let _ = state.handle_ping(conn)
 
     process.send_after(subject, timeout, Ping(subject, timeout))
   })
@@ -227,139 +203,89 @@ fn handle_ping(
 // https://github.com/elixir-ecto/db_connection/blob/1b9783dd88b693dbcbde8a74a1a351b41e5ef5ef/lib/db_connection/connection_pool.ex
 // https://queue.acm.org/appendices/codel.html
 fn handle_checkin(
-  state: State(conn),
-  conn: conn,
+  state: State(conn, err),
+  checked_out: conn,
   caller: Pid,
-) -> actor.Next(State(conn), Msg(conn)) {
-  let state =
-    state
-    |> handle_live_connection(Some(conn), caller)
-    |> result.unwrap(state)
+) -> actor.Next(State(conn, err), Msg(conn, err)) {
+  let state = case dict.get(state.live, caller) {
+    Error(_) -> state
+    Ok(Live(conn:, monitor:)) -> {
+      case checked_out == conn {
+        True -> Nil
+        False ->
+          panic as "Checked out connection not associated with caller Pid"
+      }
+
+      process.demonitor_process(monitor)
+
+      let selector = process.deselect_specific_monitor(state.selector, monitor)
+
+      let live = dict.delete(state.live, caller)
+
+      case dequeue(state.queue) {
+        Some(Waiting(caller:, monitor:, client:)) -> {
+          actor.send(client, Ok(conn))
+
+          let live = dict.insert(live, caller, Live(conn:, monitor:))
+
+          State(..state, selector:, live:)
+        }
+        None -> {
+          let idle = list.prepend(state.idle, conn)
+
+          State(..state, selector:, idle:, live:)
+        }
+      }
+    }
+  }
 
   actor.continue(state)
   |> actor.with_selector(state.selector)
-}
-
-// Validates `conn` against the `live` value.
-// When there is `Some(conn)` value, it is compared against the
-// relevant `live` value.
-// After passing validation, deselect the monitor of the current `live`
-// value.
-// The next caller waiting for a connection is removed from the queue
-// and given the connection.
-// If the queue is empty the connection is returned to `idle`.
-fn handle_live_connection(
-  state: State(conn),
-  conn: Option(conn),
-  caller: Pid,
-) -> Result(State(conn), Nil) {
-  case dict.get(state.live, caller) {
-    Error(_) -> Ok(state)
-    Ok(live) -> {
-      use current <- result.map(validate_conn(live, conn))
-
-      state.queue
-      |> dequeue(
-        with: fn(waiting) {
-          let conn = current.conn
-
-          actor.send(waiting.client, Ok(conn))
-
-          let live =
-            state.live
-            |> dict.delete(caller)
-            |> dict.insert(
-              waiting.caller,
-              Live(conn:, monitor: waiting.monitor),
-            )
-
-          State(..state, live:)
-        },
-        or_else: fn() {
-          let selector =
-            process.deselect_specific_monitor(state.selector, current.monitor)
-
-          let live =
-            state.live
-            |> dict.delete(caller)
-
-          let idle = list.prepend(state.idle, current.conn)
-
-          State(..state, selector:, idle:, live:)
-        },
-      )
-    }
-  }
-}
-
-fn validate_conn(
-  live: Live(conn),
-  conn: Option(conn),
-) -> Result(Live(conn), Nil) {
-  case conn {
-    Some(conn) -> {
-      use <- bool.guard({ conn == live.conn }, Ok(live))
-
-      Error(Nil)
-    }
-    None -> Ok(live)
-  }
 }
 
 fn handle_checkout(
-  state: State(conn),
-  client: process.Subject(Result(conn, String)),
+  state: State(conn, err),
+  client: process.Subject(Result(conn, err)),
   caller: Pid,
-) -> actor.Next(State(conn), Msg(conn)) {
-  let state =
-    with_idle(state, handle_next_conn(_, state, client, caller))
-    |> result.lazy_unwrap(fn() { handle_enqueue(state, client, caller) })
+) -> actor.Next(State(conn, err), Msg(conn, err)) {
+  let monitor = process.monitor(caller)
+  let selector =
+    process.select_specific_monitor(state.selector, monitor, CallerDown)
+
+  let state = case state.idle {
+    [] if state.current_size < state.max_size -> {
+      state.handle_open()
+      |> result.map(fn(conn) {
+        actor.send(client, Ok(conn))
+
+        let live = dict.insert(state.live, caller, Live(conn:, monitor:))
+
+        State(..state, selector:, live:, current_size: state.current_size + 1)
+      })
+      |> result.unwrap(state)
+    }
+    [] -> {
+      enqueue(state.queue, Waiting(caller:, monitor:, client:))
+
+      State(..state, selector:)
+    }
+    [conn, ..idle] -> {
+      actor.send(client, Ok(conn))
+
+      let live = dict.insert(state.live, caller, Live(conn:, monitor:))
+
+      State(..state, selector:, live:, idle:)
+    }
+  }
 
   actor.continue(state)
   |> actor.with_selector(state.selector)
 }
 
-fn handle_enqueue(
-  state: State(conn),
-  client: process.Subject(Result(conn, String)),
-  caller: Pid,
-) -> State(conn) {
-  let monitor = process.monitor(caller)
-  let selector =
-    state.selector
-    |> process.select_specific_monitor(monitor, CallerDown)
-
-  let waiting = Waiting(caller:, monitor:, client:)
-
-  enqueue(state.queue, waiting)
-
-  State(..state, selector:)
-}
-
-fn handle_next_conn(
-  conn: conn,
-  state: State(conn),
-  client: process.Subject(Result(conn, String)),
-  caller: Pid,
-) -> State(conn) {
-  let monitor = process.monitor(caller)
-  let selector =
-    state.selector
-    |> process.select_specific_monitor(monitor, CallerDown)
-
-  actor.send(client, Ok(conn))
-
-  let live =
-    state.live
-    |> dict.insert(caller, Live(conn:, monitor:))
-
-  State(..state, live:, selector:)
-}
-
 fn handle_pool_exit(
-  state: State(conn),
+  state: State(conn, err),
   exit: process.ExitMessage,
-) -> actor.Next(State(conn), Msg(conn)) {
+) -> actor.Next(State(conn, err), Msg(conn, err)) {
   state.idle
   |> list.each(state.handle_close)
 
@@ -371,24 +297,45 @@ fn handle_pool_exit(
 }
 
 fn handle_caller_down(
-  state: State(conn),
+  state: State(conn, err),
   down: process.Down,
-) -> actor.Next(State(conn), Msg(conn)) {
+) -> actor.Next(State(conn, err), Msg(conn, err)) {
   let assert process.ProcessDown(pid:, ..) = down
 
-  let state =
-    state
-    |> handle_live_connection(None, pid)
-    |> result.unwrap(state)
+  let state = case dict.get(state.live, pid) {
+    Error(_) -> state
+    Ok(Live(conn:, monitor:)) -> {
+      process.demonitor_process(monitor)
+
+      let selector = process.deselect_specific_monitor(state.selector, monitor)
+
+      let live = dict.delete(state.live, pid)
+
+      case dequeue(state.queue) {
+        Some(Waiting(caller:, monitor:, client:)) -> {
+          actor.send(client, Ok(conn))
+
+          let live = dict.insert(live, caller, Live(conn:, monitor:))
+
+          State(..state, selector:, live:)
+        }
+        None -> {
+          let idle = list.prepend(state.idle, conn)
+
+          State(..state, selector:, idle:, live:)
+        }
+      }
+    }
+  }
 
   actor.continue(state)
   |> actor.with_selector(state.selector)
 }
 
 fn handle_shutdown(
-  state: State(conn),
-  client: process.Subject(Result(Nil, String)),
-) -> actor.Next(State(conn), Msg(conn)) {
+  state: State(conn, err),
+  client: process.Subject(Result(Nil, err)),
+) -> actor.Next(State(conn, err), Msg(conn, err)) {
   case dict.size(state.live) {
     0 -> {
       state.idle
@@ -408,33 +355,31 @@ fn handle_shutdown(
 
 type Queue(a, b)
 
-fn new_queue() -> Queue(Int, #(Int, Waiting(conn))) {
+fn new_queue() -> Queue(Int, #(Int, Waiting(conn, err))) {
   let table_name = "pool_queue" <> int.to_string(unique_int())
 
   atom.create(table_name) |> ets_queue_
 }
 
 fn dequeue(
-  queue: Queue(Int, #(Int, Waiting(conn))),
-  with handler: fn(Waiting(conn)) -> t,
-  or_else fallback: fn() -> t,
-) -> t {
+  queue: Queue(Int, #(Int, Waiting(conn, err))),
+) -> Option(Waiting(conn, err)) {
   case ets_first_(queue) {
     Some(key) -> {
       let #(_sent, #(_, waiting)) = key
 
       ets_delete_(queue, key)
 
-      handler(waiting)
+      Some(waiting)
     }
-    None -> fallback()
+    None -> None
   }
 }
 
 fn enqueue(
-  queue: Queue(Int, #(Int, Waiting(conn))),
-  value: Waiting(conn),
-) -> Queue(Int, #(Int, Waiting(conn))) {
+  queue: Queue(Int, #(Int, Waiting(conn, err))),
+  value: Waiting(conn, err),
+) -> Queue(Int, #(Int, Waiting(conn, err))) {
   let _ = ets_insert_(queue, monotonic_time(), #(unique_int(), value))
 
   queue
