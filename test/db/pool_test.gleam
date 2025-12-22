@@ -9,8 +9,8 @@ pub fn start_test() {
     pool.new()
     |> pool.size(2)
     |> pool.on_open(fn() { Ok(Nil) })
-    |> pool.on_close(fn(_) { Nil })
-    |> pool.on_ping(fn(_) { Nil })
+    |> pool.on_close(fn(_) { Ok(Nil) })
+    |> pool.on_ping(fn(_) { Ok(Nil) })
 
   let assert Ok(pool) = pool.start(new_pool, 200)
 
@@ -24,8 +24,8 @@ pub fn supervised_test() {
     pool.new()
     |> pool.size(2)
     |> pool.on_open(fn() { Ok(Nil) })
-    |> pool.on_close(fn(_) { Nil })
-    |> pool.on_ping(fn(_) { Nil })
+    |> pool.on_close(fn(_) { Ok(Nil) })
+    |> pool.on_ping(fn(_) { Ok(Nil) })
 
   let pool_spec = pool.supervised(new_pool, name, 200)
 
@@ -50,8 +50,8 @@ pub fn checkout_waiting_test() {
     pool.new()
     |> pool.size(1)
     |> pool.on_open(fn() { Ok(Nil) })
-    |> pool.on_close(fn(_) { Nil })
-    |> pool.on_ping(fn(_) { Nil })
+    |> pool.on_close(fn(_) { Ok(Nil) })
+    |> pool.on_ping(fn(_) { Ok(Nil) })
 
   let assert Ok(pool) = pool.start(db_pool, 200)
 
@@ -112,8 +112,8 @@ pub fn caller_down_test() {
     pool.new()
     |> pool.size(1)
     |> pool.on_open(fn() { Ok(Nil) })
-    |> pool.on_close(fn(_) { Nil })
-    |> pool.on_ping(fn(_) { Nil })
+    |> pool.on_close(fn(_) { Ok(Nil) })
+    |> pool.on_ping(fn(_) { Ok(Nil) })
 
   let assert Ok(pool) = pool.start(pool, 200)
 
@@ -140,8 +140,8 @@ fn db_pool() -> process.Subject(pool.Msg(Nil, err)) {
       pool.new()
       |> pool.size(2)
       |> pool.on_open(fn() { Ok(Nil) })
-      |> pool.on_close(fn(_) { Nil })
-      |> pool.on_ping(fn(_) { Nil })
+      |> pool.on_close(fn(_) { Ok(Nil) })
+      |> pool.on_ping(fn(_) { Ok(Nil) })
 
     let assert Ok(pool) = pool.start(db_pool, 200)
 

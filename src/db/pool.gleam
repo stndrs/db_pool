@@ -12,15 +12,15 @@ pub opaque type Pool(conn, err) {
   Pool(
     size: Int,
     handle_open: fn() -> Result(conn, err),
-    handle_close: fn(conn) -> Nil,
-    handle_ping: fn(conn) -> Nil,
+    handle_close: fn(conn) -> Result(Nil, err),
+    handle_ping: fn(conn) -> Result(Nil, err),
   )
 }
 
 pub fn new() -> Pool(conn, err) {
   let handle_open = fn() { panic as "Pool not configured" }
-  let handle_close = fn(_) { Nil }
-  let handle_ping = fn(_) { Nil }
+  let handle_close = fn(_) { Ok(Nil) }
+  let handle_ping = fn(_) { Ok(Nil) }
 
   Pool(size: 5, handle_open:, handle_close:, handle_ping:)
 }
@@ -38,14 +38,14 @@ pub fn on_open(
 
 pub fn on_close(
   pool: Pool(conn, err),
-  handle_close: fn(conn) -> Nil,
+  handle_close: fn(conn) -> Result(Nil, err),
 ) -> Pool(conn, err) {
   Pool(..pool, handle_close:)
 }
 
 pub fn on_ping(
   pool: Pool(conn, err),
-  handle_ping: fn(conn) -> Nil,
+  handle_ping: fn(conn) -> Result(Nil, err),
 ) -> Pool(conn, err) {
   Pool(..pool, handle_ping:)
 }
@@ -125,8 +125,8 @@ type State(conn, err) {
     max_size: Int,
     current_size: Int,
     handle_open: fn() -> Result(conn, err),
-    handle_close: fn(conn) -> Nil,
-    handle_ping: fn(conn) -> Nil,
+    handle_close: fn(conn) -> Result(Nil, err),
+    handle_ping: fn(conn) -> Result(Nil, err),
     idle: List(conn),
     live: Dict(Pid, Live(conn)),
     queue: Queue(Int, #(Int, Waiting(conn, err))),
@@ -191,7 +191,7 @@ fn handle_ping(
 ) -> actor.Next(State(conn, err), Msg(conn, err)) {
   state.idle
   |> list.each(fn(conn) {
-    state.handle_ping(conn)
+    let _ = state.handle_ping(conn)
 
     process.send_after(subject, timeout, Ping(subject, timeout))
   })
