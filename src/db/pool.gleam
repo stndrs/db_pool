@@ -1,4 +1,3 @@
-import gleam/bool
 import gleam/dict.{type Dict}
 import gleam/erlang/atom.{type Atom}
 import gleam/erlang/process.{type Pid, type Subject}
@@ -205,89 +204,43 @@ fn handle_ping(
 // https://queue.acm.org/appendices/codel.html
 fn handle_checkin(
   state: State(conn, err),
-  conn: conn,
+  checked_out: conn,
   caller: Pid,
 ) -> actor.Next(State(conn, err), Msg(conn, err)) {
-  let state =
-    state
-    |> handle_live_connection(Some(conn), caller)
-    |> result.unwrap(state)
+  let state = case dict.get(state.live, caller) {
+    Error(_) -> state
+    Ok(Live(conn:, monitor:)) -> {
+      case checked_out == conn {
+        True -> Nil
+        False ->
+          panic as "Checked out connection not associated with caller Pid"
+      }
+
+      process.demonitor_process(monitor)
+
+      let selector = process.deselect_specific_monitor(state.selector, monitor)
+
+      let live = dict.delete(state.live, caller)
+
+      case dequeue(state.queue) {
+        Some(Waiting(caller:, monitor:, client:)) -> {
+          actor.send(client, Ok(conn))
+
+          let live = dict.insert(live, caller, Live(conn:, monitor:))
+
+          State(..state, selector:, live:)
+        }
+        None -> {
+          let idle = list.prepend(state.idle, conn)
+
+          State(..state, selector:, idle:, live:)
+        }
+      }
+    }
+  }
 
   actor.continue(state)
   |> actor.with_selector(state.selector)
-}
-
-// Validates `conn` against the `live` value.
-// When there is `Some(conn)` value, it is compared against the
-// relevant `live` value.
-// After passing validation, deselect the monitor of the current `live`
-// value.
-// The next caller waiting for a connection is removed from the queue
-// and given the connection.
-// If the queue is empty the connection is returned to `idle`.
-fn handle_live_connection(
-  state: State(conn, err),
-  conn: Option(conn),
-  caller: Pid,
-) -> Result(State(conn, err), Nil) {
-  case dict.get(state.live, caller) {
-    Error(_) -> Ok(state)
-    Ok(live) -> {
-      use current <- result.map(validate_conn(live, conn))
-
-      state.queue
-      |> dequeue(
-        with: fn(waiting) {
-          process.demonitor_process(current.monitor)
-
-          let selector =
-            process.deselect_specific_monitor(state.selector, current.monitor)
-
-          let conn = current.conn
-
-          actor.send(waiting.client, Ok(conn))
-
-          let live =
-            state.live
-            |> dict.delete(caller)
-            |> dict.insert(
-              waiting.caller,
-              Live(conn:, monitor: waiting.monitor),
-            )
-
-          State(..state, selector:, live:)
-        },
-        or_else: fn() {
-          process.demonitor_process(current.monitor)
-
-          let selector =
-            process.deselect_specific_monitor(state.selector, current.monitor)
-
-          let live =
-            state.live
-            |> dict.delete(caller)
-
-          let idle = list.prepend(state.idle, current.conn)
-
-          State(..state, selector:, idle:, live:)
-        },
-      )
-    }
-  }
-}
-
-fn validate_conn(
-  live: Live(conn),
-  conn: Option(conn),
-) -> Result(Live(conn), Nil) {
-  case conn {
-    Some(conn) -> {
-      use <- bool.guard({ conn == live.conn }, Ok(live))
-
-      Error(Nil)
-    }
-    None -> Ok(live)
-  }
 }
 
 fn handle_checkout(
@@ -349,10 +302,31 @@ fn handle_caller_down(
 ) -> actor.Next(State(conn, err), Msg(conn, err)) {
   let assert process.ProcessDown(pid:, ..) = down
 
-  let state =
-    state
-    |> handle_live_connection(None, pid)
-    |> result.unwrap(state)
+  let state = case dict.get(state.live, pid) {
+    Error(_) -> state
+    Ok(Live(conn:, monitor:)) -> {
+      process.demonitor_process(monitor)
+
+      let selector = process.deselect_specific_monitor(state.selector, monitor)
+
+      let live = dict.delete(state.live, pid)
+
+      case dequeue(state.queue) {
+        Some(Waiting(caller:, monitor:, client:)) -> {
+          actor.send(client, Ok(conn))
+
+          let live = dict.insert(live, caller, Live(conn:, monitor:))
+
+          State(..state, selector:, live:)
+        }
+        None -> {
+          let idle = list.prepend(state.idle, conn)
+
+          State(..state, selector:, idle:, live:)
+        }
+      }
+    }
+  }
 
   actor.continue(state)
   |> actor.with_selector(state.selector)
@@ -389,18 +363,16 @@ fn new_queue() -> Queue(Int, #(Int, Waiting(conn, err))) {
 
 fn dequeue(
   queue: Queue(Int, #(Int, Waiting(conn, err))),
-  with handler: fn(Waiting(conn, err)) -> t,
-  or_else fallback: fn() -> t,
-) -> t {
+) -> Option(Waiting(conn, err)) {
   case ets_first_(queue) {
     Some(key) -> {
       let #(_sent, #(_, waiting)) = key
 
       ets_delete_(queue, key)
 
-      handler(waiting)
+      Some(waiting)
     }
-    None -> fallback()
+    None -> None
   }
 }
 
