@@ -99,7 +99,7 @@ pub fn caller_down_test() {
   let assert Ok(_) = pool.shutdown(pool, 200)
 }
 
-fn db_pool() -> process.Subject(pool.Msg(Nil)) {
+fn db_pool() -> process.Subject(pool.Msg(Nil, err)) {
   global_value.create_with_unique_name("db_pool_test", fn() {
     let db_pool =
       pool.new()
