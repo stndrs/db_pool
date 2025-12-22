@@ -134,35 +134,6 @@ type State(conn, err) {
   )
 }
 
-fn with_idle(
-  state: State(conn, err),
-  next: fn(conn) -> State(conn, err),
-) -> Result(State(conn, err), Nil) {
-  case state.idle {
-    [] -> create_connection(state, next)
-    [conn, ..idle] -> {
-      let state1 = next(conn)
-
-      Ok(State(..state1, idle:))
-    }
-  }
-}
-
-fn create_connection(
-  state: State(conn, err),
-  next: fn(conn) -> State(conn, err),
-) -> Result(State(conn, err), Nil) {
-  use <- bool.guard(state.current_size >= state.max_size, Error(Nil))
-
-  state.handle_open()
-  |> result.replace_error(Nil)
-  |> result.map(fn(conn) {
-    let state1 = next(conn)
-
-    State(..state1, current_size: state1.current_size + 1)
-  })
-}
-
 type Live(conn) {
   Live(conn: conn, monitor: process.Monitor)
 }
@@ -324,49 +295,38 @@ fn handle_checkout(
   client: process.Subject(Result(conn, err)),
   caller: Pid,
 ) -> actor.Next(State(conn, err), Msg(conn, err)) {
-  let state =
-    with_idle(state, handle_next_conn(_, state, client, caller))
-    |> result.lazy_unwrap(fn() { handle_enqueue(state, client, caller) })
+  let monitor = process.monitor(caller)
+  let selector =
+    process.select_specific_monitor(state.selector, monitor, CallerDown)
+
+  let state = case state.idle {
+    [] if state.current_size < state.max_size -> {
+      state.handle_open()
+      |> result.map(fn(conn) {
+        actor.send(client, Ok(conn))
+
+        let live = dict.insert(state.live, caller, Live(conn:, monitor:))
+
+        State(..state, selector:, live:, current_size: state.current_size + 1)
+      })
+      |> result.unwrap(state)
+    }
+    [] -> {
+      enqueue(state.queue, Waiting(caller:, monitor:, client:))
+
+      State(..state, selector:)
+    }
+    [conn, ..idle] -> {
+      actor.send(client, Ok(conn))
+
+      let live = dict.insert(state.live, caller, Live(conn:, monitor:))
+
+      State(..state, selector:, live:, idle:)
+    }
+  }
 
   actor.continue(state)
   |> actor.with_selector(state.selector)
-}
-
-fn handle_enqueue(
-  state: State(conn, err),
-  client: process.Subject(Result(conn, err)),
-  caller: Pid,
-) -> State(conn, err) {
-  let monitor = process.monitor(caller)
-  let selector =
-    state.selector
-    |> process.select_specific_monitor(monitor, CallerDown)
-
-  let waiting = Waiting(caller:, monitor:, client:)
-
-  enqueue(state.queue, waiting)
-
-  State(..state, selector:)
-}
-
-fn handle_next_conn(
-  conn: conn,
-  state: State(conn, err),
-  client: process.Subject(Result(conn, err)),
-  caller: Pid,
-) -> State(conn, err) {
-  let monitor = process.monitor(caller)
-  let selector =
-    state.selector
-    |> process.select_specific_monitor(monitor, CallerDown)
-
-  actor.send(client, Ok(conn))
-
-  let live =
-    state.live
-    |> dict.insert(caller, Live(conn:, monitor:))
-
-  State(..state, live:, selector:)
 }
 
 fn handle_pool_exit(
