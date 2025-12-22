@@ -267,6 +267,11 @@ fn handle_live_connection(
       state.queue
       |> dequeue(
         with: fn(waiting) {
+          process.demonitor_process(current.monitor)
+
+          let selector =
+            process.deselect_specific_monitor(state.selector, current.monitor)
+
           let conn = current.conn
 
           actor.send(waiting.client, Ok(conn))
@@ -279,9 +284,11 @@ fn handle_live_connection(
               Live(conn:, monitor: waiting.monitor),
             )
 
-          State(..state, live:)
+          State(..state, selector:, live:)
         },
         or_else: fn() {
+          process.demonitor_process(current.monitor)
+
           let selector =
             process.deselect_specific_monitor(state.selector, current.monitor)
 
