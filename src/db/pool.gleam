@@ -52,18 +52,13 @@ pub fn on_ping(
 
 pub fn start(
   pool: Pool(conn, err),
+  name: process.Name(Msg(conn, err)),
   timeout: Int,
-) -> Result(Subject(Msg(conn, err)), actor.StartError) {
+) -> actor.StartResult(Subject(Msg(conn, err))) {
   actor.new_with_initialiser(timeout, initialise_pool(_, pool))
   |> actor.on_message(handle_message)
+  |> actor.named(name)
   |> actor.start
-  |> result.map(fn(started) {
-    let subj = started.data
-
-    process.send(subj, Ping(subj, 1000))
-
-    subj
-  })
 }
 
 pub fn supervised(
@@ -71,12 +66,7 @@ pub fn supervised(
   name: process.Name(Msg(conn, err)),
   timeout: Int,
 ) -> supervision.ChildSpecification(Subject(Msg(conn, err))) {
-  supervision.worker(fn() {
-    actor.new_with_initialiser(timeout, initialise_pool(_, pool))
-    |> actor.on_message(handle_message)
-    |> actor.named(name)
-    |> actor.start
-  })
+  supervision.worker(fn() { start(pool, name, timeout) })
   |> supervision.timeout(timeout)
   |> supervision.restart(supervision.Transient)
 }
@@ -102,6 +92,8 @@ fn initialise_pool(
     process.new_selector()
     |> process.select(self)
     |> process.select_trapped_exits(PoolExit)
+
+  process.send(self, Ping(self, 1000))
 
   State(
     selector:,
