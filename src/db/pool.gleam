@@ -7,6 +7,10 @@ import gleam/otp/actor
 import gleam/otp/supervision
 import gleam/result
 
+/// A `Pool` configuration that informs how many connections will
+/// be opened, and how they will be opened when the pool is started.
+/// Also requires configured handlers for closing connections and
+/// for pinging connections every `idle_interval` milliseconds.
 pub opaque type Pool(conn, err) {
   Pool(
     size: Int,
@@ -17,6 +21,7 @@ pub opaque type Pool(conn, err) {
   )
 }
 
+/// Returns a `Pool` that needs to be configured.
 pub fn new() -> Pool(conn, err) {
   let handle_open = fn() { panic as "Pool not configured" }
   let handle_close = fn(_) { Ok(Nil) }
@@ -25,10 +30,14 @@ pub fn new() -> Pool(conn, err) {
   Pool(size: 5, idle_interval: 1000, handle_open:, handle_close:, handle_ping:)
 }
 
+/// Sets the size of the pool. At startup the pool will create `size`
+/// number of connections.
 pub fn size(pool: Pool(conn, err), size: Int) -> Pool(conn, err) {
   Pool(..pool, size:)
 }
 
+/// Sets the `Pool`'s `idle_interval` value. The pool will call the
+/// configured `on_ping` function every `idle_interval` milliseconds.
 pub fn idle_interval(
   pool: Pool(conn, err),
   idle_interval: Int,
@@ -36,6 +45,8 @@ pub fn idle_interval(
   Pool(..pool, idle_interval:)
 }
 
+/// Sets the `Pool`'s `on_open` function. The provided function
+/// will be called at startup to create connections.
 pub fn on_open(
   pool: Pool(conn, err),
   handle_open: fn() -> Result(conn, err),
@@ -43,6 +54,8 @@ pub fn on_open(
   Pool(..pool, handle_open:)
 }
 
+/// Sets the `Pool`'s `on_close` function. The provided function
+/// will be called when the pool is shut down or exits.
 pub fn on_close(
   pool: Pool(conn, err),
   handle_close: fn(conn) -> Result(Nil, err),
@@ -50,6 +63,8 @@ pub fn on_close(
   Pool(..pool, handle_close:)
 }
 
+/// Sets the `Pool`'s `on_close` function. The provided function
+/// will be called every `idle_interval` milliseconds.
 pub fn on_ping(
   pool: Pool(conn, err),
   handle_ping: fn(conn) -> Result(Nil, err),
@@ -57,6 +72,7 @@ pub fn on_ping(
   Pool(..pool, handle_ping:)
 }
 
+/// Starts a connection pool.
 pub fn start(
   pool: Pool(conn, err),
   name: process.Name(Message(conn, err)),
@@ -68,6 +84,8 @@ pub fn start(
   |> actor.start
 }
 
+/// Creates a `supervision.ChildSpecification` so the pool can be
+/// added to an application's supervision tree.
 pub fn supervised(
   pool: Pool(conn, err),
   name: process.Name(Message(conn, err)),
@@ -125,13 +143,21 @@ fn initialise_pool(
 type State(conn, err) {
   State(
     selector: process.Selector(Message(conn, err)),
+    // pool capacity
     max_size: Int,
+    // current number of connections
     current_size: Int,
+    // create connection
     handle_open: fn() -> Result(conn, err),
+    // close connection
     handle_close: fn(conn) -> Result(Nil, err),
+    // called on each connection every `idle_interval`
     handle_ping: fn(conn) -> Result(Nil, err),
+    // idle connections
     idle: List(conn),
+    // connections in use
     live: Dict(Pid, Live(conn)),
+    // processes waiting for a connection
     queue: queue.Queue(Int, #(Int, Waiting(conn, err))),
   )
 }
@@ -157,6 +183,11 @@ pub opaque type Message(conn, err) {
   Shutdown(client: process.Subject(Result(Nil, err)))
 }
 
+/// Attempts to check out a connection from the pool. If successful
+/// the connection will be associated with the caller's `Pid`. If
+/// no connections are available, the caller will be added to a
+/// queue. Calls to this function will time out if no connections
+/// become available before the specified timeout.
 pub fn checkout(
   pool: Subject(Message(conn, err)),
   caller: Pid,
@@ -165,6 +196,10 @@ pub fn checkout(
   process.call(pool, timeout, CheckOut(_, caller:))
 }
 
+/// Returns a connection back to the pool. If there are other callers
+/// waiting in the queue, the provided connection will be given to them.
+/// Otherwise the connection will be returned back to the list of idle
+/// connections.
 pub fn checkin(
   pool: Subject(Message(conn, err)),
   conn: conn,
@@ -173,6 +208,7 @@ pub fn checkin(
   process.send(pool, CheckIn(conn:, caller:))
 }
 
+/// Shuts down the pool and any idle connections.
 pub fn shutdown(
   pool: Subject(Message(conn, err)),
   timeout: Int,
@@ -209,9 +245,6 @@ fn handle_ping(
   actor.continue(state)
 }
 
-// TODO: finish implementing queueing algorithm
-// https://github.com/elixir-ecto/db_connection/blob/1b9783dd88b693dbcbde8a74a1a351b41e5ef5ef/lib/db_connection/connection_pool.ex
-// https://queue.acm.org/appendices/codel.html
 fn handle_checkin(
   state: State(conn, err),
   checked_out: conn,
