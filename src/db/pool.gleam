@@ -356,7 +356,7 @@ fn new_queue() -> Queue(Int, #(Int, Waiting(conn, err))) {
 fn dequeue(
   queue: Queue(Int, #(Int, Waiting(conn, err))),
 ) -> Option(Waiting(conn, err)) {
-  case ets_first_(queue) {
+  case ets_first_lookup_(queue) {
     Some(key) -> {
       let #(_sent, #(_, waiting)) = key
 
@@ -383,11 +383,11 @@ fn ets_queue_(name: Atom) -> Queue(a, b)
 @external(erlang, "db_pool_ffi", "unique_int")
 fn unique_int() -> Int
 
-@external(erlang, "db_pool_ffi", "ets_queue_insert")
+@external(erlang, "db_pool_ffi", "ets_insert")
 fn ets_insert_(queue: Queue(a, b), key: a, value: b) -> Result(Nil, Nil)
 
 @external(erlang, "db_pool_ffi", "ets_first_lookup")
-fn ets_first_(queue: Queue(a, b)) -> Option(#(a, b))
+fn ets_first_lookup_(queue: Queue(a, b)) -> Option(#(a, b))
 
 @external(erlang, "ets", "delete")
 fn ets_delete_(queue: Queue(a, b), key: #(a, b)) -> Bool
