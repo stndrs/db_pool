@@ -4,6 +4,7 @@
   ets_queue/1,
   ets_first_lookup/1,
   ets_insert/3,
+  ets_delete/2,
   unique_int/0
 ]).
 
@@ -14,6 +15,13 @@ ets_first_lookup(Table) ->
   case ets:first_lookup(Table) of
     '$end_of_table' -> none;
     {Key, [{_Key, Value}]} -> {some, {Key, Value}}
+  end.
+
+ets_delete(Name, Key) ->
+  try
+    ets:delete(Name, Key),
+    {ok, nil}
+  catch error:badarg -> {error, nil}
   end.
 
 ets_insert(Name, Key, Value) ->

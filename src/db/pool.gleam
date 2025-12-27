@@ -1,9 +1,8 @@
+import db/pool/internal/queue
 import gleam/dict.{type Dict}
-import gleam/erlang/atom.{type Atom}
 import gleam/erlang/process.{type Pid, type Subject}
-import gleam/int
 import gleam/list
-import gleam/option.{type Option, None, Some}
+import gleam/option.{None, Some}
 import gleam/otp/actor
 import gleam/otp/supervision
 import gleam/result
@@ -104,7 +103,7 @@ fn initialise_pool(
     handle_ping: pool.handle_ping,
     idle: resources,
     live: dict.new(),
-    queue: new_queue(),
+    queue: queue.new("db_pool_queue"),
   )
   |> actor.initialised
   |> actor.selecting(selector)
@@ -121,7 +120,7 @@ type State(conn, err) {
     handle_ping: fn(conn) -> Result(Nil, err),
     idle: List(conn),
     live: Dict(Pid, Live(conn)),
-    queue: Queue(Int, #(Int, Waiting(conn, err))),
+    queue: queue.Queue(Int, #(Int, Waiting(conn, err))),
   )
 }
 
@@ -202,11 +201,7 @@ fn handle_checkin(
   let state = case dict.get(state.live, caller) {
     Error(_) -> state
     Ok(Live(conn:, monitor:)) -> {
-      case checked_out == conn {
-        True -> Nil
-        False ->
-          panic as "Checked out connection not associated with caller Pid"
-      }
+      assert checked_out == conn
 
       process.demonitor_process(monitor)
 
@@ -214,8 +209,10 @@ fn handle_checkin(
 
       let live = dict.delete(state.live, caller)
 
-      case dequeue(state.queue) {
-        Some(Waiting(caller:, monitor:, client:)) -> {
+      case queue.first_lookup(state.queue) {
+        Some(#(sent, #(_int, Waiting(caller:, monitor:, client:)))) -> {
+          let assert Ok(Nil) = queue.delete_key(state.queue, sent)
+
           actor.send(client, Ok(conn))
 
           let live = dict.insert(live, caller, Live(conn:, monitor:))
@@ -257,7 +254,12 @@ fn handle_checkout(
       |> result.unwrap(state)
     }
     [] -> {
-      enqueue(state.queue, Waiting(caller:, monitor:, client:))
+      let key = monotonic_time()
+      let value = #(unique_int(), Waiting(caller:, monitor:, client:))
+
+      // If `queue.insert` fails, the client waiting for a connection will
+      // timeout.
+      let _ = queue.insert(state.queue, key, value)
 
       State(..state, selector:)
     }
@@ -303,8 +305,10 @@ fn handle_caller_down(
 
       let live = dict.delete(state.live, pid)
 
-      case dequeue(state.queue) {
-        Some(Waiting(caller:, monitor:, client:)) -> {
+      case queue.first_lookup(state.queue) {
+        Some(#(sent, #(_int, Waiting(caller:, monitor:, client:)))) -> {
+          let assert Ok(Nil) = queue.delete_key(state.queue, sent)
+
           actor.send(client, Ok(conn))
 
           let live = dict.insert(live, caller, Live(conn:, monitor:))
@@ -343,54 +347,8 @@ fn handle_shutdown(
   }
 }
 
-// Queue
-
-type Queue(a, b)
-
-fn new_queue() -> Queue(Int, #(Int, Waiting(conn, err))) {
-  let table_name = "pool_queue" <> int.to_string(unique_int())
-
-  atom.create(table_name) |> ets_queue_
-}
-
-fn dequeue(
-  queue: Queue(Int, #(Int, Waiting(conn, err))),
-) -> Option(Waiting(conn, err)) {
-  case ets_first_lookup_(queue) {
-    Some(key) -> {
-      let #(_sent, #(_, waiting)) = key
-
-      ets_delete_(queue, key)
-
-      Some(waiting)
-    }
-    None -> None
-  }
-}
-
-fn enqueue(
-  queue: Queue(Int, #(Int, Waiting(conn, err))),
-  value: Waiting(conn, err),
-) -> Queue(Int, #(Int, Waiting(conn, err))) {
-  let _ = ets_insert_(queue, monotonic_time(), #(unique_int(), value))
-
-  queue
-}
-
-@external(erlang, "db_pool_ffi", "ets_queue")
-fn ets_queue_(name: Atom) -> Queue(a, b)
-
 @external(erlang, "db_pool_ffi", "unique_int")
 fn unique_int() -> Int
-
-@external(erlang, "db_pool_ffi", "ets_insert")
-fn ets_insert_(queue: Queue(a, b), key: a, value: b) -> Result(Nil, Nil)
-
-@external(erlang, "db_pool_ffi", "ets_first_lookup")
-fn ets_first_lookup_(queue: Queue(a, b)) -> Option(#(a, b))
-
-@external(erlang, "ets", "delete")
-fn ets_delete_(queue: Queue(a, b), key: #(a, b)) -> Bool
 
 @external(erlang, "erlang", "monotonic_time")
 fn monotonic_time() -> Int

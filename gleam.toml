@@ -8,7 +8,10 @@ version = "0.1.0"
 # licences = ["Apache-2.0"]
 repository = { type = "github", user = "stndrs", repo = "db_pool" }
 target = "erlang"
-# links = [{ title = "Website", href = "" }]
+
+internal_modules = [
+  "db/pool/internal/*"
+]
 
 [dependencies]
 gleam_stdlib = ">= 0.44.0 and < 2.0.0"
