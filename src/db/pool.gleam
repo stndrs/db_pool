@@ -10,6 +10,7 @@ import gleam/result
 pub opaque type Pool(conn, err) {
   Pool(
     size: Int,
+    idle_interval: Int,
     handle_open: fn() -> Result(conn, err),
     handle_close: fn(conn) -> Result(Nil, err),
     handle_ping: fn(conn) -> Result(Nil, err),
@@ -21,11 +22,18 @@ pub fn new() -> Pool(conn, err) {
   let handle_close = fn(_) { Ok(Nil) }
   let handle_ping = fn(_) { Ok(Nil) }
 
-  Pool(size: 5, handle_open:, handle_close:, handle_ping:)
+  Pool(size: 5, idle_interval: 1000, handle_open:, handle_close:, handle_ping:)
 }
 
 pub fn size(pool: Pool(conn, err), size: Int) -> Pool(conn, err) {
   Pool(..pool, size:)
+}
+
+pub fn idle_interval(
+  pool: Pool(conn, err),
+  idle_interval: Int,
+) -> Pool(conn, err) {
+  Pool(..pool, idle_interval:)
 }
 
 pub fn on_open(
@@ -51,9 +59,9 @@ pub fn on_ping(
 
 pub fn start(
   pool: Pool(conn, err),
-  name: process.Name(Msg(conn, err)),
+  name: process.Name(Message(conn, err)),
   timeout: Int,
-) -> actor.StartResult(Subject(Msg(conn, err))) {
+) -> actor.StartResult(Subject(Message(conn, err))) {
   actor.new_with_initialiser(timeout, initialise_pool(_, pool))
   |> actor.on_message(handle_message)
   |> actor.named(name)
@@ -62,19 +70,23 @@ pub fn start(
 
 pub fn supervised(
   pool: Pool(conn, err),
-  name: process.Name(Msg(conn, err)),
+  name: process.Name(Message(conn, err)),
   timeout: Int,
-) -> supervision.ChildSpecification(Subject(Msg(conn, err))) {
+) -> supervision.ChildSpecification(Subject(Message(conn, err))) {
   supervision.worker(fn() { start(pool, name, timeout) })
   |> supervision.timeout(timeout)
   |> supervision.restart(supervision.Transient)
 }
 
 fn initialise_pool(
-  self: Subject(Msg(conn, err)),
+  self: Subject(Message(conn, err)),
   pool: Pool(conn, err),
 ) -> Result(
-  actor.Initialised(State(conn, err), Msg(conn, err), Subject(Msg(conn, err))),
+  actor.Initialised(
+    State(conn, err),
+    Message(conn, err),
+    Subject(Message(conn, err)),
+  ),
   String,
 ) {
   let resources = {
@@ -92,7 +104,7 @@ fn initialise_pool(
     |> process.select(self)
     |> process.select_trapped_exits(PoolExit)
 
-  process.send(self, Ping(self, 1000))
+  process.send(self, Ping(self, pool.idle_interval))
 
   State(
     selector:,
@@ -112,7 +124,7 @@ fn initialise_pool(
 
 type State(conn, err) {
   State(
-    selector: process.Selector(Msg(conn, err)),
+    selector: process.Selector(Message(conn, err)),
     max_size: Int,
     current_size: Int,
     handle_open: fn() -> Result(conn, err),
@@ -136,8 +148,8 @@ type Waiting(conn, err) {
   )
 }
 
-pub opaque type Msg(conn, err) {
-  Ping(subject: Subject(Msg(conn, err)), timeout: Int)
+pub opaque type Message(conn, err) {
+  Ping(subject: Subject(Message(conn, err)), timeout: Int)
   CheckIn(conn: conn, caller: Pid)
   CheckOut(client: Subject(Result(conn, err)), caller: Pid)
   PoolExit(process.ExitMessage)
@@ -146,25 +158,32 @@ pub opaque type Msg(conn, err) {
 }
 
 pub fn checkout(
-  pool: Subject(Msg(conn, err)),
+  pool: Subject(Message(conn, err)),
   caller: Pid,
   timeout: Int,
 ) -> Result(conn, err) {
   process.call(pool, timeout, CheckOut(_, caller:))
 }
 
-pub fn checkin(pool: Subject(Msg(conn, err)), conn: conn, caller: Pid) -> Nil {
+pub fn checkin(
+  pool: Subject(Message(conn, err)),
+  conn: conn,
+  caller: Pid,
+) -> Nil {
   process.send(pool, CheckIn(conn:, caller:))
 }
 
-pub fn shutdown(pool: Subject(Msg(conn, err)), timeout: Int) -> Result(Nil, err) {
+pub fn shutdown(
+  pool: Subject(Message(conn, err)),
+  timeout: Int,
+) -> Result(Nil, err) {
   process.call(pool, timeout, Shutdown)
 }
 
 fn handle_message(
   state: State(conn, err),
-  msg: Msg(conn, err),
-) -> actor.Next(State(conn, err), Msg(conn, err)) {
+  msg: Message(conn, err),
+) -> actor.Next(State(conn, err), Message(conn, err)) {
   case msg {
     Ping(subject:, timeout:) -> handle_ping(state, subject, timeout)
     CheckIn(conn:, caller:) -> handle_checkin(state, conn, caller)
@@ -177,9 +196,9 @@ fn handle_message(
 
 fn handle_ping(
   state: State(conn, err),
-  subject: process.Subject(Msg(conn, err)),
+  subject: process.Subject(Message(conn, err)),
   timeout: Int,
-) -> actor.Next(State(conn, err), Msg(conn, err)) {
+) -> actor.Next(State(conn, err), Message(conn, err)) {
   state.idle
   |> list.each(fn(conn) {
     let _ = state.handle_ping(conn)
@@ -197,7 +216,7 @@ fn handle_checkin(
   state: State(conn, err),
   checked_out: conn,
   caller: Pid,
-) -> actor.Next(State(conn, err), Msg(conn, err)) {
+) -> actor.Next(State(conn, err), Message(conn, err)) {
   let state = case dict.get(state.live, caller) {
     Error(_) -> state
     Ok(Live(conn:, monitor:)) -> {
@@ -236,7 +255,7 @@ fn handle_checkout(
   state: State(conn, err),
   client: process.Subject(Result(conn, err)),
   caller: Pid,
-) -> actor.Next(State(conn, err), Msg(conn, err)) {
+) -> actor.Next(State(conn, err), Message(conn, err)) {
   let monitor = process.monitor(caller)
   let selector =
     process.select_specific_monitor(state.selector, monitor, CallerDown)
@@ -279,7 +298,7 @@ fn handle_checkout(
 fn handle_pool_exit(
   state: State(conn, err),
   exit: process.ExitMessage,
-) -> actor.Next(State(conn, err), Msg(conn, err)) {
+) -> actor.Next(State(conn, err), Message(conn, err)) {
   state.idle
   |> list.each(state.handle_close)
 
@@ -293,7 +312,7 @@ fn handle_pool_exit(
 fn handle_caller_down(
   state: State(conn, err),
   down: process.Down,
-) -> actor.Next(State(conn, err), Msg(conn, err)) {
+) -> actor.Next(State(conn, err), Message(conn, err)) {
   let assert process.ProcessDown(pid:, ..) = down
 
   let state = case dict.get(state.live, pid) {
@@ -331,7 +350,7 @@ fn handle_caller_down(
 fn handle_shutdown(
   state: State(conn, err),
   client: process.Subject(Result(Nil, err)),
-) -> actor.Next(State(conn, err), Msg(conn, err)) {
+) -> actor.Next(State(conn, err), Message(conn, err)) {
   case dict.size(state.live) {
     0 -> {
       state.idle
