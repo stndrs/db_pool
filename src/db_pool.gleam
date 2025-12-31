@@ -213,144 +213,86 @@ fn handle_message(
   Message(conn, err),
 ) {
   case msg {
-    Interval -> handle_interval(state)
-    CheckIn(conn:, caller:) -> handle_checkin(state, conn, caller)
-    CheckOut(client:, caller:, timeout:) ->
-      handle_checkout(state, client, caller, timeout)
-    Timeout(time_sent:, timeout:) -> handle_timeout(state, time_sent, timeout)
-    PoolExit(exit) -> handle_pool_exit(state, exit)
-    CallerDown(down) -> handle_caller_down(state, down)
-    Shutdown(client:) -> handle_shutdown(state, client)
-  }
-}
+    Interval -> {
+      let state = state.ping(state, Interval)
 
-fn handle_interval(
-  state: State(conn, Message(conn, err), PoolError(err)),
-) -> actor.Next(
-  State(conn, Message(conn, err), PoolError(err)),
-  Message(conn, err),
-) {
-  let state = state.ping(state, Interval)
+      use selector <- state.with_selector(state)
 
-  use selector <- state.with_selector(state)
+      actor.continue(state)
+      |> actor.with_selector(selector)
+    }
+    CheckIn(conn:, caller:) -> {
+      let handler = fn(client, conn) { actor.send(client, Ok(conn)) }
+      let state = state.dequeue(state, Some(conn), caller, CallerDown, handler)
 
-  actor.continue(state)
-  |> actor.with_selector(selector)
-}
+      use selector <- state.with_selector(state)
 
-fn handle_checkin(
-  state: State(conn, Message(conn, err), PoolError(err)),
-  conn: conn,
-  caller: Pid,
-) -> actor.Next(
-  State(conn, Message(conn, err), PoolError(err)),
-  Message(conn, err),
-) {
-  let handler = fn(client, conn) { actor.send(client, Ok(conn)) }
-  let state = state.dequeue(state, Some(conn), caller, CallerDown, handler)
+      actor.continue(state)
+      |> actor.with_selector(selector)
+    }
+    CheckOut(client:, caller:, timeout:) -> {
+      let state = {
+        use conn <- state.with_connection(state)
 
-  use selector <- state.with_selector(state)
+        case conn {
+          Some(Ok(conn)) -> {
+            actor.send(client, Ok(conn))
 
-  actor.continue(state)
-  |> actor.with_selector(selector)
-}
+            state.claim(state, caller, conn, CallerDown)
+          }
+          Some(Error(err)) -> {
+            actor.send(client, Error(err))
 
-fn handle_checkout(
-  state: State(conn, Message(conn, err), PoolError(err)),
-  client: process.Subject(Result(conn, PoolError(err))),
-  caller: Pid,
-  timeout: Int,
-) -> actor.Next(
-  State(conn, Message(conn, err), PoolError(err)),
-  Message(conn, err),
-) {
-  let state = {
-    use conn <- state.with_connection(state)
-
-    case conn {
-      Some(Ok(conn)) -> {
-        actor.send(client, Ok(conn))
-
-        state.claim(state, caller, conn, CallerDown)
+            state
+          }
+          None ->
+            state.enqueue(state, caller, client, timeout, Timeout, CallerDown)
+        }
       }
-      Some(Error(err)) -> {
-        actor.send(client, Error(err))
 
-        state
+      use selector <- state.with_selector(state)
+
+      actor.continue(state)
+      |> actor.with_selector(selector)
+    }
+    Timeout(time_sent:, timeout:) -> {
+      let state = {
+        let on_expiry = actor.send(_, Error(ConnectionTimeout))
+
+        state.expire(state, time_sent, timeout, on_expiry:, or_else: Timeout)
       }
-      None -> state.enqueue(state, caller, client, timeout, Timeout, CallerDown)
+
+      use selector <- state.with_selector(state)
+
+      actor.continue(state)
+      |> actor.with_selector(selector)
+    }
+    CallerDown(down) -> {
+      let assert process.ProcessDown(pid:, ..) = down
+
+      let handler = fn(client, conn) { actor.send(client, Ok(conn)) }
+      let state = state.dequeue(state, None, pid, CallerDown, handler)
+
+      use selector <- state.with_selector(state)
+
+      actor.continue(state)
+      |> actor.with_selector(selector)
+    }
+    PoolExit(exit) -> {
+      state.close(state)
+
+      case exit.reason {
+        process.Normal -> actor.stop()
+        process.Killed -> actor.stop_abnormal("pool killed")
+        process.Abnormal(_reason) ->
+          actor.stop_abnormal("pool stopped abnormally")
+      }
+    }
+    Shutdown(client:) -> {
+      state.shutdown(state)
+
+      actor.send(client, Ok(Nil))
+      actor.stop()
     }
   }
-
-  use selector <- state.with_selector(state)
-
-  actor.continue(state)
-  |> actor.with_selector(selector)
-}
-
-fn handle_timeout(
-  state: State(conn, Message(conn, err), PoolError(err)),
-  sent: Int,
-  timeout: Int,
-) -> actor.Next(
-  State(conn, Message(conn, err), PoolError(err)),
-  Message(conn, err),
-) {
-  let state = {
-    let on_expiry = actor.send(_, Error(ConnectionTimeout))
-
-    state.expire(state, sent, timeout, on_expiry:, or_else: Timeout)
-  }
-
-  use selector <- state.with_selector(state)
-
-  actor.continue(state)
-  |> actor.with_selector(selector)
-}
-
-fn handle_pool_exit(
-  state: State(conn, Message(conn, err), PoolError(err)),
-  exit: process.ExitMessage,
-) -> actor.Next(
-  State(conn, Message(conn, err), PoolError(err)),
-  Message(conn, err),
-) {
-  state.close(state)
-
-  case exit.reason {
-    process.Normal -> actor.stop()
-    process.Killed -> actor.stop_abnormal("pool killed")
-    process.Abnormal(_reason) -> actor.stop_abnormal("pool stopped abnormally")
-  }
-}
-
-fn handle_caller_down(
-  state: State(conn, Message(conn, err), PoolError(err)),
-  down: process.Down,
-) -> actor.Next(
-  State(conn, Message(conn, err), PoolError(err)),
-  Message(conn, err),
-) {
-  let assert process.ProcessDown(pid:, ..) = down
-
-  let handler = fn(client, conn) { actor.send(client, Ok(conn)) }
-  let state = state.dequeue(state, None, pid, CallerDown, handler)
-
-  use selector <- state.with_selector(state)
-
-  actor.continue(state)
-  |> actor.with_selector(selector)
-}
-
-fn handle_shutdown(
-  state: State(conn, Message(conn, err), PoolError(err)),
-  client: process.Subject(Result(Nil, PoolError(err))),
-) -> actor.Next(
-  State(conn, Message(conn, err), PoolError(err)),
-  Message(conn, err),
-) {
-  state.shutdown(state)
-
-  actor.send(client, Ok(Nil))
-  actor.stop()
 }
