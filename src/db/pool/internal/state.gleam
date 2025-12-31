@@ -308,5 +308,7 @@ pub fn ping(state: State(conn, msg, err), message: msg) -> State(conn, msg, err)
 }
 
 pub fn close(state: State(conn, msg, err)) -> Nil {
-  list.each(state.idle, state.handle_close)
+  let assert Ok(Nil) = list.try_each(state.idle, state.handle_close)
+
+  Nil
 }

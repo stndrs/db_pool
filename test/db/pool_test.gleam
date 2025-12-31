@@ -187,6 +187,24 @@ pub fn waiting_caller_timeout_test() {
   let assert Ok(_) = pool.shutdown(pool.data, 100)
 }
 
+pub fn pool_exit_test() {
+  let name = process.new_name("db_pool_test")
+
+  let db_pool =
+    pool.new()
+    |> pool.size(2)
+    |> pool.on_open(fn() { Ok(Nil) })
+    |> pool.on_close(fn(_) { Ok(Nil) })
+    |> pool.on_ping(fn(_) { Nil })
+
+  let assert Ok(pool) = pool.start(db_pool, name, 200)
+
+  let assert Ok(pid) = process.subject_owner(pool.data)
+
+  // Doesn't crash
+  process.send_exit(pid)
+}
+
 fn db_pool() -> process.Subject(pool.Message(Nil, err)) {
   global_value.create_with_unique_name("db_pool_test", fn() {
     let name = process.new_name("db_pool_test")
