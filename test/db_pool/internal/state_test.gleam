@@ -5,7 +5,7 @@ import gleam/erlang/reference
 import gleam/option.{None, Some}
 import gleam/result
 
-pub fn current_connection_none_test() {
+pub fn current_connection_error_test() {
   let assert Ok(state) =
     state.new()
     |> state.on_open(fn() { Ok(reference.new()) })
@@ -13,7 +13,7 @@ pub fn current_connection_none_test() {
 
   let self = process.self()
 
-  assert None == state.current_connection(state, self)
+  let assert Error(Nil) = state.current_connection(state, self)
 }
 
 pub fn enqueue_test() {
@@ -38,7 +38,7 @@ pub fn enqueue_test() {
   assert 1 == state.queue_size(state)
 }
 
-pub fn claim_test() {
+pub fn checkout_test() {
   let assert Ok(state) =
     state.new()
     |> state.max_size(1)
@@ -49,16 +49,12 @@ pub fn claim_test() {
 
   let self = process.self()
 
-  assert None == state.current_connection(state, self)
+  let assert Error(Nil) = state.current_connection(state, self)
 
-  let state =
-    state.next_connection(state, fn(conn) {
-      let assert Some(Ok(conn)) = conn
+  let assert Ok(state) =
+    state.checkout(state, self, fn(_) { Nil }, fn(_conn) { Nil })
 
-      state.claim(state, self, conn, fn(_) { Nil })
-    })
-
-  let assert Some(_) = state.current_connection(state, self)
+  let assert Ok(_conn) = state.current_connection(state, self)
 
   assert 1 == state.active_size(state)
 }
@@ -76,28 +72,23 @@ pub fn dequeue_test() {
 
   assert 1 == state.current_size(state)
 
-  // Claim a connection
-  let state =
-    state
-    |> state.next_connection(fn(conn) {
-      let assert Some(Ok(conn)) = conn
-
-      state
-      |> state.claim(self, conn, fn(_) { Nil })
-    })
+  let assert Ok(state) =
+    state.checkout(state, self, fn(_) { Nil }, fn(_) { Nil })
 
   assert 0 == state.queue_size(state)
 
   let subject = process.new_subject()
 
   // Enqueue a waiting process
-  state
-  |> state.enqueue(self, subject, 1000, fn(_, _) { Nil }, fn(_) { Nil })
+  let state =
+    state
+    |> state.enqueue(self, subject, 1000, fn(_, _) { Nil }, fn(_) { Nil })
 
   assert 1 == state.queue_size(state)
 
-  state
-  |> state.dequeue(Some(conn), self, fn(_) { Nil }, fn(_client, _conn) { Nil })
+  let state =
+    state
+    |> state.dequeue(Some(conn), self, fn(_) { Nil }, fn(_client, _conn) { Nil })
 
   // Ensure previously queued process removed from queue
   assert 0 == state.queue_size(state)
@@ -113,28 +104,23 @@ pub fn dequeue_without_connection_test() {
     |> state.on_open(fn() { Ok(reference.new()) })
     |> state.build(process.new_selector())
 
-  // Claim a connection
-  let state =
-    state
-    |> state.next_connection(fn(conn) {
-      let assert Some(Ok(conn)) = conn
-
-      state
-      |> state.claim(self, conn, fn(_) { Nil })
-    })
+  let assert Ok(state) =
+    state.checkout(state, self, fn(_) { Nil }, fn(_) { Nil })
 
   assert 0 == state.queue_size(state)
 
   let subject = process.new_subject()
 
   // Enqueue a waiting process
-  state
-  |> state.enqueue(self, subject, 5000, fn(_, _) { Nil }, fn(_) { Nil })
+  let state =
+    state
+    |> state.enqueue(self, subject, 5000, fn(_, _) { Nil }, fn(_) { Nil })
 
   assert 1 == state.queue_size(state)
 
-  state
-  |> state.dequeue(None, self, fn(_) { Nil }, fn(_client, _conn) { Nil })
+  let state =
+    state
+    |> state.dequeue(None, self, fn(_) { Nil }, fn(_client, _conn) { Nil })
 
   // Ensure queued process has been removed from the queue
   assert 0 == state.queue_size(state)

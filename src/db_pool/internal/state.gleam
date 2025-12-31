@@ -4,7 +4,7 @@ import gleam/bool
 import gleam/dict.{type Dict}
 import gleam/erlang/process
 import gleam/list
-import gleam/option.{type Option, None, Some}
+import gleam/option.{type Option}
 import gleam/result
 
 pub opaque type Waiting(conn, err) {
@@ -199,36 +199,66 @@ pub fn dequeue(
   })
 }
 
+pub fn checkout(
+  state: State(conn, msg, err),
+  caller: process.Pid,
+  handle_down: fn(process.Down) -> msg,
+  next: fn(conn) -> Nil,
+) -> Result(State(conn, msg, err), Nil) {
+  current_connection(state, caller)
+  |> result.map(fn(conn) {
+    next(conn)
+
+    state
+  })
+  |> result.lazy_or(fn() {
+    case state.idle {
+      [] if state.current_size < state.max_size -> {
+        state.handle_open()
+        |> result.map(fn(conn) {
+          next(conn)
+
+          let monitor = process.monitor(caller)
+          let activated = Active(conn:, monitor:)
+          let active = dict.insert(state.active, caller, activated)
+
+          let selector =
+            state.selector
+            |> process.select_specific_monitor(activated.monitor, handle_down)
+
+          State(
+            ..state,
+            current_size: state.current_size + 1,
+            selector:,
+            active:,
+          )
+        })
+        |> result.replace_error(Nil)
+      }
+      [] -> Error(Nil)
+      [conn, ..idle] -> {
+        next(conn)
+
+        let monitor = process.monitor(caller)
+        let activated = Active(conn:, monitor:)
+        let active = dict.insert(state.active, caller, activated)
+
+        let selector =
+          state.selector
+          |> process.select_specific_monitor(activated.monitor, handle_down)
+
+        Ok(State(..state, idle:, selector:, active:))
+      }
+    }
+  })
+}
+
 pub fn current_connection(
   state: State(conn, msg, err),
   caller: process.Pid,
-) -> Option(conn) {
+) -> Result(conn, Nil) {
   dict.get(state.active, caller)
-  |> result.map(fn(active) { Some(active.conn) })
-  |> result.unwrap(None)
-}
-
-pub fn next_connection(
-  state: State(conn, msg, err),
-  next: fn(Option(Result(conn, err))) -> State(conn, msg, err),
-) -> State(conn, msg, err) {
-  case state.idle {
-    [] if state.current_size < state.max_size -> {
-      let conn = state.handle_open()
-      let state = next(Some(conn))
-
-      case conn {
-        Ok(_) -> State(..state, current_size: state.current_size + 1)
-        _ -> state
-      }
-    }
-    [] -> next(None)
-    [conn, ..idle] -> {
-      let state = Some(Ok(conn)) |> next
-
-      State(..state, idle:)
-    }
-  }
+  |> result.map(fn(active) { active.conn })
 }
 
 pub fn enqueue(
@@ -255,23 +285,6 @@ pub fn enqueue(
     |> process.select_specific_monitor(waiting.monitor, handle_down)
 
   State(..state, selector:)
-}
-
-pub fn claim(
-  state: State(conn, msg, err),
-  caller: process.Pid,
-  conn: conn,
-  mapping: fn(process.Down) -> msg,
-) -> State(conn, msg, err) {
-  let monitor = process.monitor(caller)
-  let activated = Active(conn:, monitor:)
-  let active = dict.insert(state.active, caller, activated)
-
-  let selector =
-    state.selector
-    |> process.select_specific_monitor(activated.monitor, mapping)
-
-  State(..state, selector:, active:)
 }
 
 pub fn expire(
