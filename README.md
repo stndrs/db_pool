@@ -5,9 +5,9 @@
 
 A database connection pool.
 
-This library opens connections eagerly at startup. Connections can be checked out, removing them from the list of idle connections. Active connections are associated with the `Pid` of the caller that checked it out. Checking in connections will remove the association with the caller.
+This library eagerly opens connections at startup. Connections can be checked out from the pool, marking them as active. Active connections are associated with the `Pid` of the caller that checked it out. Checking in connections will remove the association with the caller. Because active connections are associated with the `Pid` of a calling process, subsequent calls to check out a connection from the same process will return the already checked out connection.
 
-If all connections have been checked out, new callers attempting to check out connections will be added to a FIFO queue. Callers waiting in the queue will be given connections as they become available.
+If all connections are checked out, new callers attempting to check out will be added to a FIFO queue. Callers waiting in the queue will be given connections as they become available.
 
 Callers are monitored so if they crash their checked out connections can be added back to the pool.
 
@@ -54,3 +54,7 @@ gleam add db_pool
 gleam run   # Run the project
 gleam test  # Run the tests
 ```
+
+## Acknowledgements
+
+Inspired in part by [`bath`](https://github.com/Pevensie/bath).
