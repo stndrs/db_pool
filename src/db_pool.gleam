@@ -1,6 +1,5 @@
 import db_pool/internal/state.{type State}
 import gleam/erlang/process.{type Pid, type Subject}
-import gleam/list
 import gleam/option.{None, Some}
 import gleam/otp/actor
 import gleam/otp/supervision
@@ -130,14 +129,6 @@ fn initialise_pool(
   ),
   String,
 ) {
-  let resources = {
-    list.repeat("", pool.size)
-    |> list.try_map(fn(_) { pool.handle_open() })
-    |> result.map_error(fn(_) { "(db_pool) Failed to open connections" })
-  }
-
-  use resources <- result.map(resources)
-
   process.trap_exits(True)
 
   let selector =
@@ -145,17 +136,18 @@ fn initialise_pool(
     |> process.select(self)
     |> process.select_trapped_exits(PoolExit)
 
-  state.new(selector)
+  state.new()
   |> state.max_size(pool.size)
-  |> state.current_size(pool.size)
   |> state.on_open(pool.handle_open)
   |> state.on_close(pool.handle_close)
   |> state.on_interval(pool.handle_interval)
-  |> state.idle(resources)
   |> state.interval(pool.interval)
-  |> actor.initialised
-  |> actor.selecting(selector)
-  |> actor.returning(self)
+  |> state.build(selector)
+  |> result.map(fn(state) {
+    actor.initialised(state)
+    |> actor.selecting(selector)
+    |> actor.returning(self)
+  })
 }
 
 pub opaque type Message(conn, err) {
@@ -240,13 +232,13 @@ fn handle_message(
         None -> {
           use next <- state.next_connection(state)
 
-          next
-          |> option.map(fn(conn) {
+          option.map(next, fn(conn) {
             actor.send(client, conn)
 
-            conn
-            |> result.map(state.claim(state, caller, _, CallerDown))
-            |> result.unwrap(state)
+            case conn {
+              Ok(conn) -> state.claim(state, caller, conn, CallerDown)
+              _ -> state
+            }
           })
           |> option.lazy_unwrap(fn() {
             state.enqueue(

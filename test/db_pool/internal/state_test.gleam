@@ -1,12 +1,15 @@
 import db_pool/internal
 import db_pool/internal/state
 import gleam/erlang/process
+import gleam/erlang/reference
 import gleam/option.{None, Some}
+import gleam/result
 
 pub fn current_connection_none_test() {
-  let state =
-    process.new_selector()
-    |> state.new
+  let assert Ok(state) =
+    state.new()
+    |> state.on_open(fn() { Ok(reference.new()) })
+    |> state.build(process.new_selector())
 
   let self = process.self()
 
@@ -14,9 +17,10 @@ pub fn current_connection_none_test() {
 }
 
 pub fn enqueue_test() {
-  let state =
-    process.new_selector()
-    |> state.new
+  let assert Ok(state) =
+    state.new()
+    |> state.on_open(fn() { Ok(reference.new()) })
+    |> state.build(process.new_selector())
 
   let self = process.self()
   let subject = process.new_subject()
@@ -34,15 +38,12 @@ pub fn enqueue_test() {
   assert 1 == state.queue_size(state)
 }
 
-pub type Connection {
-  Connection(Int)
-}
-
 pub fn claim_test() {
-  let state =
-    process.new_selector()
-    |> state.new
-    |> state.idle([Connection(1)])
+  let assert Ok(state) =
+    state.new()
+    |> state.max_size(1)
+    |> state.on_open(fn() { Ok(reference.new()) })
+    |> state.build(process.new_selector())
 
   assert 0 == state.active_size(state)
 
@@ -57,20 +58,23 @@ pub fn claim_test() {
       state.claim(state, self, conn, fn(_) { Nil })
     })
 
-  let assert Some(_conn) = state.current_connection(state, self)
+  let assert Some(_) = state.current_connection(state, self)
 
   assert 1 == state.active_size(state)
 }
 
 pub fn dequeue_test() {
   let self = process.self()
-  let connection = Connection(1)
+  let conn = reference.new()
 
   // Initialize new state
-  let state =
-    process.new_selector()
-    |> state.new
-    |> state.idle([connection])
+  let assert Ok(state) =
+    state.new()
+    |> state.max_size(1)
+    |> state.on_open(fn() { Ok(conn) })
+    |> state.build(process.new_selector())
+
+  assert 1 == state.current_size(state)
 
   // Claim a connection
   let state =
@@ -93,9 +97,7 @@ pub fn dequeue_test() {
   assert 1 == state.queue_size(state)
 
   state
-  |> state.dequeue(Some(connection), self, fn(_) { Nil }, fn(_client, _conn) {
-    Nil
-  })
+  |> state.dequeue(Some(conn), self, fn(_) { Nil }, fn(_client, _conn) { Nil })
 
   // Ensure previously queued process removed from queue
   assert 0 == state.queue_size(state)
@@ -105,10 +107,11 @@ pub fn dequeue_without_connection_test() {
   let self = process.self()
 
   // Initialize new state
-  let state =
-    process.new_selector()
-    |> state.new
-    |> state.idle([Connection(1)])
+  let assert Ok(state) =
+    state.new()
+    |> state.max_size(1)
+    |> state.on_open(fn() { Ok(reference.new()) })
+    |> state.build(process.new_selector())
 
   // Claim a connection
   let state =
@@ -138,9 +141,10 @@ pub fn dequeue_without_connection_test() {
 }
 
 pub fn expire_test() {
-  let state =
-    process.new_selector()
-    |> state.new
+  let assert Ok(state) =
+    state.new()
+    |> state.on_open(fn() { Ok(reference.new()) })
+    |> state.build(process.new_selector())
 
   let now_in_ms = internal.now_in_ms()
 
@@ -170,9 +174,10 @@ pub fn expire_test() {
 }
 
 pub fn expire_retry_test() {
-  let state =
-    process.new_selector()
-    |> state.new
+  let assert Ok(state) =
+    state.new()
+    |> state.on_open(fn() { Ok(reference.new()) })
+    |> state.build(process.new_selector())
 
   let now_in_ms = internal.now_in_ms()
 
@@ -208,11 +213,12 @@ pub fn expire_retry_test() {
 pub fn ping_test() {
   let selector = process.new_selector()
 
-  let state =
-    selector
-    |> state.new
+  let assert Ok(state) =
+    state.new()
+    |> state.on_open(fn() { Ok(reference.new()) })
     |> state.interval(10)
-    |> state.ping("Ping!")
+    |> state.build(selector)
+    |> result.map(state.ping(_, "Ping!"))
 
   use selector <- state.with_selector(state)
 
@@ -220,15 +226,19 @@ pub fn ping_test() {
 }
 
 pub fn shutdown_test() {
-  assert Nil
-    == process.new_selector()
-    |> state.new
-    |> state.shutdown
+  let assert Ok(state) =
+    state.new()
+    |> state.on_open(fn() { Ok(reference.new()) })
+    |> state.build(process.new_selector())
+
+  assert Nil == state.shutdown(state)
 }
 
 pub fn close_test() {
-  assert Nil
-    == process.new_selector()
-    |> state.new
-    |> state.close
+  let assert Ok(state) =
+    state.new()
+    |> state.on_open(fn() { Ok(reference.new()) })
+    |> state.build(process.new_selector())
+
+  assert Nil == state.close(state)
 }

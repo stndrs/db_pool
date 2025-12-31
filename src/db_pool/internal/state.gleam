@@ -20,6 +20,60 @@ pub opaque type Active(conn) {
   Active(conn: conn, monitor: process.Monitor)
 }
 
+pub opaque type Builder(conn, err) {
+  Builder(
+    // pool capacity
+    max_size: Int,
+    // open connection
+    handle_open: fn() -> Result(conn, err),
+    // close connection
+    handle_close: fn(conn) -> Result(Nil, err),
+    // called on each connection every `interval`
+    handle_interval: fn(conn) -> Nil,
+    // idle time between pings
+    interval: Int,
+  )
+}
+
+pub fn new() -> Builder(conn, err) {
+  Builder(
+    max_size: 1,
+    handle_open: fn() { panic as "(db_pool) on_open not configured" },
+    handle_close: fn(_) { Ok(Nil) },
+    handle_interval: fn(_) { Nil },
+    interval: 1000,
+  )
+}
+
+pub fn max_size(state: Builder(conn, err), max_size: Int) -> Builder(conn, err) {
+  Builder(..state, max_size:)
+}
+
+pub fn on_open(
+  state: Builder(conn, err),
+  handle_open: fn() -> Result(conn, err),
+) -> Builder(conn, err) {
+  Builder(..state, handle_open:)
+}
+
+pub fn on_close(
+  state: Builder(conn, err),
+  handle_close: fn(conn) -> Result(Nil, err),
+) -> Builder(conn, err) {
+  Builder(..state, handle_close:)
+}
+
+pub fn on_interval(
+  state: Builder(conn, err),
+  handle_interval: fn(conn) -> Nil,
+) -> Builder(conn, err) {
+  Builder(..state, handle_interval:)
+}
+
+pub fn interval(state: Builder(conn, err), interval: Int) -> Builder(conn, err) {
+  Builder(..state, interval:)
+}
+
 pub opaque type State(conn, msg, err) {
   State(
     selector: process.Selector(msg),
@@ -44,16 +98,27 @@ pub opaque type State(conn, msg, err) {
   )
 }
 
-pub fn new(selector: process.Selector(msg)) -> State(conn, msg, err) {
+pub fn build(
+  builder: Builder(conn, err),
+  selector: process.Selector(msg),
+) -> Result(State(conn, msg, err), String) {
+  let connections = {
+    list.repeat("", builder.max_size)
+    |> list.try_map(fn(_) { builder.handle_open() })
+    |> result.map_error(fn(_) { "(db_pool) Failed to open connections" })
+  }
+
+  use idle <- result.map(connections)
+
   State(
     selector:,
-    max_size: 0,
-    current_size: 0,
-    handle_open: fn() { panic },
-    handle_close: fn(_) { panic },
-    handle_interval: fn(_) { Nil },
-    interval: 1000,
-    idle: [],
+    max_size: builder.max_size,
+    current_size: builder.max_size,
+    handle_open: builder.handle_open,
+    handle_close: builder.handle_close,
+    handle_interval: builder.handle_interval,
+    interval: builder.interval,
+    idle:,
     active: dict.new(),
     queue: queue.new("db_pool_queue"),
   )
@@ -66,67 +131,8 @@ pub fn with_selector(
   next(state.selector)
 }
 
-pub fn selector(
-  selector: process.Selector(msg),
-  state: State(conn, msg, err),
-) -> State(conn, msg, err) {
-  State(..state, selector:)
-}
-
-pub fn max_size(
-  state: State(conn, msg, err),
-  max_size: Int,
-) -> State(conn, msg, err) {
-  State(..state, max_size:)
-}
-
-pub fn on_open(
-  state: State(conn, msg, err),
-  handle_open: fn() -> Result(conn, err),
-) -> State(conn, msg, err) {
-  State(..state, handle_open:)
-}
-
-pub fn on_close(
-  state: State(conn, msg, err),
-  handle_close: fn(conn) -> Result(Nil, err),
-) -> State(conn, msg, err) {
-  State(..state, handle_close:)
-}
-
-pub fn on_interval(
-  state: State(conn, msg, err),
-  handle_interval: fn(conn) -> Nil,
-) -> State(conn, msg, err) {
-  State(..state, handle_interval:)
-}
-
-pub fn current_size(
-  state: State(conn, msg, err),
-  current_size: Int,
-) -> State(conn, msg, err) {
-  State(..state, current_size:)
-}
-
-pub fn interval(
-  state: State(conn, msg, err),
-  interval: Int,
-) -> State(conn, msg, err) {
-  State(..state, interval:)
-}
-
-pub fn idle(
-  state: State(conn, msg, err),
-  idle: List(conn),
-) -> State(conn, msg, err) {
-  State(..state, idle:)
-}
-
-fn active(
-  state: State(conn, msg, err),
-  active: Dict(process.Pid, Active(conn)),
-) -> State(conn, msg, err) {
-  State(..state, active:)
+pub fn current_size(state: State(conn, msg, err)) -> Int {
+  state.current_size
 }
 
 pub fn queue_size(state: State(conn, msg, err)) -> Int {
@@ -167,7 +173,7 @@ pub fn dequeue(
     let monitor = process.monitor(waiting.caller)
     let next = Active(conn: prev.conn, monitor:)
 
-    let all_active =
+    let active =
       state.active
       |> dict.delete(caller)
       |> dict.insert(waiting.caller, next)
@@ -175,21 +181,21 @@ pub fn dequeue(
     process.cancel_timer(waiting.timer)
     process.demonitor_process(prev.monitor)
 
-    let state =
+    let selector =
       state.selector
       |> process.deselect_specific_monitor(prev.monitor)
       |> process.select_specific_monitor(next.monitor, mapping)
-      |> selector(state)
-      |> active(all_active)
+
+    let state = State(..state, selector:, active:)
 
     handler(waiting.client, prev.conn)
 
     state
   }
   |> result.lazy_unwrap(fn() {
-    state.idle
-    |> list.prepend(prev.conn)
-    |> idle(state, _)
+    let idle = list.prepend(state.idle, prev.conn)
+
+    State(..state, idle:)
   })
 }
 
@@ -207,13 +213,20 @@ pub fn next_connection(
   next: fn(Option(Result(conn, err))) -> State(conn, msg, err),
 ) -> State(conn, msg, err) {
   case state.idle {
-    [] if state.current_size < state.max_size ->
-      Some(state.handle_open()) |> next
+    [] if state.current_size < state.max_size -> {
+      let conn = state.handle_open()
+      let state = next(Some(conn))
+
+      case conn {
+        Ok(_) -> State(..state, current_size: state.current_size + 1)
+        _ -> state
+      }
+    }
     [] -> next(None)
-    [conn, ..remaining] -> {
-      Some(Ok(conn))
-      |> next
-      |> idle(remaining)
+    [conn, ..idle] -> {
+      let state = Some(Ok(conn)) |> next
+
+      State(..state, idle:)
     }
   }
 }
@@ -236,10 +249,12 @@ pub fn enqueue(
 
   let assert Ok(Nil) = queue.insert(state.queue, now_in_ms, waiting)
 
-  state.selector
-  |> process.select(subject)
-  |> process.select_specific_monitor(waiting.monitor, handle_down)
-  |> selector(state)
+  let selector =
+    state.selector
+    |> process.select(subject)
+    |> process.select_specific_monitor(waiting.monitor, handle_down)
+
+  State(..state, selector:)
 }
 
 pub fn claim(
@@ -250,12 +265,13 @@ pub fn claim(
 ) -> State(conn, msg, err) {
   let monitor = process.monitor(caller)
   let activated = Active(conn:, monitor:)
-  let all_active = dict.insert(state.active, caller, activated)
+  let active = dict.insert(state.active, caller, activated)
 
-  state.selector
-  |> process.select_specific_monitor(activated.monitor, mapping)
-  |> selector(state)
-  |> active(all_active)
+  let selector =
+    state.selector
+    |> process.select_specific_monitor(activated.monitor, mapping)
+
+  State(..state, selector:, active:)
 }
 
 pub fn expire(
@@ -278,9 +294,9 @@ pub fn expire(
       let assert Ok(Nil) =
         queue.insert(state.queue, sent, Waiting(..waiting, timer:))
 
-      state.selector
-      |> process.select(subject)
-      |> selector(state)
+      let selector = process.select(state.selector, subject)
+
+      State(..state, selector:)
     })
 
     let assert Ok(Nil) = queue.delete_key(state.queue, sent)
@@ -290,9 +306,10 @@ pub fn expire(
     process.cancel_timer(waiting.timer)
     process.demonitor_process(waiting.monitor)
 
-    state.selector
-    |> process.deselect_specific_monitor(waiting.monitor)
-    |> selector(state)
+    let selector =
+      process.deselect_specific_monitor(state.selector, waiting.monitor)
+
+    State(..state, selector:)
   })
   |> result.unwrap(state)
 }
@@ -311,9 +328,9 @@ pub fn ping(state: State(conn, msg, err), message: msg) -> State(conn, msg, err)
 
   let _timer = process.send_after(subject, state.interval, message)
 
-  state.selector
-  |> process.select(subject)
-  |> selector(state)
+  let selector = process.select(state.selector, subject)
+
+  State(..state, selector:)
 }
 
 pub fn close(state: State(conn, msg, err)) -> Nil {
