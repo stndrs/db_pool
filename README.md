@@ -5,7 +5,7 @@
 
 A database connection pool.
 
-This library opens connections eagerly at startup. Connections can be checked out, removing them from the list of idle connections. Live connections are associated with the `Pid` of the caller that checked it out. Checking in connections will remove the association with the caller.
+This library opens connections eagerly at startup. Connections can be checked out, removing them from the list of idle connections. Active connections are associated with the `Pid` of the caller that checked it out. Checking in connections will remove the association with the caller.
 
 If all connections have been checked out, new callers attempting to check out connections will be added to a FIFO queue. Callers waiting in the queue will be given connections as they become available.
 

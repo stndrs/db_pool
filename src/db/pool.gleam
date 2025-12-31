@@ -1,11 +1,17 @@
-import db/pool/internal/queue
-import gleam/dict.{type Dict}
+import db/pool/internal/state.{type State}
 import gleam/erlang/process.{type Pid, type Subject}
 import gleam/list
 import gleam/option.{None, Some}
 import gleam/otp/actor
 import gleam/otp/supervision
 import gleam/result
+
+pub type PoolError(err) {
+  OpenError(err)
+  CloseError(err)
+  ConnectionError(err)
+  ConnectionTimeout
+}
 
 /// A `Pool` configuration that informs how many connections will
 /// be opened, and how they will be opened when the pool is started.
@@ -15,17 +21,17 @@ pub opaque type Pool(conn, err) {
   Pool(
     size: Int,
     idle_interval: Int,
-    handle_open: fn() -> Result(conn, err),
-    handle_close: fn(conn) -> Result(Nil, err),
-    handle_ping: fn(conn) -> Result(Nil, err),
+    handle_open: fn() -> Result(conn, PoolError(err)),
+    handle_close: fn(conn) -> Result(Nil, PoolError(err)),
+    handle_ping: fn(conn) -> Nil,
   )
 }
 
 /// Returns a `Pool` that needs to be configured.
 pub fn new() -> Pool(conn, err) {
-  let handle_open = fn() { panic as "Pool not configured" }
+  let handle_open = fn() { Error(ConnectionTimeout) }
   let handle_close = fn(_) { Ok(Nil) }
-  let handle_ping = fn(_) { Ok(Nil) }
+  let handle_ping = fn(_) { Nil }
 
   Pool(size: 5, idle_interval: 1000, handle_open:, handle_close:, handle_ping:)
 }
@@ -51,6 +57,8 @@ pub fn on_open(
   pool: Pool(conn, err),
   handle_open: fn() -> Result(conn, err),
 ) -> Pool(conn, err) {
+  let handle_open = fn() { handle_open() |> result.map_error(OpenError) }
+
   Pool(..pool, handle_open:)
 }
 
@@ -60,6 +68,10 @@ pub fn on_close(
   pool: Pool(conn, err),
   handle_close: fn(conn) -> Result(Nil, err),
 ) -> Pool(conn, err) {
+  let handle_close = fn(conn) {
+    handle_close(conn) |> result.map_error(CloseError)
+  }
+
   Pool(..pool, handle_close:)
 }
 
@@ -67,7 +79,7 @@ pub fn on_close(
 /// will be called every `idle_interval` milliseconds.
 pub fn on_ping(
   pool: Pool(conn, err),
-  handle_ping: fn(conn) -> Result(Nil, err),
+  handle_ping: fn(conn) -> Nil,
 ) -> Pool(conn, err) {
   Pool(..pool, handle_ping:)
 }
@@ -82,6 +94,11 @@ pub fn start(
   |> actor.on_message(handle_message)
   |> actor.named(name)
   |> actor.start
+  |> result.map(fn(started) {
+    let _timer = process.send_after(started.data, pool.idle_interval, Ping)
+
+    started
+  })
 }
 
 /// Creates a `supervision.ChildSpecification` so the pool can be
@@ -101,7 +118,7 @@ fn initialise_pool(
   pool: Pool(conn, err),
 ) -> Result(
   actor.Initialised(
-    State(conn, err),
+    State(conn, Message(conn, err), PoolError(err)),
     Message(conn, err),
     Subject(Message(conn, err)),
   ),
@@ -122,65 +139,31 @@ fn initialise_pool(
     |> process.select(self)
     |> process.select_trapped_exits(PoolExit)
 
-  process.send(self, Ping(self, pool.idle_interval))
-
-  State(
-    selector:,
-    max_size: pool.size,
-    current_size: pool.size,
-    handle_open: pool.handle_open,
-    handle_close: pool.handle_close,
-    handle_ping: pool.handle_ping,
-    idle: resources,
-    live: dict.new(),
-    queue: queue.new("db_pool_queue"),
-  )
+  state.new(selector)
+  |> state.max_size(pool.size)
+  |> state.current_size(pool.size)
+  |> state.on_open(pool.handle_open)
+  |> state.on_close(pool.handle_close)
+  |> state.on_ping(pool.handle_ping)
+  |> state.idle(resources)
+  |> state.idle_interval(pool.idle_interval)
   |> actor.initialised
   |> actor.selecting(selector)
   |> actor.returning(self)
 }
 
-type State(conn, err) {
-  State(
-    selector: process.Selector(Message(conn, err)),
-    // pool capacity
-    max_size: Int,
-    // current number of connections
-    current_size: Int,
-    // create connection
-    handle_open: fn() -> Result(conn, err),
-    // close connection
-    handle_close: fn(conn) -> Result(Nil, err),
-    // called on each connection every `idle_interval`
-    handle_ping: fn(conn) -> Result(Nil, err),
-    // idle connections
-    idle: List(conn),
-    // connections in use
-    live: Dict(Pid, Live(conn)),
-    // processes waiting for a connection
-    queue: queue.Queue(Int, #(Int, Waiting(conn, err))),
-  )
-}
-
-type Live(conn) {
-  Live(conn: conn, monitor: process.Monitor)
-}
-
-type Waiting(conn, err) {
-  Waiting(
-    caller: Pid,
-    monitor: process.Monitor,
-    client: Subject(Result(conn, err)),
-  )
-}
-
 pub opaque type Message(conn, err) {
-  Ping(subject: Subject(Message(conn, err)), timeout: Int)
+  Ping
   CheckIn(conn: conn, caller: Pid)
-  CheckOut(client: Subject(Result(conn, err)), caller: Pid)
+  CheckOut(
+    client: Subject(Result(conn, PoolError(err))),
+    caller: Pid,
+    timeout: Int,
+  )
+  Timeout(time_sent: Int, timeout: Int)
   PoolExit(process.ExitMessage)
   CallerDown(process.Down)
-  Shutdown(client: process.Subject(Result(Nil, err)))
+  Shutdown(client: process.Subject(Result(Nil, PoolError(err))))
 }
 
 /// Attempts to check out a connection from the pool. If successful
@@ -188,12 +171,23 @@ pub opaque type Message(conn, err) {
 /// no connections are available, the caller will be added to a
 /// queue. Calls to this function will time out if no connections
 /// become available before the specified timeout.
+///
+/// The provided timeout will have 50 milliseconds added onto it
+/// internally. So if you want to wait at most 1000 milliseconds,
+/// you should provided a timeout of 950.
+///
+/// The 50 millisecond padding added here allows callers to wait in
+/// the queue. The queue will respond with a connection or an error
+/// value before the provided `timeout` is reached.
+///
+/// Without padding the timeout the process will always panic before
+/// callers added to the queue can be sent a reply.
 pub fn checkout(
   pool: Subject(Message(conn, err)),
   caller: Pid,
   timeout: Int,
-) -> Result(conn, err) {
-  process.call(pool, timeout, CheckOut(_, caller:))
+) -> Result(conn, PoolError(err)) {
+  process.call(pool, timeout + 50, CheckOut(_, caller:, timeout:))
 }
 
 /// Returns a connection back to the pool. If there are other callers
@@ -212,18 +206,23 @@ pub fn checkin(
 pub fn shutdown(
   pool: Subject(Message(conn, err)),
   timeout: Int,
-) -> Result(Nil, err) {
+) -> Result(Nil, PoolError(err)) {
   process.call(pool, timeout, Shutdown)
 }
 
 fn handle_message(
-  state: State(conn, err),
+  state: State(conn, Message(conn, err), PoolError(err)),
   msg: Message(conn, err),
-) -> actor.Next(State(conn, err), Message(conn, err)) {
+) -> actor.Next(
+  State(conn, Message(conn, err), PoolError(err)),
+  Message(conn, err),
+) {
   case msg {
-    Ping(subject:, timeout:) -> handle_ping(state, subject, timeout)
+    Ping -> handle_ping(state)
     CheckIn(conn:, caller:) -> handle_checkin(state, conn, caller)
-    CheckOut(client:, caller:) -> handle_checkout(state, client, caller)
+    CheckOut(client:, caller:, timeout:) ->
+      handle_checkout(state, client, caller, timeout)
+    Timeout(time_sent:, timeout:) -> handle_timeout(state, time_sent, timeout)
     PoolExit(exit) -> handle_pool_exit(state, exit)
     CallerDown(down) -> handle_caller_down(state, down)
     Shutdown(client:) -> handle_shutdown(state, client)
@@ -231,109 +230,97 @@ fn handle_message(
 }
 
 fn handle_ping(
-  state: State(conn, err),
-  subject: process.Subject(Message(conn, err)),
-  timeout: Int,
-) -> actor.Next(State(conn, err), Message(conn, err)) {
-  state.idle
-  |> list.each(fn(conn) {
-    let _ = state.handle_ping(conn)
+  state: State(conn, Message(conn, err), PoolError(err)),
+) -> actor.Next(
+  State(conn, Message(conn, err), PoolError(err)),
+  Message(conn, err),
+) {
+  let state = state.ping(state, Ping)
 
-    process.send_after(subject, timeout, Ping(subject, timeout))
-  })
+  use selector <- state.with_selector(state)
 
   actor.continue(state)
+  |> actor.with_selector(selector)
 }
 
 fn handle_checkin(
-  state: State(conn, err),
-  checked_out: conn,
+  state: State(conn, Message(conn, err), PoolError(err)),
+  conn: conn,
   caller: Pid,
-) -> actor.Next(State(conn, err), Message(conn, err)) {
-  let state = case dict.get(state.live, caller) {
-    Error(_) -> state
-    Ok(Live(conn:, monitor:)) -> {
-      assert checked_out == conn
+) -> actor.Next(
+  State(conn, Message(conn, err), PoolError(err)),
+  Message(conn, err),
+) {
+  let handler = fn(client, conn) { actor.send(client, Ok(conn)) }
+  let state = state.dequeue(state, Some(conn), caller, CallerDown, handler)
 
-      process.demonitor_process(monitor)
-
-      let selector = process.deselect_specific_monitor(state.selector, monitor)
-
-      let live = dict.delete(state.live, caller)
-
-      case queue.first_lookup(state.queue) {
-        Some(#(sent, #(_int, Waiting(caller:, monitor:, client:)))) -> {
-          let assert Ok(Nil) = queue.delete_key(state.queue, sent)
-
-          actor.send(client, Ok(conn))
-
-          let live = dict.insert(live, caller, Live(conn:, monitor:))
-
-          State(..state, selector:, live:)
-        }
-        None -> {
-          let idle = list.prepend(state.idle, conn)
-
-          State(..state, selector:, idle:, live:)
-        }
-      }
-    }
-  }
+  use selector <- state.with_selector(state)
 
   actor.continue(state)
-  |> actor.with_selector(state.selector)
+  |> actor.with_selector(selector)
 }
 
 fn handle_checkout(
-  state: State(conn, err),
-  client: process.Subject(Result(conn, err)),
+  state: State(conn, Message(conn, err), PoolError(err)),
+  client: process.Subject(Result(conn, PoolError(err))),
   caller: Pid,
-) -> actor.Next(State(conn, err), Message(conn, err)) {
-  let monitor = process.monitor(caller)
-  let selector =
-    process.select_specific_monitor(state.selector, monitor, CallerDown)
+  timeout: Int,
+) -> actor.Next(
+  State(conn, Message(conn, err), PoolError(err)),
+  Message(conn, err),
+) {
+  let state = {
+    use conn <- state.with_connection(state)
 
-  let state = case state.idle {
-    [] if state.current_size < state.max_size -> {
-      state.handle_open()
-      |> result.map(fn(conn) {
+    case conn {
+      Some(Ok(conn)) -> {
         actor.send(client, Ok(conn))
 
-        let live = dict.insert(state.live, caller, Live(conn:, monitor:))
+        state.claim(state, caller, conn, CallerDown)
+      }
+      Some(Error(err)) -> {
+        actor.send(client, Error(err))
 
-        State(..state, selector:, live:, current_size: state.current_size + 1)
-      })
-      |> result.unwrap(state)
-    }
-    [] -> {
-      let key = monotonic_time()
-      let value = #(unique_int(), Waiting(caller:, monitor:, client:))
-
-      // If `queue.insert` fails, the client waiting for a connection will
-      // timeout.
-      let _ = queue.insert(state.queue, key, value)
-
-      State(..state, selector:)
-    }
-    [conn, ..idle] -> {
-      actor.send(client, Ok(conn))
-
-      let live = dict.insert(state.live, caller, Live(conn:, monitor:))
-
-      State(..state, selector:, live:, idle:)
+        state
+      }
+      None -> state.enqueue(state, caller, client, timeout, Timeout, CallerDown)
     }
   }
 
+  use selector <- state.with_selector(state)
+
   actor.continue(state)
-  |> actor.with_selector(state.selector)
+  |> actor.with_selector(selector)
+}
+
+fn handle_timeout(
+  state: State(conn, Message(conn, err), PoolError(err)),
+  sent: Int,
+  timeout: Int,
+) -> actor.Next(
+  State(conn, Message(conn, err), PoolError(err)),
+  Message(conn, err),
+) {
+  let state = {
+    let on_expiry = actor.send(_, Error(ConnectionTimeout))
+
+    state.expire(state, sent, timeout, on_expiry:, or_else: Timeout)
+  }
+
+  use selector <- state.with_selector(state)
+
+  actor.continue(state)
+  |> actor.with_selector(selector)
 }
 
 fn handle_pool_exit(
-  state: State(conn, err),
+  state: State(conn, Message(conn, err), PoolError(err)),
   exit: process.ExitMessage,
-) -> actor.Next(State(conn, err), Message(conn, err)) {
-  state.idle
-  |> list.each(state.handle_close)
+) -> actor.Next(
+  State(conn, Message(conn, err), PoolError(err)),
+  Message(conn, err),
+) {
+  state.close(state)
 
   case exit.reason {
     process.Normal -> actor.stop()
@@ -343,64 +330,32 @@ fn handle_pool_exit(
 }
 
 fn handle_caller_down(
-  state: State(conn, err),
+  state: State(conn, Message(conn, err), PoolError(err)),
   down: process.Down,
-) -> actor.Next(State(conn, err), Message(conn, err)) {
+) -> actor.Next(
+  State(conn, Message(conn, err), PoolError(err)),
+  Message(conn, err),
+) {
   let assert process.ProcessDown(pid:, ..) = down
 
-  let state = case dict.get(state.live, pid) {
-    Error(_) -> state
-    Ok(Live(conn:, monitor:)) -> {
-      process.demonitor_process(monitor)
+  let handler = fn(client, conn) { actor.send(client, Ok(conn)) }
+  let state = state.dequeue(state, None, pid, CallerDown, handler)
 
-      let selector = process.deselect_specific_monitor(state.selector, monitor)
-
-      let live = dict.delete(state.live, pid)
-
-      case queue.first_lookup(state.queue) {
-        Some(#(sent, #(_int, Waiting(caller:, monitor:, client:)))) -> {
-          let assert Ok(Nil) = queue.delete_key(state.queue, sent)
-
-          actor.send(client, Ok(conn))
-
-          let live = dict.insert(live, caller, Live(conn:, monitor:))
-
-          State(..state, selector:, live:)
-        }
-        None -> {
-          let idle = list.prepend(state.idle, conn)
-
-          State(..state, selector:, idle:, live:)
-        }
-      }
-    }
-  }
+  use selector <- state.with_selector(state)
 
   actor.continue(state)
-  |> actor.with_selector(state.selector)
+  |> actor.with_selector(selector)
 }
 
 fn handle_shutdown(
-  state: State(conn, err),
-  client: process.Subject(Result(Nil, err)),
-) -> actor.Next(State(conn, err), Message(conn, err)) {
-  case dict.size(state.live) {
-    0 -> {
-      state.idle
-      |> list.each(state.handle_close)
+  state: State(conn, Message(conn, err), PoolError(err)),
+  client: process.Subject(Result(Nil, PoolError(err))),
+) -> actor.Next(
+  State(conn, Message(conn, err), PoolError(err)),
+  Message(conn, err),
+) {
+  state.shutdown(state)
 
-      actor.send(client, Ok(Nil))
-      actor.stop()
-    }
-    _ -> {
-      actor.send(client, Ok(Nil))
-      actor.stop()
-    }
-  }
+  actor.send(client, Ok(Nil))
+  actor.stop()
 }
-
-@external(erlang, "db_pool_ffi", "unique_int")
-fn unique_int() -> Int
-
-@external(erlang, "erlang", "monotonic_time")
-fn monotonic_time() -> Int
