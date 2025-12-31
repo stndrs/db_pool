@@ -1,5 +1,6 @@
 import db_pool
 import gleam/erlang/process
+import gleam/erlang/reference
 import gleam/int
 import gleam/otp/actor
 import gleam/otp/static_supervisor
@@ -65,6 +66,35 @@ pub fn supervised_test() {
     |> static_supervisor.start
 }
 
+pub fn checkout_current_connection_test() {
+  let name = process.new_name("db_pool_test")
+
+  let new_pool =
+    db_pool.new()
+    |> db_pool.size(2)
+    |> db_pool.on_open(fn() { Ok(reference.new()) })
+    |> db_pool.on_close(fn(_) { Ok(Nil) })
+    |> db_pool.on_interval(fn(_) { Nil })
+
+  let assert Ok(pool) = db_pool.start(new_pool, name, 200)
+
+  let self = process.self()
+
+  let assert Ok(conn1) = db_pool.checkout(pool.data, self, 200)
+
+  let assert Ok(conn2) = db_pool.checkout(pool.data, self, 200)
+
+  assert conn1 == conn2
+
+  process.spawn(fn() {
+    let self = process.self()
+
+    let assert Ok(conn3) = db_pool.checkout(pool.data, self, 200)
+
+    assert conn1 != conn3
+  })
+}
+
 pub fn checkout_checkin_test() {
   let pool = db_pool()
 
@@ -82,7 +112,7 @@ pub fn checkout_exhaustion_test() {
     let self = process.self()
     let assert Ok(Nil) = db_pool.checkout(pool, self, 50)
 
-    process.sleep(200)
+    process.sleep(100)
 
     db_pool.checkin(pool, Nil, self)
   })
@@ -91,15 +121,19 @@ pub fn checkout_exhaustion_test() {
     let self = process.self()
     let assert Ok(Nil) = db_pool.checkout(pool, self, 50)
 
-    process.sleep(200)
+    process.sleep(100)
 
     db_pool.checkin(pool, Nil, self)
   })
 
-  process.sleep(100)
+  process.spawn(fn() {
+    process.sleep(50)
 
-  let assert Error(db_pool.ConnectionTimeout) =
-    db_pool.checkout(pool, process.self(), 50)
+    let self = process.self()
+
+    let assert Error(db_pool.ConnectionTimeout) =
+      db_pool.checkout(pool, self, 50)
+  })
 }
 
 pub fn caller_down_test() {

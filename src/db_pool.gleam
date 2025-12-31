@@ -231,22 +231,33 @@ fn handle_message(
       |> actor.with_selector(selector)
     }
     CheckOut(client:, caller:, timeout:) -> {
-      let state = {
-        use conn <- state.with_connection(state)
+      let state = case state.current_connection(state, caller) {
+        Some(conn) -> {
+          actor.send(client, Ok(conn))
 
-        case conn {
-          Some(Ok(conn)) -> {
-            actor.send(client, Ok(conn))
+          state
+        }
+        None -> {
+          use next <- state.next_connection(state)
 
-            state.claim(state, caller, conn, CallerDown)
-          }
-          Some(Error(err)) -> {
-            actor.send(client, Error(err))
+          next
+          |> option.map(fn(conn) {
+            actor.send(client, conn)
 
-            state
-          }
-          None ->
-            state.enqueue(state, caller, client, timeout, Timeout, CallerDown)
+            conn
+            |> result.map(state.claim(state, caller, _, CallerDown))
+            |> result.unwrap(state)
+          })
+          |> option.lazy_unwrap(fn() {
+            state.enqueue(
+              state,
+              caller,
+              client,
+              timeout,
+              on_timeout: Timeout,
+              on_down: CallerDown,
+            )
+          })
         }
       }
 

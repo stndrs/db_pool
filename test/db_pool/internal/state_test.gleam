@@ -3,6 +3,16 @@ import db_pool/internal/state
 import gleam/erlang/process
 import gleam/option.{None, Some}
 
+pub fn current_connection_none_test() {
+  let state =
+    process.new_selector()
+    |> state.new
+
+  let self = process.self()
+
+  assert None == state.current_connection(state, self)
+}
+
 pub fn enqueue_test() {
   let state =
     process.new_selector()
@@ -36,12 +46,18 @@ pub fn claim_test() {
 
   assert 0 == state.active_size(state)
 
+  let self = process.self()
+
+  assert None == state.current_connection(state, self)
+
   let state =
-    state.with_connection(state, fn(conn) {
+    state.next_connection(state, fn(conn) {
       let assert Some(Ok(conn)) = conn
 
-      state.claim(state, process.self(), conn, fn(_) { Nil })
+      state.claim(state, self, conn, fn(_) { Nil })
     })
+
+  let assert Some(_conn) = state.current_connection(state, self)
 
   assert 1 == state.active_size(state)
 }
@@ -59,7 +75,7 @@ pub fn dequeue_test() {
   // Claim a connection
   let state =
     state
-    |> state.with_connection(fn(conn) {
+    |> state.next_connection(fn(conn) {
       let assert Some(Ok(conn)) = conn
 
       state
@@ -97,7 +113,7 @@ pub fn dequeue_without_connection_test() {
   // Claim a connection
   let state =
     state
-    |> state.with_connection(fn(conn) {
+    |> state.next_connection(fn(conn) {
       let assert Some(Ok(conn)) = conn
 
       state

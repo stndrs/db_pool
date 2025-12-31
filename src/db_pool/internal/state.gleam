@@ -122,7 +122,7 @@ pub fn idle(
   State(..state, idle:)
 }
 
-pub fn active(
+fn active(
   state: State(conn, msg, err),
   active: Dict(process.Pid, Active(conn)),
 ) -> State(conn, msg, err) {
@@ -193,7 +193,16 @@ pub fn dequeue(
   })
 }
 
-pub fn with_connection(
+pub fn current_connection(
+  state: State(conn, msg, err),
+  caller: process.Pid,
+) -> Option(conn) {
+  dict.get(state.active, caller)
+  |> result.map(fn(active) { Some(active.conn) })
+  |> result.unwrap(None)
+}
+
+pub fn next_connection(
   state: State(conn, msg, err),
   next: fn(Option(Result(conn, err))) -> State(conn, msg, err),
 ) -> State(conn, msg, err) {
