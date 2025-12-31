@@ -1,4 +1,4 @@
-import db/pool/internal/state.{type State}
+import db_pool/internal/state.{type State}
 import gleam/erlang/process.{type Pid, type Subject}
 import gleam/list
 import gleam/option.{None, Some}
@@ -18,12 +18,12 @@ pub type PoolError(err) {
 /// Example:
 ///
 /// ```gleam
-///   let db_pool = pool.new()
-///     |> pool.size(5)
-///     |> pool.interval(1000)
-///     |> pool.on_open(database.open)
-///     |> pool.on_close(database.close)
-///     |> pool.on_interval(database.ping)
+///   let db_pool = db_pool.new()
+///     |> db_pool.size(5)
+///     |> db_pool.interval(1000)
+///     |> db_pool.on_open(database.open)
+///     |> db_pool.on_close(database.close)
+///     |> db_pool.on_interval(database.ping)
 /// ```
 ///
 pub opaque type Pool(conn, err) {

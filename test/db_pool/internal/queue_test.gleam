@@ -1,4 +1,4 @@
-import db/pool/internal/queue
+import db_pool/internal/queue
 
 pub fn queue_test() {
   let data = queue.new("test_queue")

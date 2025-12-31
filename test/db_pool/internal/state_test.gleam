@@ -1,5 +1,5 @@
-import db/pool/internal
-import db/pool/internal/state
+import db_pool/internal
+import db_pool/internal/state
 import gleam/erlang/process
 import gleam/option.{None, Some}
 

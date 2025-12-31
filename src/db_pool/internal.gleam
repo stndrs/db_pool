@@ -1,5 +1,4 @@
-pub type TimeUnit {
-  Native
+type TimeUnit {
   Millisecond
 }
 

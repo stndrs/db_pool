@@ -1,5 +1,5 @@
-import db/pool/internal
-import db/pool/internal/queue.{type Queue}
+import db_pool/internal
+import db_pool/internal/queue.{type Queue}
 import gleam/bool
 import gleam/dict.{type Dict}
 import gleam/erlang/process

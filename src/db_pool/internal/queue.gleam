@@ -1,4 +1,4 @@
-import db/pool/internal
+import db_pool/internal
 import gleam/erlang/atom.{type Atom}
 import gleam/int
 

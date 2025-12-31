@@ -13,28 +13,32 @@ Callers are monitored so if they crash their checked out connections can be adde
 
 ```gleam
 import database
-import db/pool
+import db_pool
 import gleam/erlang/process
 
 pub fn main() -> Nil {
-  let db_pool =
-    pool.new()
-    |> pool.size(5)
-    |> pool.on_open(database.open)
-    |> pool.on_close(database.close)
-    |> pool.on_interval(database.ping)
+  let name = process.new_name("db_pool")
 
-  let assert Ok(_) = pool.start(db_pool, 1000)
+  let db_pool =
+    db_pool.new()
+    |> db_pool.size(5)
+    |> db_pool.on_open(database.open)
+    |> db_pool.on_close(database.close)
+    |> db_pool.on_interval(database.ping)
+
+  let assert Ok(started) = db_pool.start(db_pool, name, 1000)
+
+  let pool = started.data
 
   let self = process.self()
 
-  let assert Ok(conn) = pool.checkout(db_pool, self, 500)
+  let assert Ok(conn) = db_pool.checkout(pool, self, 500)
 
   let assert Ok(users) = database.query("SELECT * FROM users", conn)
 
-  pool.checkin(db_pool, conn, self)
+  db_pool.checkin(pool, conn, self)
 
-  let assert Ok(_) = pool.shutdown(new_pool, 1000)
+  let assert Ok(_) = db_pool.shutdown(pool, 1000)
 }
 ```
 
