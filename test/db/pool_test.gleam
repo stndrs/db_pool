@@ -1,5 +1,6 @@
 import db/pool
 import gleam/erlang/process
+import gleam/otp/actor
 import gleam/otp/static_supervisor
 import global_value
 
@@ -15,6 +16,20 @@ pub fn start_test() {
   let assert Ok(pool) = pool.start(new_pool, name, 200)
 
   let assert Ok(_) = pool.shutdown(pool.data, 200)
+}
+
+pub fn start_error_test() {
+  let new_pool =
+    pool.new()
+    |> pool.size(2)
+    |> pool.on_open(fn() { Error("oops") })
+    |> pool.on_close(fn(_) { Ok(Nil) })
+    |> pool.on_ping(fn(_) { Nil })
+
+  let name = process.new_name("db_pool_test")
+
+  let assert Error(actor.InitFailed("(db_pool) Failed to open connections")) =
+    pool.start(new_pool, name, 200)
 }
 
 pub fn supervised_test() {
@@ -48,7 +63,7 @@ pub fn checkout_checkin_test() {
 pub fn checkout_exhaustion_test() {
   let pool = db_pool()
 
-  process.spawn_unlinked(fn() {
+  process.spawn(fn() {
     let self = process.self()
     let assert Ok(Nil) = pool.checkout(pool, self, 50)
 
@@ -57,7 +72,7 @@ pub fn checkout_exhaustion_test() {
     pool.checkin(pool, Nil, self)
   })
 
-  process.spawn_unlinked(fn() {
+  process.spawn(fn() {
     let self = process.self()
     let assert Ok(Nil) = pool.checkout(pool, self, 50)
 
@@ -146,28 +161,28 @@ pub fn waiting_caller_timeout_test() {
     |> pool.on_close(fn(_) { Ok(Nil) })
     |> pool.on_ping(fn(_) { Nil })
 
-  let assert Ok(pool) = pool.start(pool, name, 50)
+  let assert Ok(pool) = pool.start(pool, name, 100)
 
   process.spawn(fn() {
     let self = process.self()
 
-    let assert Ok(Nil) = pool.checkout(pool.data, self, 50)
+    let assert Ok(Nil) = pool.checkout(pool.data, self, 100)
 
-    process.sleep(150)
+    process.sleep(100)
 
     pool.checkin(pool.data, Nil, self)
   })
 
-  process.spawn_unlinked(fn() {
+  process.spawn(fn() {
     let self = process.self()
 
     let assert Error(pool.ConnectionTimeout) =
-      pool.checkout(pool.data, self, 50)
+      pool.checkout(pool.data, self, 100)
 
     pool.checkin(pool.data, Nil, self)
   })
 
-  process.sleep(200)
+  process.sleep(150)
 
   let assert Ok(_) = pool.shutdown(pool.data, 100)
 }

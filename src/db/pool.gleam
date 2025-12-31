@@ -7,8 +7,6 @@ import gleam/otp/supervision
 import gleam/result
 
 pub type PoolError(err) {
-  OpenError(err)
-  CloseError(err)
   ConnectionError(err)
   ConnectionTimeout
 }
@@ -57,7 +55,7 @@ pub fn on_open(
   pool: Pool(conn, err),
   handle_open: fn() -> Result(conn, err),
 ) -> Pool(conn, err) {
-  let handle_open = fn() { handle_open() |> result.map_error(OpenError) }
+  let handle_open = fn() { handle_open() |> result.map_error(ConnectionError) }
 
   Pool(..pool, handle_open:)
 }
@@ -69,7 +67,7 @@ pub fn on_close(
   handle_close: fn(conn) -> Result(Nil, err),
 ) -> Pool(conn, err) {
   let handle_close = fn(conn) {
-    handle_close(conn) |> result.map_error(CloseError)
+    handle_close(conn) |> result.map_error(ConnectionError)
   }
 
   Pool(..pool, handle_close:)
@@ -127,7 +125,7 @@ fn initialise_pool(
   let resources = {
     list.repeat("", pool.size)
     |> list.try_map(fn(_) { pool.handle_open() })
-    |> result.map_error(fn(_) { "Pgl pool failed to initialise" })
+    |> result.map_error(fn(_) { "(db_pool) Failed to open connections" })
   }
 
   use resources <- result.map(resources)

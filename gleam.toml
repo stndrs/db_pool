@@ -10,7 +10,8 @@ repository = { type = "github", user = "stndrs", repo = "db_pool" }
 target = "erlang"
 
 internal_modules = [
-  "db/pool/internal/*"
+  "db/pool/internal/*",
+  "db/pool/internal"
 ]
 
 [dependencies]
