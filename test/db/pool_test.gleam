@@ -1,5 +1,6 @@
 import db/pool
 import gleam/erlang/process
+import gleam/int
 import gleam/otp/actor
 import gleam/otp/static_supervisor
 import global_value
@@ -101,25 +102,28 @@ pub fn caller_down_test() {
   let pool =
     pool.new()
     |> pool.size(1)
-    |> pool.on_open(fn() { Ok(Nil) })
+    |> pool.on_open(fn() { Ok(int.random(10)) })
     |> pool.on_close(fn(_) { Ok(Nil) })
     |> pool.on_interval(fn(_) { Nil })
 
   let assert Ok(pool) = pool.start(pool, name, 200)
 
-  process.spawn_unlinked(fn() {
-    let self = process.self()
+  let caller =
+    process.spawn_unlinked(fn() {
+      let self = process.self()
 
-    let assert Ok(Nil) = pool.checkout(pool.data, self, 200)
+      let assert Ok(_conn) = pool.checkout(pool.data, self, 100)
 
-    panic as "Crash!"
-  })
+      process.sleep_forever()
+    })
 
   process.sleep(200)
 
+  process.kill(caller)
+
   let self = process.self()
 
-  let assert Ok(Nil) = pool.checkout(pool.data, self, 200)
+  let assert Ok(_conn) = pool.checkout(pool.data, self, 200)
 
   let assert Ok(_) = pool.shutdown(pool.data, 200)
 }
