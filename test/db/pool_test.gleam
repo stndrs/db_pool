@@ -4,13 +4,21 @@ import gleam/otp/actor
 import gleam/otp/static_supervisor
 import global_value
 
+pub fn new_error_test() {
+  let db_pool = pool.new()
+
+  let name = process.new_name("db_pool_test")
+
+  let assert Error(actor.InitFailed(_)) = pool.start(db_pool, name, 200)
+}
+
 pub fn start_test() {
   let new_pool =
     pool.new()
     |> pool.size(2)
     |> pool.on_open(fn() { Ok(Nil) })
     |> pool.on_close(fn(_) { Ok(Nil) })
-    |> pool.on_ping(fn(_) { Nil })
+    |> pool.on_interval(fn(_) { Nil })
 
   let name = process.new_name("db_pool_test")
   let assert Ok(pool) = pool.start(new_pool, name, 200)
@@ -24,7 +32,7 @@ pub fn start_error_test() {
     |> pool.size(2)
     |> pool.on_open(fn() { Error("oops") })
     |> pool.on_close(fn(_) { Ok(Nil) })
-    |> pool.on_ping(fn(_) { Nil })
+    |> pool.on_interval(fn(_) { Nil })
 
   let name = process.new_name("db_pool_test")
 
@@ -40,7 +48,7 @@ pub fn supervised_test() {
     |> pool.size(2)
     |> pool.on_open(fn() { Ok(Nil) })
     |> pool.on_close(fn(_) { Ok(Nil) })
-    |> pool.on_ping(fn(_) { Nil })
+    |> pool.on_interval(fn(_) { Nil })
 
   let pool_spec = pool.supervised(new_pool, name, 200)
 
@@ -95,7 +103,7 @@ pub fn caller_down_test() {
     |> pool.size(1)
     |> pool.on_open(fn() { Ok(Nil) })
     |> pool.on_close(fn(_) { Ok(Nil) })
-    |> pool.on_ping(fn(_) { Nil })
+    |> pool.on_interval(fn(_) { Nil })
 
   let assert Ok(pool) = pool.start(pool, name, 200)
 
@@ -124,7 +132,7 @@ pub fn waiting_caller_test() {
     |> pool.size(1)
     |> pool.on_open(fn() { Ok(Nil) })
     |> pool.on_close(fn(_) { Ok(Nil) })
-    |> pool.on_ping(fn(_) { Nil })
+    |> pool.on_interval(fn(_) { Nil })
 
   let assert Ok(pool) = pool.start(pool, name, 200)
 
@@ -159,7 +167,7 @@ pub fn waiting_caller_timeout_test() {
     |> pool.size(1)
     |> pool.on_open(fn() { Ok(Nil) })
     |> pool.on_close(fn(_) { Ok(Nil) })
-    |> pool.on_ping(fn(_) { Nil })
+    |> pool.on_interval(fn(_) { Nil })
 
   let assert Ok(pool) = pool.start(pool, name, 100)
 
@@ -195,7 +203,7 @@ pub fn pool_exit_test() {
     |> pool.size(2)
     |> pool.on_open(fn() { Ok(Nil) })
     |> pool.on_close(fn(_) { Ok(Nil) })
-    |> pool.on_ping(fn(_) { Nil })
+    |> pool.on_interval(fn(_) { Nil })
 
   let assert Ok(pool) = pool.start(db_pool, name, 200)
 
@@ -214,7 +222,7 @@ fn db_pool() -> process.Subject(pool.Message(Nil, err)) {
       |> pool.size(2)
       |> pool.on_open(fn() { Ok(Nil) })
       |> pool.on_close(fn(_) { Ok(Nil) })
-      |> pool.on_ping(fn(_) { Nil })
+      |> pool.on_interval(fn(_) { Nil })
 
     let assert Ok(pool) = pool.start(db_pool, name, 200)
 

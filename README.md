@@ -22,7 +22,7 @@ pub fn main() -> Nil {
     |> pool.size(5)
     |> pool.on_open(database.open)
     |> pool.on_close(database.close)
-    |> pool.on_ping(database.ping)
+    |> pool.on_interval(database.ping)
 
   let assert Ok(_) = pool.start(db_pool, 1000)
 
@@ -40,9 +40,9 @@ pub fn main() -> Nil {
 
 ## Installation
 
-TODO
-
-Further documentation can be found at <https://hexdocs.pm/db_pool>.
+```sh
+gleam add db_pool
+```
 
 ## Development
 

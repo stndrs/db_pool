@@ -31,10 +31,10 @@ pub opaque type State(conn, msg, err) {
     handle_open: fn() -> Result(conn, err),
     // close connection
     handle_close: fn(conn) -> Result(Nil, err),
-    // called on each connection every `idle_interval`
-    handle_ping: fn(conn) -> Nil,
+    // called on each connection every `interval`
+    handle_interval: fn(conn) -> Nil,
     // idle time between pings
-    idle_interval: Int,
+    interval: Int,
     // idle connections
     idle: List(conn),
     // connections in use
@@ -51,8 +51,8 @@ pub fn new(selector: process.Selector(msg)) -> State(conn, msg, err) {
     current_size: 0,
     handle_open: fn() { panic },
     handle_close: fn(_) { panic },
-    handle_ping: fn(_) { Nil },
-    idle_interval: 1000,
+    handle_interval: fn(_) { Nil },
+    interval: 1000,
     idle: [],
     active: dict.new(),
     queue: queue.new("db_pool_queue"),
@@ -94,11 +94,11 @@ pub fn on_close(
   State(..state, handle_close:)
 }
 
-pub fn on_ping(
+pub fn on_interval(
   state: State(conn, msg, err),
-  handle_ping: fn(conn) -> Nil,
+  handle_interval: fn(conn) -> Nil,
 ) -> State(conn, msg, err) {
-  State(..state, handle_ping:)
+  State(..state, handle_interval:)
 }
 
 pub fn current_size(
@@ -108,11 +108,11 @@ pub fn current_size(
   State(..state, current_size:)
 }
 
-pub fn idle_interval(
+pub fn interval(
   state: State(conn, msg, err),
-  idle_interval: Int,
+  interval: Int,
 ) -> State(conn, msg, err) {
-  State(..state, idle_interval:)
+  State(..state, interval:)
 }
 
 pub fn idle(
@@ -296,11 +296,11 @@ pub fn shutdown(state: State(conn, msg, err)) -> Nil {
 }
 
 pub fn ping(state: State(conn, msg, err), message: msg) -> State(conn, msg, err) {
-  list.each(state.idle, state.handle_ping)
+  list.each(state.idle, state.handle_interval)
 
   let subject = process.new_subject()
 
-  let _timer = process.send_after(subject, state.idle_interval, message)
+  let _timer = process.send_after(subject, state.interval, message)
 
   state.selector
   |> process.select(subject)

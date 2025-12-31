@@ -195,7 +195,7 @@ pub fn ping_test() {
   let state =
     selector
     |> state.new
-    |> state.idle_interval(10)
+    |> state.interval(10)
     |> state.ping("Ping!")
 
   use selector <- state.with_selector(state)

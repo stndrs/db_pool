@@ -11,17 +11,28 @@ pub type PoolError(err) {
   ConnectionTimeout
 }
 
-/// A `Pool` configuration that informs how many connections will
-/// be opened, and how they will be opened when the pool is started.
-/// Also requires configured handlers for closing connections and
-/// for pinging connections every `idle_interval` milliseconds.
+/// A `Pool` configuration. Holds the size of the pool and functions
+/// for opening and closing connections. Can also be provided
+/// a function to be run every `interval` milliseconds.
+///
+/// Example:
+///
+/// ```gleam
+///   let db_pool = pool.new()
+///     |> pool.size(5)
+///     |> pool.interval(1000)
+///     |> pool.on_open(database.open)
+///     |> pool.on_close(database.close)
+///     |> pool.on_interval(database.ping)
+/// ```
+///
 pub opaque type Pool(conn, err) {
   Pool(
     size: Int,
-    idle_interval: Int,
+    interval: Int,
     handle_open: fn() -> Result(conn, PoolError(err)),
     handle_close: fn(conn) -> Result(Nil, PoolError(err)),
-    handle_ping: fn(conn) -> Nil,
+    handle_interval: fn(conn) -> Nil,
   )
 }
 
@@ -29,9 +40,9 @@ pub opaque type Pool(conn, err) {
 pub fn new() -> Pool(conn, err) {
   let handle_open = fn() { Error(ConnectionTimeout) }
   let handle_close = fn(_) { Ok(Nil) }
-  let handle_ping = fn(_) { Nil }
+  let handle_interval = fn(_) { Nil }
 
-  Pool(size: 5, idle_interval: 1000, handle_open:, handle_close:, handle_ping:)
+  Pool(size: 5, interval: 1000, handle_open:, handle_close:, handle_interval:)
 }
 
 /// Sets the size of the pool. At startup the pool will create `size`
@@ -40,17 +51,14 @@ pub fn size(pool: Pool(conn, err), size: Int) -> Pool(conn, err) {
   Pool(..pool, size:)
 }
 
-/// Sets the `Pool`'s `idle_interval` value. The pool will call the
-/// configured `on_ping` function every `idle_interval` milliseconds.
-pub fn idle_interval(
-  pool: Pool(conn, err),
-  idle_interval: Int,
-) -> Pool(conn, err) {
-  Pool(..pool, idle_interval:)
+/// Sets the `Pool`'s `interval` value. The pool will call the
+/// configured `on_interval` function every `interval` milliseconds.
+pub fn interval(pool: Pool(conn, err), interval: Int) -> Pool(conn, err) {
+  Pool(..pool, interval:)
 }
 
-/// Sets the `Pool`'s `on_open` function. The provided function
-/// will be called at startup to create connections.
+/// Sets the `Pool`'s `on_open` function. The provided function will be
+/// called at startup to create connections.
 pub fn on_open(
   pool: Pool(conn, err),
   handle_open: fn() -> Result(conn, err),
@@ -60,8 +68,8 @@ pub fn on_open(
   Pool(..pool, handle_open:)
 }
 
-/// Sets the `Pool`'s `on_close` function. The provided function
-/// will be called when the pool is shut down or exits.
+/// Sets the `Pool`'s `on_close` function. The provided function will be
+/// called on each idle connection when the pool is shut down or exits.
 pub fn on_close(
   pool: Pool(conn, err),
   handle_close: fn(conn) -> Result(Nil, err),
@@ -73,13 +81,13 @@ pub fn on_close(
   Pool(..pool, handle_close:)
 }
 
-/// Sets the `Pool`'s `on_close` function. The provided function
-/// will be called every `idle_interval` milliseconds.
-pub fn on_ping(
+/// Sets the `Pool`'s `on_interval` function. The provided function
+/// will be called every `interval` milliseconds.
+pub fn on_interval(
   pool: Pool(conn, err),
-  handle_ping: fn(conn) -> Nil,
+  handle_interval: fn(conn) -> Nil,
 ) -> Pool(conn, err) {
-  Pool(..pool, handle_ping:)
+  Pool(..pool, handle_interval:)
 }
 
 /// Starts a connection pool.
@@ -93,7 +101,7 @@ pub fn start(
   |> actor.named(name)
   |> actor.start
   |> result.map(fn(started) {
-    let _timer = process.send_after(started.data, pool.idle_interval, Ping)
+    let _timer = process.send_after(started.data, pool.interval, Interval)
 
     started
   })
@@ -142,16 +150,16 @@ fn initialise_pool(
   |> state.current_size(pool.size)
   |> state.on_open(pool.handle_open)
   |> state.on_close(pool.handle_close)
-  |> state.on_ping(pool.handle_ping)
+  |> state.on_interval(pool.handle_interval)
   |> state.idle(resources)
-  |> state.idle_interval(pool.idle_interval)
+  |> state.interval(pool.interval)
   |> actor.initialised
   |> actor.selecting(selector)
   |> actor.returning(self)
 }
 
 pub opaque type Message(conn, err) {
-  Ping
+  Interval
   CheckIn(conn: conn, caller: Pid)
   CheckOut(
     client: Subject(Result(conn, PoolError(err))),
@@ -164,34 +172,21 @@ pub opaque type Message(conn, err) {
   Shutdown(client: process.Subject(Result(Nil, PoolError(err))))
 }
 
-/// Attempts to check out a connection from the pool. If successful
-/// the connection will be associated with the caller's `Pid`. If
-/// no connections are available, the caller will be added to a
-/// queue. Calls to this function will time out if no connections
-/// become available before the specified timeout.
-///
-/// The provided timeout will have 50 milliseconds added onto it
-/// internally. So if you want to wait at most 1000 milliseconds,
-/// you should provided a timeout of 950.
-///
-/// The 50 millisecond padding added here allows callers to wait in
-/// the queue. The queue will respond with a connection or an error
-/// value before the provided `timeout` is reached.
-///
-/// Without padding the timeout the process will always panic before
-/// callers added to the queue can be sent a reply.
+/// Attempts to check out a connection from the pool.
 pub fn checkout(
   pool: Subject(Message(conn, err)),
   caller: Pid,
   timeout: Int,
 ) -> Result(conn, PoolError(err)) {
-  process.call(pool, timeout + 50, CheckOut(_, caller:, timeout:))
+  let #(process_timeout, timeout) = case { timeout - 50 } < 0 {
+    True -> #(timeout, timeout)
+    False -> #(timeout + 50, timeout - 50)
+  }
+
+  process.call(pool, process_timeout, CheckOut(_, caller:, timeout:))
 }
 
-/// Returns a connection back to the pool. If there are other callers
-/// waiting in the queue, the provided connection will be given to them.
-/// Otherwise the connection will be returned back to the list of idle
-/// connections.
+/// Returns a connection back to the pool.
 pub fn checkin(
   pool: Subject(Message(conn, err)),
   conn: conn,
@@ -216,7 +211,7 @@ fn handle_message(
   Message(conn, err),
 ) {
   case msg {
-    Ping -> handle_ping(state)
+    Interval -> handle_interval(state)
     CheckIn(conn:, caller:) -> handle_checkin(state, conn, caller)
     CheckOut(client:, caller:, timeout:) ->
       handle_checkout(state, client, caller, timeout)
@@ -227,13 +222,13 @@ fn handle_message(
   }
 }
 
-fn handle_ping(
+fn handle_interval(
   state: State(conn, Message(conn, err), PoolError(err)),
 ) -> actor.Next(
   State(conn, Message(conn, err), PoolError(err)),
   Message(conn, err),
 ) {
-  let state = state.ping(state, Ping)
+  let state = state.ping(state, Interval)
 
   use selector <- state.with_selector(state)
 
