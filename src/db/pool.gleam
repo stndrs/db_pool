@@ -178,9 +178,11 @@ pub fn checkout(
   caller: Pid,
   timeout: Int,
 ) -> Result(conn, PoolError(err)) {
-  let #(process_timeout, timeout) = case { timeout - 50 } < 0 {
+  let checkout_timeout = timeout - 50
+
+  let #(process_timeout, timeout) = case checkout_timeout < 0 {
     True -> #(timeout, timeout)
-    False -> #(timeout + 50, timeout - 50)
+    False -> #(timeout + 50, checkout_timeout)
   }
 
   process.call(pool, process_timeout, CheckOut(_, caller:, timeout:))
