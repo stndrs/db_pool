@@ -1,9 +1,9 @@
-import db_pool/internal
 import db_pool/internal/state
 import gleam/erlang/process
 import gleam/erlang/reference
 import gleam/option.{None, Some}
 import gleam/result
+import rasa/counter
 
 pub fn current_connection_error_test() {
   let assert Ok(state) =
@@ -132,7 +132,10 @@ pub fn expire_test() {
     |> state.on_open(fn() { Ok(reference.new()) })
     |> state.build(process.new_selector())
 
-  let now_in_ms = internal.now_in_ms()
+  let assert Ok(now_in_ms) =
+    counter.Millisecond
+    |> counter.monotonic
+    |> counter.next
 
   assert 0 == state.queue_size(state)
 
@@ -165,7 +168,10 @@ pub fn expire_retry_test() {
     |> state.on_open(fn() { Ok(reference.new()) })
     |> state.build(process.new_selector())
 
-  let now_in_ms = internal.now_in_ms()
+  let assert Ok(now_in_ms) =
+    counter.Millisecond
+    |> counter.monotonic
+    |> counter.next
 
   assert 0 == state.queue_size(state)
 
