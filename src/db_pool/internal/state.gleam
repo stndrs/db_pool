@@ -1,18 +1,18 @@
-import db_pool/internal
-import db_pool/internal/queue.{type Queue}
 import gleam/bool
 import gleam/dict.{type Dict}
 import gleam/erlang/process
 import gleam/list
 import gleam/option.{type Option}
 import gleam/result
+import rasa
+import rasa/counter
+import rasa/queue.{type Queue}
 
 pub opaque type Waiting(conn, err) {
   Waiting(
     caller: process.Pid,
     monitor: process.Monitor,
     client: process.Subject(Result(conn, err)),
-    timer: process.Timer,
   )
 }
 
@@ -94,7 +94,9 @@ pub opaque type State(conn, msg, err) {
     // connections in use
     active: Dict(process.Pid, Active(conn)),
     // processes waiting for a connection
-    queue: Queue(Int, Waiting(conn, err)),
+    queue: Queue(Waiting(conn, err)),
+    // monotonic time counter
+    counter: counter.Counter,
   )
 }
 
@@ -110,6 +112,13 @@ pub fn build(
 
   use idle <- result.map(connections)
 
+  let counter = counter.monotonic(counter.Millisecond)
+
+  let queue =
+    queue.build("db_pool_queue")
+    |> queue.with_access(rasa.Private)
+    |> queue.new(counter)
+
   State(
     selector:,
     max_size: builder.max_size,
@@ -120,7 +129,8 @@ pub fn build(
     interval: builder.interval,
     idle:,
     active: dict.new(),
-    queue: queue.new("db_pool_queue"),
+    queue:,
+    counter:,
   )
 }
 
@@ -167,8 +177,8 @@ pub fn dequeue(
   })
 
   {
-    use #(time_sent, waiting) <- result.try(queue.first_lookup(state.queue))
-    use _ <- result.map(queue.delete_key(state.queue, time_sent))
+    use #(time_sent, waiting) <- result.try(queue.first(state.queue))
+    use _ <- result.map(queue.delete(state.queue, time_sent))
 
     let monitor = process.monitor(waiting.caller)
     let next = Active(conn: prev.conn, monitor:)
@@ -178,7 +188,6 @@ pub fn dequeue(
       |> dict.delete(caller)
       |> dict.insert(waiting.caller, next)
 
-    process.cancel_timer(waiting.timer)
     process.demonitor_process(prev.monitor)
 
     let selector =
@@ -269,15 +278,14 @@ pub fn enqueue(
   on_timeout handle_timeout: fn(Int, Int) -> msg,
   on_down handle_down: fn(process.Down) -> msg,
 ) -> State(conn, msg, err) {
-  let now_in_ms = internal.now_in_ms()
-  let subject = process.new_subject()
-  let timer =
-    process.send_after(subject, timeout, handle_timeout(now_in_ms, timeout))
-
   let monitor = process.monitor(caller)
-  let waiting = Waiting(caller:, monitor:, client:, timer:)
+  let waiting = Waiting(caller:, monitor:, client:)
 
-  let assert Ok(Nil) = queue.insert(state.queue, now_in_ms, waiting)
+  let assert Ok(now_in_ms) = queue.push(state.queue, waiting)
+
+  let subject = process.new_subject()
+  let _timer =
+    process.send_after(subject, timeout, handle_timeout(now_in_ms, timeout))
 
   let selector =
     state.selector
@@ -294,29 +302,23 @@ pub fn expire(
   on_expiry next: fn(process.Subject(Result(conn, err))) -> Nil,
   or_else extend: fn(Int, Int) -> msg,
 ) -> State(conn, msg, err) {
-  queue.lookup(state.queue, sent)
-  |> result.map(fn(waiting) {
-    let now = internal.now_in_ms()
+  queue.at(state.queue, sent)
+  |> result.try(fn(waiting) {
+    use now <- result.map(counter.next(state.counter))
 
     use <- bool.lazy_guard(when: { now < { sent + timeout } }, return: fn() {
-      process.cancel_timer(waiting.timer)
-
       let subject = process.new_subject()
-      let timer = process.send_after(subject, timeout, extend(sent, timeout))
-
-      let assert Ok(Nil) =
-        queue.insert(state.queue, sent, Waiting(..waiting, timer:))
+      let _timer = process.send_after(subject, timeout, extend(sent, timeout))
 
       let selector = process.select(state.selector, subject)
 
       State(..state, selector:)
     })
 
-    let assert Ok(Nil) = queue.delete_key(state.queue, sent)
+    let assert Ok(Nil) = queue.delete(state.queue, sent)
 
     next(waiting.client)
 
-    process.cancel_timer(waiting.timer)
     process.demonitor_process(waiting.monitor)
 
     let selector =
