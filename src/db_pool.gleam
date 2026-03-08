@@ -8,6 +8,7 @@ import gleam/result
 pub type PoolError(err) {
   ConnectionError(err)
   ConnectionTimeout
+  ConnectionUnavailable
 }
 
 /// A `Pool` configuration. Holds the size of the pool and functions
@@ -29,6 +30,8 @@ pub opaque type Pool(conn, err) {
   Pool(
     size: Int,
     interval: Int,
+    queue_target: Int,
+    queue_interval: Int,
     handle_open: fn() -> Result(conn, PoolError(err)),
     handle_close: fn(conn) -> Result(Nil, PoolError(err)),
     handle_interval: fn(conn) -> Nil,
@@ -41,7 +44,15 @@ pub fn new() -> Pool(conn, err) {
   let handle_close = fn(_) { Ok(Nil) }
   let handle_interval = fn(_) { Nil }
 
-  Pool(size: 5, interval: 1000, handle_open:, handle_close:, handle_interval:)
+  Pool(
+    size: 5,
+    interval: 1000,
+    queue_target: 50,
+    queue_interval: 1000,
+    handle_open:,
+    handle_close:,
+    handle_interval:,
+  )
 }
 
 /// Sets the size of the pool. At startup the pool will create `size`
@@ -89,6 +100,20 @@ pub fn on_interval(
   Pool(..pool, handle_interval:)
 }
 
+/// Sets the CoDel queue target in milliseconds. This is the maximum
+/// acceptable queue delay before the pool considers itself overloaded.
+/// Defaults to 50ms.
+pub fn queue_target(pool: Pool(conn, err), target: Int) -> Pool(conn, err) {
+  Pool(..pool, queue_target: target)
+}
+
+/// Sets the CoDel queue interval in milliseconds. This is the length
+/// of each CoDel measurement interval. The pool evaluates queue health
+/// at each interval boundary. Defaults to 1000ms.
+pub fn queue_interval(pool: Pool(conn, err), interval: Int) -> Pool(conn, err) {
+  Pool(..pool, queue_interval: interval)
+}
+
 /// Starts a connection pool.
 pub fn start(
   pool: Pool(conn, err),
@@ -101,6 +126,12 @@ pub fn start(
   |> actor.start
   |> result.map(fn(started) {
     let _timer = process.send_after(started.data, pool.interval, Interval)
+    let _poll_timer =
+      process.send_after(
+        started.data,
+        pool.queue_interval,
+        Poll(time: 0, last_sent: 0),
+      )
 
     started
   })
@@ -142,6 +173,8 @@ fn initialise_pool(
   |> state.on_close(pool.handle_close)
   |> state.on_interval(pool.handle_interval)
   |> state.interval(pool.interval)
+  |> state.queue_target(pool.queue_target)
+  |> state.queue_interval(pool.queue_interval)
   |> state.build(selector)
   |> result.map(fn(state) {
     actor.initialised(state)
@@ -159,6 +192,7 @@ pub opaque type Message(conn, err) {
     timeout: Int,
   )
   Timeout(time_sent: Int, timeout: Int)
+  Poll(time: Int, last_sent: Int)
   PoolExit(process.ExitMessage)
   CallerDown(process.Down)
   Shutdown(client: process.Subject(Result(Nil, PoolError(err))))
@@ -215,7 +249,9 @@ fn handle_message(
     }
     CheckIn(conn:, caller:) -> {
       let handler = fn(client, conn) { actor.send(client, Ok(conn)) }
-      let state = state.dequeue(state, Some(conn), caller, CallerDown, handler)
+      let on_drop = actor.send(_, Error(ConnectionUnavailable))
+      let state =
+        state.dequeue(state, Some(conn), caller, CallerDown, handler, on_drop:)
 
       use selector <- state.with_selector(state)
 
@@ -260,7 +296,17 @@ fn handle_message(
       let assert process.ProcessDown(pid:, ..) = down
 
       let handler = fn(client, conn) { actor.send(client, Ok(conn)) }
-      let state = state.dequeue(state, None, pid, CallerDown, handler)
+      let on_drop = actor.send(_, Error(ConnectionUnavailable))
+      let state = state.dequeue(state, None, pid, CallerDown, handler, on_drop:)
+
+      use selector <- state.with_selector(state)
+
+      actor.continue(state)
+      |> actor.with_selector(selector)
+    }
+    Poll(time:, last_sent:) -> {
+      let on_drop = actor.send(_, Error(ConnectionUnavailable))
+      let state = state.poll(state, time, last_sent, on_poll: Poll, on_drop:)
 
       use selector <- state.with_selector(state)
 

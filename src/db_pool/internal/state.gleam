@@ -32,6 +32,10 @@ pub opaque type Builder(conn, err) {
     handle_interval: fn(conn) -> Nil,
     // idle time between pings
     interval: Int,
+    // maximum acceptable queue delay in ms
+    queue_target: Int,
+    // measurement interval in ms
+    queue_interval: Int,
   )
 }
 
@@ -42,6 +46,8 @@ pub fn new() -> Builder(conn, err) {
     handle_close: fn(_) { Ok(Nil) },
     handle_interval: fn(_) { Nil },
     interval: 1000,
+    queue_target: 50,
+    queue_interval: 1000,
   )
 }
 
@@ -74,6 +80,20 @@ pub fn interval(state: Builder(conn, err), interval: Int) -> Builder(conn, err) 
   Builder(..state, interval:)
 }
 
+pub fn queue_target(
+  state: Builder(conn, err),
+  queue_target: Int,
+) -> Builder(conn, err) {
+  Builder(..state, queue_target:)
+}
+
+pub fn queue_interval(
+  state: Builder(conn, err),
+  queue_interval: Int,
+) -> Builder(conn, err) {
+  Builder(..state, queue_interval:)
+}
+
 pub opaque type State(conn, msg, err) {
   State(
     selector: process.Selector(msg),
@@ -97,6 +117,16 @@ pub opaque type State(conn, msg, err) {
     queue: Queue(Waiting(conn, err)),
     // monotonic time counter
     counter: counter.Counter,
+    // maximum acceptable queue delay in ms
+    queue_target: Int,
+    // measurement interval in ms
+    queue_interval: Int,
+    // minimum delay observed in the current interval
+    delay: Int,
+    // whether the pool is in slow mode
+    slow: Bool,
+    // monotonic ms when the current interval ends
+    next: Int,
   )
 }
 
@@ -119,6 +149,9 @@ pub fn build(
     |> queue.with_access(rasa.Private)
     |> queue.new(counter)
 
+  // This shouldn't ever return `Error`
+  let assert Ok(now) = counter.next(counter)
+
   State(
     selector:,
     max_size: builder.max_size,
@@ -131,6 +164,11 @@ pub fn build(
     active: dict.new(),
     queue:,
     counter:,
+    queue_target: builder.queue_target,
+    queue_interval: builder.queue_interval,
+    delay: 0,
+    slow: False,
+    next: now + builder.queue_interval,
   )
 }
 
@@ -153,6 +191,14 @@ pub fn active_size(state: State(conn, msg, err)) -> Int {
   dict.size(state.active)
 }
 
+pub fn is_slow(state: State(conn, msg, err)) -> Bool {
+  state.slow
+}
+
+pub fn codel_delay(state: State(conn, msg, err)) -> Int {
+  state.delay
+}
+
 fn with_active(
   state: State(conn, msg, err),
   caller: process.Pid,
@@ -169,6 +215,7 @@ pub fn dequeue(
   caller: process.Pid,
   mapping: fn(process.Down) -> msg,
   handler: fn(process.Subject(Result(conn, err)), conn) -> Nil,
+  on_drop drop: fn(process.Subject(Result(conn, err))) -> Nil,
 ) -> State(conn, msg, err) {
   use prev <- with_active(state, caller)
 
@@ -176,36 +223,179 @@ pub fn dequeue(
     assert prev.conn == conn
   })
 
-  {
-    use #(time_sent, waiting) <- result.try(queue.first(state.queue))
-    use _ <- result.map(queue.delete(state.queue, time_sent))
+  // This shouldn't ever return `Error`
+  let assert Ok(now) = counter.next(state.counter)
 
-    let monitor = process.monitor(waiting.caller)
-    let next = Active(conn: prev.conn, monitor:)
+  let active = dict.delete(state.active, caller)
+  process.demonitor_process(prev.monitor)
+  let selector = process.deselect_specific_monitor(state.selector, prev.monitor)
+  let state = State(..state, selector:, active:)
 
-    let active =
-      state.active
-      |> dict.delete(caller)
-      |> dict.insert(waiting.caller, next)
+  codel_dequeue(state, now, prev.conn, mapping, handler, drop)
+}
 
-    process.demonitor_process(prev.monitor)
-
-    let selector =
-      state.selector
-      |> process.deselect_specific_monitor(prev.monitor)
-      |> process.select_specific_monitor(next.monitor, mapping)
-
-    let state = State(..state, selector:, active:)
-
-    handler(waiting.client, prev.conn)
-
-    state
+/// dispatches to the appropriate strategy based on
+/// whether we're at an interval boundary, in slow mode, or in fast mode.
+fn codel_dequeue(
+  state: State(conn, msg, err),
+  now: Int,
+  conn: conn,
+  mapping: fn(process.Down) -> msg,
+  handler: fn(process.Subject(Result(conn, err)), conn) -> Nil,
+  on_drop drop: fn(process.Subject(Result(conn, err))) -> Nil,
+) -> State(conn, msg, err) {
+  case now >= state.next {
+    // evaluate whether we should be slow or fast
+    True -> dequeue_first(state, now, conn, mapping, handler)
+    // Mid-interval
+    False ->
+      case state.slow {
+        False -> dequeue_fast(state, now, conn, mapping, handler)
+        True ->
+          dequeue_slow(
+            state,
+            now,
+            state.queue_target * 2,
+            conn,
+            mapping,
+            handler,
+            drop,
+          )
+      }
   }
-  |> result.lazy_unwrap(fn() {
-    let idle = list.prepend(state.idle, prev.conn)
+}
 
-    State(..state, idle:)
-  })
+/// Called at an interval boundary. Measures the delay of the first waiter,
+/// sets slow mode based on whether the previous interval's min delay
+/// exceeded the target, and resets the interval.
+fn dequeue_first(
+  state: State(conn, msg, err),
+  now: Int,
+  conn: conn,
+  mapping: fn(process.Down) -> msg,
+  handler: fn(process.Subject(Result(conn, err)), conn) -> Nil,
+) -> State(conn, msg, err) {
+  let next = now + state.queue_interval
+  let slow = state.delay > state.queue_target
+
+  case queue.first(state.queue) {
+    Ok(#(sent, waiting)) -> {
+      let assert Ok(Nil) = queue.delete(state.queue, sent)
+
+      let delay = now - sent
+      let state = State(..state, next:, delay:, slow:)
+
+      let state = serve_waiter(state, waiting, conn, mapping, handler)
+
+      // Track the minimum delay
+      case delay < state.delay {
+        True -> State(..state, delay:)
+        False -> state
+      }
+    }
+    _ -> {
+      // No waiters so return connection to idle
+      let idle = list.prepend(state.idle, conn)
+      State(..state, next:, delay: 0, slow:, idle:)
+    }
+  }
+}
+
+/// serve the first waiter immediately, tracking minimum delay.
+fn dequeue_fast(
+  state: State(conn, msg, err),
+  now: Int,
+  conn: conn,
+  mapping: fn(process.Down) -> msg,
+  handler: fn(process.Subject(Result(conn, err)), conn) -> Nil,
+) -> State(conn, msg, err) {
+  case queue.first(state.queue) {
+    Ok(#(sent, waiting)) -> {
+      let assert Ok(Nil) = queue.delete(state.queue, sent)
+      let delay = now - sent
+      // Update min delay if this is smaller
+      let state = case delay < state.delay {
+        True -> State(..state, delay:)
+        False -> state
+      }
+      serve_waiter(state, waiting, conn, mapping, handler)
+    }
+    _ -> {
+      // No waiters, return connection to idle
+      let idle = list.prepend(state.idle, conn)
+      State(..state, idle:, delay: 0)
+    }
+  }
+}
+
+/// drop waiters that have been waiting longer than the timeout
+/// threshold (target * 2), then serve the first valid waiter.
+fn dequeue_slow(
+  state: State(conn, msg, err),
+  now: Int,
+  timeout: Int,
+  conn: conn,
+  mapping: fn(process.Down) -> msg,
+  handler: fn(process.Subject(Result(conn, err)), conn) -> Nil,
+  on_drop drop: fn(process.Subject(Result(conn, err))) -> Nil,
+) -> State(conn, msg, err) {
+  case queue.first(state.queue) {
+    Ok(#(sent, waiting)) if now - sent > timeout -> {
+      // This waiter is too old. Drop it and continue
+      let assert Ok(Nil) = queue.delete(state.queue, sent)
+
+      drop(waiting.client)
+      process.demonitor_process(waiting.monitor)
+
+      let selector =
+        process.deselect_specific_monitor(state.selector, waiting.monitor)
+
+      State(..state, selector:)
+      |> dequeue_slow(now, timeout, conn, mapping, handler, drop)
+    }
+    Ok(#(sent, waiting)) -> {
+      // This waiter is fresh enough
+      let assert Ok(Nil) = queue.delete(state.queue, sent)
+
+      let delay = now - sent
+      let state = case delay < state.delay {
+        True -> State(..state, delay:)
+        False -> state
+      }
+
+      serve_waiter(state, waiting, conn, mapping, handler)
+    }
+    _ -> {
+      // No waiters, return connection to idle
+      let idle = list.prepend(state.idle, conn)
+      State(..state, idle:, delay: 0)
+    }
+  }
+}
+
+fn serve_waiter(
+  state: State(conn, msg, err),
+  waiting: Waiting(conn, err),
+  conn: conn,
+  mapping: fn(process.Down) -> msg,
+  handler: fn(process.Subject(Result(conn, err)), conn) -> Nil,
+) -> State(conn, msg, err) {
+  let monitor = process.monitor(waiting.caller)
+  let next = Active(conn:, monitor:)
+  let active = dict.insert(state.active, waiting.caller, next)
+
+  process.demonitor_process(waiting.monitor)
+
+  let selector =
+    state.selector
+    |> process.deselect_specific_monitor(waiting.monitor)
+    |> process.select_specific_monitor(next.monitor, mapping)
+
+  let state = State(..state, selector:, active:)
+
+  handler(waiting.client, conn)
+
+  state
 }
 
 pub fn checkout(
@@ -327,6 +517,100 @@ pub fn expire(
     State(..state, selector:)
   })
   |> result.unwrap(state)
+}
+
+/// Called periodically by the poll timer. Checks whether the queue has
+/// made progress since the last poll. If the queue has stalled (oldest
+/// entry hasn't changed), evaluates CoDel timeout logic to potentially
+/// enter slow mode and drop stale waiters.
+pub fn poll(
+  state: State(conn, msg, err),
+  time: Int,
+  last_sent: Int,
+  on_poll schedule_poll: fn(Int, Int) -> msg,
+  on_drop drop: fn(process.Subject(Result(conn, err))) -> Nil,
+) -> State(conn, msg, err) {
+  case queue.first(state.queue) {
+    // oldest entry is the same as or older than the last poll
+    Ok(#(sent, _)) if sent <= last_sent -> {
+      let delay = time - sent
+
+      state
+      |> codel_timeout(delay, time, drop)
+      |> start_poll(time, sent, schedule_poll)
+    }
+    // Queue is making progress
+    Ok(#(sent, _)) -> start_poll(state, time, sent, schedule_poll)
+    // Queue is empty
+    _ -> start_poll(state, time, time, schedule_poll)
+  }
+}
+
+/// If we're at an interval boundary and the minimum delay exceeds the target,
+/// enter slow mode and drop stale waiters.
+fn codel_timeout(
+  state: State(conn, msg, err),
+  delay: Int,
+  time: Int,
+  on_drop drop: fn(process.Subject(Result(conn, err))) -> Nil,
+) -> State(conn, msg, err) {
+  case time >= state.next, state.delay > state.queue_target {
+    // Interval boundary and delay exceeds target, enter slow mode
+    True, True -> {
+      State(..state, slow: True, delay:, next: time + state.queue_interval)
+      |> poll_drop_slow(time, state.queue_target * 2, drop)
+    }
+    // Interval boundary and delay within target, exit slow mode
+    True, False ->
+      State(..state, slow: False, delay:, next: time + state.queue_interval)
+    _, _ -> state
+  }
+}
+
+/// Drops all waiters from the front of the queue whose delay exceeds
+/// the given timeout threshold. Used by the poll timer when the pool
+/// is in slow mode.
+fn poll_drop_slow(
+  state: State(conn, msg, err),
+  now: Int,
+  timeout: Int,
+  on_drop drop: fn(process.Subject(Result(conn, err))) -> Nil,
+) -> State(conn, msg, err) {
+  case queue.first(state.queue) {
+    Ok(#(sent, waiting)) if now - sent > timeout -> {
+      let assert Ok(Nil) = queue.delete(state.queue, sent)
+
+      drop(waiting.client)
+      process.demonitor_process(waiting.monitor)
+
+      let selector =
+        process.deselect_specific_monitor(state.selector, waiting.monitor)
+
+      State(..state, selector:)
+      |> poll_drop_slow(now, timeout, drop)
+    }
+    _ -> state
+  }
+}
+
+/// Schedules the next poll timer.
+fn start_poll(
+  state: State(conn, msg, err),
+  now: Int,
+  last_sent: Int,
+  schedule_poll: fn(Int, Int) -> msg,
+) -> State(conn, msg, err) {
+  let poll_time = now + state.queue_interval
+  let subject = process.new_subject()
+  let _timer =
+    process.send_after(
+      subject,
+      state.queue_interval,
+      schedule_poll(poll_time, last_sent),
+    )
+  let selector = process.select(state.selector, subject)
+
+  State(..state, selector:)
 }
 
 pub fn shutdown(state: State(conn, msg, err)) -> Nil {
