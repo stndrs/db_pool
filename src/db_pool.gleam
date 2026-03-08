@@ -212,14 +212,7 @@ pub fn checkout(
   timeout: Int,
   deadline: Int,
 ) -> Result(conn, PoolError(err)) {
-  let checkout_timeout = timeout - 50
-
-  let #(process_timeout, timeout) = case checkout_timeout < 0 {
-    True -> #(timeout, timeout)
-    False -> #(timeout + 50, checkout_timeout)
-  }
-
-  process.call(pool, process_timeout, CheckOut(_, caller:, timeout:, deadline:))
+  process.call_forever(pool, CheckOut(_, caller:, timeout:, deadline:))
 }
 
 /// Returns a connection back to the pool.

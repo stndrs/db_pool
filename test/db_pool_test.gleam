@@ -132,7 +132,7 @@ pub fn checkout_exhaustion_test() {
     let self = process.self()
 
     let assert Error(db_pool.ConnectionTimeout) =
-      db_pool.checkout(pool, self, 50, 30_000)
+      db_pool.checkout(pool, self, 20, 30_000)
   })
 }
 
