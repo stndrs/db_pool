@@ -10,6 +10,7 @@ pub type PoolError(err) {
   ConnectionError(err)
   ConnectionTimeout
   ConnectionUnavailable
+  ConnectionDeadlineExceeded
 }
 
 /// A `Pool` configuration. Holds the size of the pool and functions
@@ -194,8 +195,10 @@ pub opaque type Message(conn, err) {
     client: Subject(Result(conn, PoolError(err))),
     caller: Pid,
     timeout: Int,
+    deadline: Int,
   )
   Timeout(time_sent: Int, timeout: Int)
+  DeadlineExpired(caller: Pid, checkout_time: Int)
   Poll(time: Int, last_sent: Int)
   PoolExit(process.ExitMessage)
   CallerDown(process.Down)
@@ -207,6 +210,7 @@ pub fn checkout(
   pool: Subject(Message(conn, err)),
   caller: Pid,
   timeout: Int,
+  deadline: Int,
 ) -> Result(conn, PoolError(err)) {
   let checkout_timeout = timeout - 50
 
@@ -215,7 +219,7 @@ pub fn checkout(
     False -> #(timeout + 50, checkout_timeout)
   }
 
-  process.call(pool, process_timeout, CheckOut(_, caller:, timeout:))
+  process.call(pool, process_timeout, CheckOut(_, caller:, timeout:, deadline:))
 }
 
 /// Returns a connection back to the pool.
@@ -255,24 +259,38 @@ fn handle_message(
       let handler = fn(client, conn) { actor.send(client, Ok(conn)) }
       let on_drop = actor.send(_, Error(ConnectionUnavailable))
       let state =
-        state.dequeue(state, Some(conn), caller, CallerDown, handler, on_drop:)
+        state.dequeue(
+          state,
+          Some(conn),
+          caller,
+          CallerDown,
+          handler,
+          on_drop:,
+          on_deadline: DeadlineExpired,
+        )
 
       use selector <- state.with_selector(state)
 
       actor.continue(state)
       |> actor.with_selector(selector)
     }
-    CheckOut(client:, caller:, timeout:) -> {
+    CheckOut(client:, caller:, timeout:, deadline:) -> {
       let state = {
-        state.checkout(state, caller, CallerDown, fn(conn) {
-          actor.send(client, Ok(conn))
-        })
+        state.checkout(
+          state,
+          caller,
+          CallerDown,
+          deadline,
+          DeadlineExpired,
+          fn(conn) { actor.send(client, Ok(conn)) },
+        )
         |> result.lazy_unwrap(fn() {
           state.enqueue(
             state,
             caller,
             client,
             timeout,
+            deadline,
             on_timeout: Timeout,
             on_down: CallerDown,
           )
@@ -296,12 +314,40 @@ fn handle_message(
       actor.continue(state)
       |> actor.with_selector(selector)
     }
+    DeadlineExpired(caller:, checkout_time:) -> {
+      let handler = fn(client, conn) { actor.send(client, Ok(conn)) }
+      let on_drop = actor.send(_, Error(ConnectionUnavailable))
+      let state =
+        state.deadline_expired(
+          state,
+          caller,
+          checkout_time,
+          CallerDown,
+          handler,
+          on_drop:,
+          on_deadline: DeadlineExpired,
+        )
+
+      use selector <- state.with_selector(state)
+
+      actor.continue(state)
+      |> actor.with_selector(selector)
+    }
     CallerDown(down) -> {
       let assert process.ProcessDown(pid:, ..) = down
 
       let handler = fn(client, conn) { actor.send(client, Ok(conn)) }
       let on_drop = actor.send(_, Error(ConnectionUnavailable))
-      let state = state.dequeue(state, None, pid, CallerDown, handler, on_drop:)
+      let state =
+        state.dequeue(
+          state,
+          None,
+          pid,
+          CallerDown,
+          handler,
+          on_drop:,
+          on_deadline: DeadlineExpired,
+        )
 
       use selector <- state.with_selector(state)
 

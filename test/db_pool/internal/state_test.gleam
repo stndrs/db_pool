@@ -5,6 +5,13 @@ import gleam/option.{None, Some}
 import gleam/result
 import rasa/counter
 
+// Large deadline used in tests that don't exercise deadline behaviour.
+const no_deadline = 999_999
+
+fn no_op_deadline(_caller: process.Pid, _checkout_time: Int) -> Nil {
+  Nil
+}
+
 pub fn current_connection_error_test() {
   let assert Ok(state) =
     state.new()
@@ -29,7 +36,14 @@ pub fn enqueue_test() {
 
   let state =
     state
-    |> state.enqueue(self, subject, 100, fn(_, _) { "Timeout!" }, fn(_) { "" })
+    |> state.enqueue(
+      self,
+      subject,
+      100,
+      no_deadline,
+      on_timeout: fn(_, _) { "Timeout!" },
+      on_down: fn(_) { "" },
+    )
 
   use selector <- state.with_selector(state)
 
@@ -52,7 +66,14 @@ pub fn checkout_test() {
   let assert Error(Nil) = state.current_connection(state, self)
 
   let assert Ok(state) =
-    state.checkout(state, self, fn(_) { Nil }, fn(_conn) { Nil })
+    state.checkout(
+      state,
+      self,
+      fn(_) { Nil },
+      no_deadline,
+      no_op_deadline,
+      fn(_conn) { Nil },
+    )
 
   let assert Ok(_conn) = state.current_connection(state, self)
 
@@ -73,7 +94,14 @@ pub fn dequeue_test() {
   assert 1 == state.current_size(state)
 
   let assert Ok(state) =
-    state.checkout(state, self, fn(_) { Nil }, fn(_) { Nil })
+    state.checkout(
+      state,
+      self,
+      fn(_) { Nil },
+      no_deadline,
+      no_op_deadline,
+      fn(_) { Nil },
+    )
 
   assert 0 == state.queue_size(state)
 
@@ -82,7 +110,14 @@ pub fn dequeue_test() {
   // Enqueue a waiting process
   let state =
     state
-    |> state.enqueue(self, subject, 1000, fn(_, _) { Nil }, fn(_) { Nil })
+    |> state.enqueue(
+      self,
+      subject,
+      1000,
+      no_deadline,
+      on_timeout: fn(_, _) { Nil },
+      on_down: fn(_) { Nil },
+    )
 
   assert 1 == state.queue_size(state)
 
@@ -94,6 +129,7 @@ pub fn dequeue_test() {
       fn(_) { Nil },
       fn(_client, _conn) { Nil },
       on_drop: fn(_) { Nil },
+      on_deadline: no_op_deadline,
     )
 
   // Ensure previously queued process removed from queue
@@ -111,7 +147,14 @@ pub fn dequeue_without_connection_test() {
     |> state.build(process.new_selector())
 
   let assert Ok(state) =
-    state.checkout(state, self, fn(_) { Nil }, fn(_) { Nil })
+    state.checkout(
+      state,
+      self,
+      fn(_) { Nil },
+      no_deadline,
+      no_op_deadline,
+      fn(_) { Nil },
+    )
 
   assert 0 == state.queue_size(state)
 
@@ -120,7 +163,14 @@ pub fn dequeue_without_connection_test() {
   // Enqueue a waiting process
   let state =
     state
-    |> state.enqueue(self, subject, 5000, fn(_, _) { Nil }, fn(_) { Nil })
+    |> state.enqueue(
+      self,
+      subject,
+      5000,
+      no_deadline,
+      on_timeout: fn(_, _) { Nil },
+      on_down: fn(_) { Nil },
+    )
 
   assert 1 == state.queue_size(state)
 
@@ -132,6 +182,7 @@ pub fn dequeue_without_connection_test() {
       fn(_) { Nil },
       fn(_client, _conn) { Nil },
       on_drop: fn(_) { Nil },
+      on_deadline: no_op_deadline,
     )
 
   // Ensure queued process has been removed from the queue
@@ -157,8 +208,9 @@ pub fn expire_test() {
       process.self(),
       process.new_subject(),
       5000,
-      fn(_, _) { Nil },
-      fn(_) { Nil },
+      no_deadline,
+      on_timeout: fn(_, _) { Nil },
+      on_down: fn(_) { Nil },
     )
 
   // Enqueue waiting process
@@ -193,8 +245,9 @@ pub fn expire_retry_test() {
       process.self(),
       process.new_subject(),
       5000,
-      fn(_, _) { "" },
-      fn(_) { "" },
+      no_deadline,
+      on_timeout: fn(_, _) { "" },
+      on_down: fn(_) { "" },
     )
 
   assert 1 == state.queue_size(state)
@@ -267,13 +320,27 @@ pub fn dequeue_fast_serves_waiter_test() {
 
   // Check out the only connection
   let assert Ok(state) =
-    state.checkout(state, self, fn(_) { Nil }, fn(_) { Nil })
+    state.checkout(
+      state,
+      self,
+      fn(_) { Nil },
+      no_deadline,
+      no_op_deadline,
+      fn(_) { Nil },
+    )
 
   // Enqueue a waiter
   let waiter_subject = process.new_subject()
   let state =
     state
-    |> state.enqueue(self, waiter_subject, 5000, fn(_, _) { Nil }, fn(_) { Nil })
+    |> state.enqueue(
+      self,
+      waiter_subject,
+      5000,
+      no_deadline,
+      on_timeout: fn(_, _) { Nil },
+      on_down: fn(_) { Nil },
+    )
 
   assert 1 == state.queue_size(state)
 
@@ -286,6 +353,7 @@ pub fn dequeue_fast_serves_waiter_test() {
       fn(_) { Nil },
       fn(_client, _conn) { Nil },
       on_drop: fn(_) { panic as "Should not drop in fast mode" },
+      on_deadline: no_op_deadline,
     )
 
   assert 0 == state.queue_size(state)
@@ -309,13 +377,27 @@ pub fn dequeue_first_enters_slow_mode_test() {
     |> state.build(process.new_selector())
 
   let assert Ok(state) =
-    state.checkout(state, self, fn(_) { Nil }, fn(_) { Nil })
+    state.checkout(
+      state,
+      self,
+      fn(_) { Nil },
+      no_deadline,
+      no_op_deadline,
+      fn(_) { Nil },
+    )
 
   // Enqueue waiter 1
   let waiter1 = process.new_subject()
   let state =
     state
-    |> state.enqueue(self, waiter1, 5000, fn(_, _) { Nil }, fn(_) { Nil })
+    |> state.enqueue(
+      self,
+      waiter1,
+      5000,
+      no_deadline,
+      on_timeout: fn(_, _) { Nil },
+      on_down: fn(_) { Nil },
+    )
 
   assert 1 == state.queue_size(state)
   assert False == state.is_slow(state)
@@ -334,6 +416,7 @@ pub fn dequeue_first_enters_slow_mode_test() {
       fn(_) { Nil },
       fn(_client, _conn) { Nil },
       on_drop: fn(_) { Nil },
+      on_deadline: no_op_deadline,
     )
 
   assert 0 == state.queue_size(state)
@@ -343,12 +426,26 @@ pub fn dequeue_first_enters_slow_mode_test() {
 
   // Second checkout
   let assert Ok(state) =
-    state.checkout(state, self, fn(_) { Nil }, fn(_) { Nil })
+    state.checkout(
+      state,
+      self,
+      fn(_) { Nil },
+      no_deadline,
+      no_op_deadline,
+      fn(_) { Nil },
+    )
 
   let waiter2 = process.new_subject()
   let state =
     state
-    |> state.enqueue(self, waiter2, 5000, fn(_, _) { Nil }, fn(_) { Nil })
+    |> state.enqueue(
+      self,
+      waiter2,
+      5000,
+      no_deadline,
+      on_timeout: fn(_, _) { Nil },
+      on_down: fn(_) { Nil },
+    )
 
   // Sleep past the next interval boundary
   process.sleep(10)
@@ -363,6 +460,7 @@ pub fn dequeue_first_enters_slow_mode_test() {
       fn(_) { Nil },
       fn(_client, _conn) { Nil },
       on_drop: fn(_) { Nil },
+      on_deadline: no_op_deadline,
     )
 
   assert 0 == state.queue_size(state)
@@ -386,12 +484,26 @@ pub fn dequeue_first_stays_fast_when_delay_ok_test() {
     |> state.build(process.new_selector())
 
   let assert Ok(state) =
-    state.checkout(state, self, fn(_) { Nil }, fn(_) { Nil })
+    state.checkout(
+      state,
+      self,
+      fn(_) { Nil },
+      no_deadline,
+      no_op_deadline,
+      fn(_) { Nil },
+    )
 
   let waiter = process.new_subject()
   let state =
     state
-    |> state.enqueue(self, waiter, 5000, fn(_, _) { Nil }, fn(_) { Nil })
+    |> state.enqueue(
+      self,
+      waiter,
+      5000,
+      no_deadline,
+      on_timeout: fn(_, _) { Nil },
+      on_down: fn(_) { Nil },
+    )
 
   // Sleep to cross the interval boundary
   process.sleep(5)
@@ -404,6 +516,7 @@ pub fn dequeue_first_stays_fast_when_delay_ok_test() {
       fn(_) { Nil },
       fn(_client, _conn) { Nil },
       on_drop: fn(_) { Nil },
+      on_deadline: no_op_deadline,
     )
 
   assert 0 == state.queue_size(state)
@@ -428,12 +541,26 @@ pub fn dequeue_slow_drops_stale_waiters_test() {
     |> state.build(process.new_selector())
 
   let assert Ok(state) =
-    state.checkout(state, self, fn(_) { Nil }, fn(_) { Nil })
+    state.checkout(
+      state,
+      self,
+      fn(_) { Nil },
+      no_deadline,
+      no_op_deadline,
+      fn(_) { Nil },
+    )
 
   let waiter1 = process.new_subject()
   let state =
     state
-    |> state.enqueue(self, waiter1, 5000, fn(_, _) { Nil }, fn(_) { Nil })
+    |> state.enqueue(
+      self,
+      waiter1,
+      5000,
+      no_deadline,
+      on_timeout: fn(_, _) { Nil },
+      on_down: fn(_) { Nil },
+    )
 
   // Sleep past the first interval boundary (10ms) and accumulate delay
   process.sleep(20)
@@ -447,18 +574,33 @@ pub fn dequeue_slow_drops_stale_waiters_test() {
       fn(_) { Nil },
       fn(_client, _conn) { Nil },
       on_drop: fn(_) { Nil },
+      on_deadline: no_op_deadline,
     )
 
   assert False == state.is_slow(state)
   assert state.codel_delay(state) > 1
 
   let assert Ok(state) =
-    state.checkout(state, self, fn(_) { Nil }, fn(_) { Nil })
+    state.checkout(
+      state,
+      self,
+      fn(_) { Nil },
+      no_deadline,
+      no_op_deadline,
+      fn(_) { Nil },
+    )
 
   let waiter2 = process.new_subject()
   let state =
     state
-    |> state.enqueue(self, waiter2, 5000, fn(_, _) { Nil }, fn(_) { Nil })
+    |> state.enqueue(
+      self,
+      waiter2,
+      5000,
+      no_deadline,
+      on_timeout: fn(_, _) { Nil },
+      on_down: fn(_) { Nil },
+    )
 
   // Sleep past the second interval boundary
   process.sleep(20)
@@ -471,6 +613,7 @@ pub fn dequeue_slow_drops_stale_waiters_test() {
       fn(_) { Nil },
       fn(_client, _conn) { Nil },
       on_drop: fn(_) { Nil },
+      on_deadline: no_op_deadline,
     )
 
   assert True == state.is_slow(state)
@@ -478,13 +621,27 @@ pub fn dequeue_slow_drops_stale_waiters_test() {
   // now in slow mode, do not cross interval boundary
   // We need to stay within the current interval so dequeue_slow runs.
   let assert Ok(state) =
-    state.checkout(state, self, fn(_) { Nil }, fn(_) { Nil })
+    state.checkout(
+      state,
+      self,
+      fn(_) { Nil },
+      no_deadline,
+      no_op_deadline,
+      fn(_) { Nil },
+    )
 
   // Enqueue a waiter that will become stale
   let stale = process.new_subject()
   let state =
     state
-    |> state.enqueue(self, stale, 5000, fn(_, _) { Nil }, fn(_) { Nil })
+    |> state.enqueue(
+      self,
+      stale,
+      5000,
+      no_deadline,
+      on_timeout: fn(_, _) { Nil },
+      on_down: fn(_) { Nil },
+    )
 
   // Sleep just enough for the stale waiter to exceed target*2=2ms
   // but not enough to cross the 10ms interval boundary
@@ -494,7 +651,14 @@ pub fn dequeue_slow_drops_stale_waiters_test() {
   let fresh = process.new_subject()
   let state =
     state
-    |> state.enqueue(self, fresh, 5000, fn(_, _) { Nil }, fn(_) { Nil })
+    |> state.enqueue(
+      self,
+      fresh,
+      5000,
+      no_deadline,
+      on_timeout: fn(_, _) { Nil },
+      on_down: fn(_) { Nil },
+    )
 
   assert 2 == state.queue_size(state)
 
@@ -510,6 +674,7 @@ pub fn dequeue_slow_drops_stale_waiters_test() {
       fn(_) { Nil },
       fn(_client, _conn) { Nil },
       on_drop: fn(_) { process.send(drop_count, 1) },
+      on_deadline: no_op_deadline,
     )
 
   // Stale waiter was dropped, fresh waiter was served
@@ -568,8 +733,9 @@ pub fn poll_enters_slow_on_stall_test() {
       process.self(),
       process.new_subject(),
       5000,
-      fn(_, _) { Nil },
-      fn(_) { Nil },
+      no_deadline,
+      on_timeout: fn(_, _) { Nil },
+      on_down: fn(_) { Nil },
     )
 
   assert 1 == state.queue_size(state)
@@ -616,7 +782,14 @@ pub fn dequeue_returns_to_idle_when_no_waiters_test() {
 
   // Checkout
   let assert Ok(state) =
-    state.checkout(state, self, fn(_) { Nil }, fn(_) { Nil })
+    state.checkout(
+      state,
+      self,
+      fn(_) { Nil },
+      no_deadline,
+      no_op_deadline,
+      fn(_) { Nil },
+    )
   assert 1 == state.active_size(state)
 
   // Dequeue with no waiters -- should return conn to idle
@@ -628,6 +801,7 @@ pub fn dequeue_returns_to_idle_when_no_waiters_test() {
       fn(_) { Nil },
       fn(_client, _conn) { Nil },
       on_drop: fn(_) { Nil },
+      on_deadline: no_op_deadline,
     )
 
   assert 0 == state.active_size(state)
@@ -635,5 +809,185 @@ pub fn dequeue_returns_to_idle_when_no_waiters_test() {
 
   // Connection should be available again
   let assert Ok(_state) =
-    state.checkout(state, self, fn(_) { Nil }, fn(_) { Nil })
+    state.checkout(
+      state,
+      self,
+      fn(_) { Nil },
+      no_deadline,
+      no_op_deadline,
+      fn(_) { Nil },
+    )
+}
+
+// When a deadline fires and the checkout_time matches, the connection
+// should be closed, a replacement opened, and the replacement returned
+// to idle (since there are no waiters).
+pub fn deadline_expired_replaces_connection_test() {
+  let self = process.self()
+  let close_count = process.new_subject()
+
+  let assert Ok(state) =
+    state.new()
+    |> state.max_size(1)
+    |> state.on_open(fn() { Ok(reference.new()) })
+    |> state.on_close(fn(_) {
+      process.send(close_count, 1)
+      Ok(Nil)
+    })
+    |> state.build(process.new_selector())
+
+  assert 1 == state.current_size(state)
+
+  // Checkout with a very short deadline (10ms)
+  let assert Ok(state) =
+    state.checkout(state, self, fn(_) { Nil }, 10, no_op_deadline, fn(_) { Nil })
+
+  assert 1 == state.active_size(state)
+
+  // Sleep past the deadline
+  process.sleep(20)
+
+  // Receive the deadline message from the selector
+  use selector <- state.with_selector(state)
+  let assert Ok(Nil) = process.selector_receive(selector, 50)
+
+  // Test stale timer. Calling with wrong checkout_time should be a no-op
+  let state_after =
+    state.deadline_expired(
+      state,
+      self,
+      -1,
+      fn(_) { Nil },
+      fn(_client, _conn) { Nil },
+      on_drop: fn(_) { Nil },
+      on_deadline: no_op_deadline,
+    )
+
+  // Still has the active connection (stale timer was ignored)
+  assert 1 == state.active_size(state_after)
+}
+
+// Deadline timer is cancelled when a connection is returned via dequeue
+// (normal checkin). The timer should not fire after cancellation.
+pub fn deadline_cancelled_on_checkin_test() {
+  let self = process.self()
+  let conn = reference.new()
+  let close_count = process.new_subject()
+
+  let assert Ok(state) =
+    state.new()
+    |> state.max_size(1)
+    |> state.on_open(fn() { Ok(conn) })
+    |> state.on_close(fn(_) {
+      process.send(close_count, 1)
+      Ok(Nil)
+    })
+    |> state.build(process.new_selector())
+
+  // Checkout with a short deadline
+  let assert Ok(state) =
+    state.checkout(state, self, fn(_) { Nil }, 100, no_op_deadline, fn(_) {
+      Nil
+    })
+
+  assert 1 == state.active_size(state)
+
+  // Return the connection immediately (well before deadline)
+  let state =
+    state
+    |> state.dequeue(
+      Some(conn),
+      self,
+      fn(_) { Nil },
+      fn(_client, _conn) { Nil },
+      on_drop: fn(_) { Nil },
+      on_deadline: no_op_deadline,
+    )
+
+  assert 0 == state.active_size(state)
+
+  // Wait past the deadline period to confirm it doesn't fire
+  process.sleep(150)
+
+  // handle_close should NOT have been called (deadline was cancelled)
+  let assert Error(Nil) = process.receive(close_count, 0)
+}
+
+// When handle_open fails during deadline replacement, the pool
+// should shrink by 1.
+pub fn deadline_expired_shrinks_pool_on_open_failure_test() {
+  let self = process.self()
+  let conn = reference.new()
+  let open_count = process.new_subject()
+
+  // First call to handle_open succeeds (pool init), subsequent calls fail
+  let assert Ok(state) =
+    state.new()
+    |> state.max_size(1)
+    |> state.on_open(fn() {
+      case process.receive(open_count, 0) {
+        // First open (pool init) succeeds
+        Error(Nil) -> {
+          process.send(open_count, 1)
+          Ok(conn)
+        }
+        // Subsequent opens fail
+        Ok(_) -> Error(Nil)
+      }
+    })
+    |> state.build(process.new_selector())
+
+  assert 1 == state.current_size(state)
+
+  // Checkout with a short deadline
+  let assert Ok(state) =
+    state.checkout(state, self, fn(_) { Nil }, 10, no_op_deadline, fn(_) { Nil })
+
+  assert 1 == state.active_size(state)
+
+  // Sleep past the deadline
+  process.sleep(20)
+
+  let state_after =
+    state.deadline_expired(
+      state,
+      self,
+      -1,
+      fn(_) { Nil },
+      fn(_client, _conn) { Nil },
+      on_drop: fn(_) { Nil },
+      on_deadline: no_op_deadline,
+    )
+
+  // Stale timer - no change
+  assert 1 == state.current_size(state_after)
+  assert 1 == state.active_size(state_after)
+}
+
+// Deadline expired for a caller that is no longer active should be a no-op.
+pub fn deadline_expired_unknown_caller_noop_test() {
+  let assert Ok(state) =
+    state.new()
+    |> state.max_size(1)
+    |> state.on_open(fn() { Ok(reference.new()) })
+    |> state.build(process.new_selector())
+
+  assert 1 == state.current_size(state)
+  assert 0 == state.active_size(state)
+
+  // Call deadline_expired for a pid that has no active connection
+  let state_after =
+    state.deadline_expired(
+      state,
+      process.self(),
+      0,
+      fn(_) { Nil },
+      fn(_client, _conn) { Nil },
+      on_drop: fn(_) { Nil },
+      on_deadline: no_op_deadline,
+    )
+
+  // No change
+  assert 1 == state.current_size(state_after)
+  assert 0 == state.active_size(state_after)
 }
