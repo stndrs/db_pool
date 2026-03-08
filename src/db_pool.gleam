@@ -4,6 +4,7 @@ import gleam/option.{None, Some}
 import gleam/otp/actor
 import gleam/otp/supervision
 import gleam/result
+import rasa/counter
 
 pub type PoolError(err) {
   ConnectionError(err)
@@ -125,12 +126,15 @@ pub fn start(
   |> actor.named(name)
   |> actor.start
   |> result.map(fn(started) {
+    let counter = counter.monotonic(counter.Millisecond)
+    let assert Ok(time) = counter.next(counter)
+
     let _timer = process.send_after(started.data, pool.interval, Interval)
     let _poll_timer =
       process.send_after(
         started.data,
         pool.queue_interval,
-        Poll(time: 0, last_sent: 0),
+        Poll(time:, last_sent: time),
       )
 
     started
