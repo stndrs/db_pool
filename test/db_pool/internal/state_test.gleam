@@ -195,32 +195,38 @@ pub fn expire_test() {
     |> state.on_open(fn() { Ok(reference.new()) })
     |> state.build(process.new_selector())
 
-  let assert Ok(now_in_ms) =
-    counter.Millisecond
-    |> counter.monotonic
-    |> counter.next
-
   assert 0 == state.queue_size(state)
+
+  // Use a subject to capture the queue key from the timeout callback
+  let key_subject = process.new_subject()
 
   let state =
     state
     |> state.enqueue(
       process.self(),
       process.new_subject(),
-      5000,
+      1,
       no_deadline,
-      on_timeout: fn(_, _) { Nil },
+      on_timeout: fn(sent, _timeout) {
+        process.send(key_subject, sent)
+        Nil
+      },
       on_down: fn(_) { Nil },
     )
 
   // Enqueue waiting process
   assert 1 == state.queue_size(state)
 
+  // Receive the queue key from the timeout callback (fires after 1ms)
+  use selector <- state.with_selector(state)
+  let assert Ok(Nil) = process.selector_receive(selector, 50)
+  let assert Ok(sent) = process.receive(key_subject, 0)
+
   let extend = fn(_, _) { panic as "should not be called" }
   let on_expiry = fn(_) { Nil }
 
   state
-  |> state.expire(now_in_ms, -100, on_expiry:, or_else: extend)
+  |> state.expire(sent, -100, on_expiry:, or_else: extend)
 
   // Ensure queued process has been removed from the queue
   assert 0 == state.queue_size(state)
@@ -232,32 +238,38 @@ pub fn expire_retry_test() {
     |> state.on_open(fn() { Ok(reference.new()) })
     |> state.build(process.new_selector())
 
-  let assert Ok(now_in_ms) =
-    counter.Millisecond
-    |> counter.monotonic
-    |> counter.next
-
   assert 0 == state.queue_size(state)
+
+  // Use a subject to capture the queue key from the timeout callback
+  let key_subject = process.new_subject()
 
   let state =
     state
     |> state.enqueue(
       process.self(),
       process.new_subject(),
-      5000,
+      1,
       no_deadline,
-      on_timeout: fn(_, _) { "" },
+      on_timeout: fn(sent, _timeout) {
+        process.send(key_subject, sent)
+        ""
+      },
       on_down: fn(_) { "" },
     )
 
   assert 1 == state.queue_size(state)
+
+  // Receive the queue key from the timeout callback (fires after 1ms)
+  use selector <- state.with_selector(state)
+  let assert Ok("") = process.selector_receive(selector, 50)
+  let assert Ok(sent) = process.receive(key_subject, 0)
 
   let extend = fn(_, _) { "Extend!" }
   let on_expiry = fn(_) { panic as "Should not be called" }
 
   let state =
     state
-    |> state.expire(now_in_ms, 100, on_expiry:, or_else: extend)
+    |> state.expire(sent, 100, on_expiry:, or_else: extend)
 
   // Ensure queued process is still in the queue
   assert 1 == state.queue_size(state)
@@ -694,7 +706,7 @@ pub fn poll_schedules_next_poll_test() {
     |> state.build(process.new_selector())
 
   let assert Ok(now) =
-    counter.Millisecond
+    counter.Nanosecond
     |> counter.monotonic
     |> counter.next
 
@@ -744,7 +756,7 @@ pub fn poll_enters_slow_on_stall_test() {
   process.sleep(10)
 
   let assert Ok(now) =
-    counter.Millisecond
+    counter.Nanosecond
     |> counter.monotonic
     |> counter.next
 
@@ -756,7 +768,7 @@ pub fn poll_enters_slow_on_stall_test() {
   process.sleep(5)
 
   let assert Ok(now2) =
-    counter.Millisecond
+    counter.Nanosecond
     |> counter.monotonic
     |> counter.next
 

@@ -8,6 +8,8 @@ import rasa
 import rasa/counter
 import rasa/queue.{type Queue}
 
+const ns_per_ms = 1_000_000
+
 pub opaque type Waiting(conn, err) {
   Waiting(
     caller: process.Pid,
@@ -148,7 +150,7 @@ pub fn build(
 
   use idle <- result.map(connections)
 
-  let counter = counter.monotonic(counter.Millisecond)
+  let counter = counter.monotonic(counter.Nanosecond)
 
   let queue =
     queue.build("db_pool_queue")
@@ -170,11 +172,11 @@ pub fn build(
     active: dict.new(),
     queue:,
     counter:,
-    queue_target: builder.queue_target,
-    queue_interval: builder.queue_interval,
+    queue_target: builder.queue_target * ns_per_ms,
+    queue_interval: builder.queue_interval * ns_per_ms,
     delay: 0,
     slow: False,
-    next: now + builder.queue_interval,
+    next: now + builder.queue_interval * ns_per_ms,
   )
 }
 
@@ -610,14 +612,17 @@ pub fn expire(
   |> result.try(fn(waiting) {
     use now <- result.map(counter.next(state.counter))
 
-    use <- bool.lazy_guard(when: { now < { sent + timeout } }, return: fn() {
-      let subject = process.new_subject()
-      let _timer = process.send_after(subject, timeout, extend(sent, timeout))
+    use <- bool.lazy_guard(
+      when: { now < { sent + timeout * ns_per_ms } },
+      return: fn() {
+        let subject = process.new_subject()
+        let _timer = process.send_after(subject, timeout, extend(sent, timeout))
 
-      let selector = process.select(state.selector, subject)
+        let selector = process.select(state.selector, subject)
 
-      State(..state, selector:)
-    })
+        State(..state, selector:)
+      },
+    )
 
     let assert Ok(Nil) = queue.delete(state.queue, sent)
 
@@ -719,7 +724,7 @@ fn start_poll(
   let _timer =
     process.send_after(
       subject,
-      state.queue_interval,
+      state.queue_interval / ns_per_ms,
       schedule_poll(poll_time, last_sent),
     )
   let selector = process.select(state.selector, subject)

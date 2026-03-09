@@ -127,7 +127,7 @@ pub fn start(
   |> actor.named(name)
   |> actor.start
   |> result.map(fn(started) {
-    let counter = counter.monotonic(counter.Millisecond)
+    let counter = counter.monotonic(counter.Nanosecond)
     let assert Ok(time) = counter.next(counter)
 
     let _timer = process.send_after(started.data, pool.interval, Interval)
