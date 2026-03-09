@@ -358,6 +358,98 @@ pub fn deadline_expires_serves_waiting_caller_test() {
   let assert Ok(_) = db_pool.shutdown(pool.data, 200)
 }
 
+// When a waiting caller dies before a connection becomes available,
+// the pool skips the dead waiter and serves the next live waiter.
+pub fn dead_waiter_skipped_test() {
+  let name = process.new_name("db_pool_test")
+
+  let pool =
+    db_pool.new()
+    |> db_pool.size(1)
+    |> db_pool.on_open(fn() { Ok(Nil) })
+    |> db_pool.on_close(fn(_) { Ok(Nil) })
+    |> db_pool.on_interval(fn(_) { Nil })
+
+  let assert Ok(pool) = db_pool.start(pool, name, 200)
+
+  // Caller A takes the only connection
+  let self = process.self()
+  let assert Ok(Nil) = db_pool.checkout(pool.data, self, 200, 30_000)
+
+  // Caller B enqueues as a waiter, then dies
+  let waiter_b =
+    process.spawn_unlinked(fn() {
+      let self = process.self()
+      let _result = db_pool.checkout(pool.data, self, 5000, 30_000)
+      Nil
+    })
+
+  process.sleep(50)
+
+  process.kill(waiter_b)
+  process.sleep(50)
+
+  // Caller C enqueues as a waiter
+  let result_subject = process.new_subject()
+  process.spawn(fn() {
+    let self = process.self()
+    let result = db_pool.checkout(pool.data, self, 5000, 30_000)
+    process.send(result_subject, result)
+  })
+
+  // Give time for C to enqueue
+  process.sleep(50)
+
+  // A returns the connection -- should skip dead B and serve C
+  db_pool.checkin(pool.data, Nil, self)
+
+  // C should receive the connection
+  let assert Ok(Ok(Nil)) = process.receive(result_subject, 500)
+
+  let assert Ok(_) = db_pool.shutdown(pool.data, 200)
+}
+
+/// When all waiting callers are dead, the connection returns to idle.
+pub fn all_dead_waiters_connection_returns_to_idle_test() {
+  let name = process.new_name("db_pool_test")
+
+  let pool =
+    db_pool.new()
+    |> db_pool.size(1)
+    |> db_pool.on_open(fn() { Ok(Nil) })
+    |> db_pool.on_close(fn(_) { Ok(Nil) })
+    |> db_pool.on_interval(fn(_) { Nil })
+
+  let assert Ok(pool) = db_pool.start(pool, name, 200)
+
+  // Caller A takes the only connection
+  let self = process.self()
+  let assert Ok(Nil) = db_pool.checkout(pool.data, self, 200, 30_000)
+
+  // Caller B enqueues as a waiter, then dies
+  let waiter_b =
+    process.spawn_unlinked(fn() {
+      let self = process.self()
+      let _result = db_pool.checkout(pool.data, self, 5000, 30_000)
+      Nil
+    })
+
+  process.sleep(50)
+
+  process.kill(waiter_b)
+  process.sleep(50)
+
+  // A returns the connection -- should skip dead B and return conn to idle
+  db_pool.checkin(pool.data, Nil, self)
+
+  process.sleep(50)
+
+  // A new caller should be able to checkout immediately (conn is idle)
+  let assert Ok(Nil) = db_pool.checkout(pool.data, self, 200, 30_000)
+
+  let assert Ok(_) = db_pool.shutdown(pool.data, 200)
+}
+
 fn db_pool() -> process.Subject(db_pool.Message(Nil, err)) {
   global_value.create_with_unique_name("db_pool_test", fn() {
     let name = process.new_name("db_pool_test")

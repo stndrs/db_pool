@@ -284,8 +284,8 @@ pub fn deadline_expired(
   |> result.unwrap(state)
 }
 
-/// dispatches to the appropriate strategy based on
-/// whether we're at an interval boundary, in slow mode, or in fast mode.
+// dispatches to the appropriate strategy based on
+// whether we're at an interval boundary, in slow mode, or in fast mode.
 fn codel_dequeue(
   state: State(conn, msg, err),
   now: Int,
@@ -297,11 +297,12 @@ fn codel_dequeue(
 ) -> State(conn, msg, err) {
   case now >= state.next {
     // evaluate whether we should be slow or fast
-    True -> dequeue_first(state, now, conn, mapping, handler, on_deadline)
+    True -> dequeue_first(state, now, conn, mapping, handler, drop, on_deadline)
     // Mid-interval
     False ->
       case state.slow {
-        False -> dequeue_fast(state, now, conn, mapping, handler, on_deadline)
+        False ->
+          dequeue_fast(state, now, conn, mapping, handler, drop, on_deadline)
         True ->
           dequeue_slow(
             state,
@@ -317,16 +318,17 @@ fn codel_dequeue(
   }
 }
 
-/// Called at an interval boundary. Measures the delay of the first waiter,
-/// sets slow mode based on whether the previous interval's min delay
-/// exceeded the target, and resets the interval.
+// Called at an interval boundary. Measures the delay of the first waiter,
+// sets slow mode based on whether the previous interval's min delay
+// exceeded the target, and resets the interval.
 fn dequeue_first(
   state: State(conn, msg, err),
   now: Int,
   conn: conn,
   mapping: fn(process.Down) -> msg,
   handler: fn(process.Subject(Result(conn, err)), conn) -> Nil,
-  on_deadline: fn(process.Pid, Int) -> msg,
+  on_drop drop: fn(process.Subject(Result(conn, err))) -> Nil,
+  on_deadline on_deadline: fn(process.Pid, Int) -> msg,
 ) -> State(conn, msg, err) {
   let next = now + state.queue_interval
   let slow = state.delay > state.queue_target
@@ -338,14 +340,7 @@ fn dequeue_first(
       let delay = now - sent
       let state = State(..state, next:, delay:, slow:)
 
-      let state =
-        serve_waiter(state, waiting, conn, mapping, handler, on_deadline)
-
-      // Track the minimum delay
-      case delay < state.delay {
-        True -> State(..state, delay:)
-        False -> state
-      }
+      serve_waiter(state, waiting, conn, mapping, handler, drop, on_deadline)
     }
     _ -> {
       // No waiters so return connection to idle
@@ -355,14 +350,15 @@ fn dequeue_first(
   }
 }
 
-/// serve the first waiter immediately, tracking minimum delay.
+// serve the first waiter immediately, tracking minimum delay.
 fn dequeue_fast(
   state: State(conn, msg, err),
   now: Int,
   conn: conn,
   mapping: fn(process.Down) -> msg,
   handler: fn(process.Subject(Result(conn, err)), conn) -> Nil,
-  on_deadline: fn(process.Pid, Int) -> msg,
+  on_drop drop: fn(process.Subject(Result(conn, err))) -> Nil,
+  on_deadline on_deadline: fn(process.Pid, Int) -> msg,
 ) -> State(conn, msg, err) {
   case queue.first(state.queue) {
     Ok(#(sent, waiting)) -> {
@@ -373,7 +369,7 @@ fn dequeue_fast(
         True -> State(..state, delay:)
         False -> state
       }
-      serve_waiter(state, waiting, conn, mapping, handler, on_deadline)
+      serve_waiter(state, waiting, conn, mapping, handler, drop, on_deadline)
     }
     _ -> {
       // No waiters, return connection to idle
@@ -383,8 +379,8 @@ fn dequeue_fast(
   }
 }
 
-/// drop waiters that have been waiting longer than the timeout
-/// threshold (target * 2), then serve the first valid waiter.
+// drop waiters that have been waiting longer than the timeout
+// threshold (target * 2), then serve the first valid waiter.
 fn dequeue_slow(
   state: State(conn, msg, err),
   now: Int,
@@ -419,7 +415,7 @@ fn dequeue_slow(
         False -> state
       }
 
-      serve_waiter(state, waiting, conn, mapping, handler, on_deadline)
+      serve_waiter(state, waiting, conn, mapping, handler, drop, on_deadline)
     }
     _ -> {
       // No waiters, return connection to idle
@@ -435,37 +431,54 @@ fn serve_waiter(
   conn: conn,
   mapping: fn(process.Down) -> msg,
   handler: fn(process.Subject(Result(conn, err)), conn) -> Nil,
-  on_deadline: fn(process.Pid, Int) -> msg,
+  on_drop drop: fn(process.Subject(Result(conn, err))) -> Nil,
+  on_deadline on_deadline: fn(process.Pid, Int) -> msg,
 ) -> State(conn, msg, err) {
-  let monitor = process.monitor(waiting.caller)
+  // Check if the waiter is still alive before committing to the handoff.
+  // If the waiter died between being enqueued and now, skip it and retry
+  // with the next waiter via codel_dequeue
+  case process.is_alive(waiting.caller) {
+    False -> {
+      process.demonitor_process(waiting.monitor)
+      let selector =
+        process.deselect_specific_monitor(state.selector, waiting.monitor)
+      let state = State(..state, selector:)
 
-  // This shouldn't ever return `Error`
-  let assert Ok(now) = counter.next(state.counter)
+      let assert Ok(now) = counter.next(state.counter)
+      codel_dequeue(state, now, conn, mapping, handler, drop, on_deadline)
+    }
+    True -> {
+      let monitor = process.monitor(waiting.caller)
 
-  let deadline_subject = process.new_subject()
-  let deadline_timer =
-    process.send_after(
-      deadline_subject,
-      waiting.deadline,
-      on_deadline(waiting.caller, now),
-    )
+      // This shouldn't ever return `Error`
+      let assert Ok(now) = counter.next(state.counter)
 
-  let next = Active(conn:, monitor:, deadline_timer:, checkout_time: now)
-  let active = dict.insert(state.active, waiting.caller, next)
+      let deadline_subject = process.new_subject()
+      let deadline_timer =
+        process.send_after(
+          deadline_subject,
+          waiting.deadline,
+          on_deadline(waiting.caller, now),
+        )
 
-  process.demonitor_process(waiting.monitor)
+      let next = Active(conn:, monitor:, deadline_timer:, checkout_time: now)
+      let active = dict.insert(state.active, waiting.caller, next)
 
-  let selector =
-    state.selector
-    |> process.deselect_specific_monitor(waiting.monitor)
-    |> process.select_specific_monitor(next.monitor, mapping)
-    |> process.select(deadline_subject)
+      process.demonitor_process(waiting.monitor)
 
-  let state = State(..state, selector:, active:)
+      let selector =
+        state.selector
+        |> process.deselect_specific_monitor(waiting.monitor)
+        |> process.select_specific_monitor(next.monitor, mapping)
+        |> process.select(deadline_subject)
 
-  handler(waiting.client, conn)
+      let state = State(..state, selector:, active:)
 
-  state
+      handler(waiting.client, conn)
+
+      state
+    }
+  }
 }
 
 pub fn checkout(
@@ -647,8 +660,8 @@ pub fn poll(
   }
 }
 
-/// If we're at an interval boundary and the minimum delay exceeds the target,
-/// enter slow mode and drop stale waiters.
+// If we're at an interval boundary and the minimum delay exceeds the target,
+// enter slow mode and drop stale waiters.
 fn codel_timeout(
   state: State(conn, msg, err),
   delay: Int,
@@ -668,9 +681,9 @@ fn codel_timeout(
   }
 }
 
-/// Drops all waiters from the front of the queue whose delay exceeds
-/// the given timeout threshold. Used by the poll timer when the pool
-/// is in slow mode.
+// Drops all waiters from the front of the queue whose delay exceeds
+// the given timeout threshold. Used by the poll timer when the pool
+// is in slow mode.
 fn poll_drop_slow(
   state: State(conn, msg, err),
   now: Int,
@@ -694,7 +707,7 @@ fn poll_drop_slow(
   }
 }
 
-/// Schedules the next poll timer.
+// Schedules the next poll timer.
 fn start_poll(
   state: State(conn, msg, err),
   now: Int,
