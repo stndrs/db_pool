@@ -1,10 +1,11 @@
-import db_pool/internal/state.{type State}
+import db_pool/internal/state.{type HolderRef, type Shared, type State}
 import gleam/erlang/process.{type Pid, type Subject}
-import gleam/option.{None, Some}
 import gleam/otp/actor
 import gleam/otp/supervision
 import gleam/result
 import rasa/counter
+import rasa/monotonic
+import rasa/table
 
 pub type PoolError(err) {
   ConnectionError(err)
@@ -116,19 +117,41 @@ pub fn queue_interval(pool: Pool(conn, err), interval: Int) -> Pool(conn, err) {
   Pool(..pool, queue_interval: interval)
 }
 
+/// Handle returned by `start` — wraps the actor subject plus shared state
+/// needed for fast-path checkout/checkin.
+pub type PoolHandle(conn, err) {
+  PoolHandle(subject: Subject(Message(conn, err)), shared: Shared(conn))
+}
+
 /// Starts a connection pool.
 pub fn start(
   pool: Pool(conn, err),
   name: process.Name(Message(conn, err)),
   timeout: Int,
-) -> actor.StartResult(Subject(Message(conn, err))) {
+) -> Result(PoolHandle(conn, err), actor.StartError) {
+  start_raw(pool, name, timeout)
+  |> result.map(fn(pair) {
+    let #(started, shared) = pair
+    PoolHandle(subject: started.data, shared:)
+  })
+}
+
+/// Internal start that returns the raw Started + Shared for supervised use.
+fn start_raw(
+  pool: Pool(conn, err),
+  name: process.Name(Message(conn, err)),
+  timeout: Int,
+) -> Result(
+  #(actor.Started(Subject(Message(conn, err))), Shared(conn)),
+  actor.StartError,
+) {
   actor.new_with_initialiser(timeout, initialise_pool(_, pool))
   |> actor.on_message(handle_message)
   |> actor.named(name)
   |> actor.start
   |> result.map(fn(started) {
-    let counter = counter.monotonic(counter.Nanosecond)
-    let assert Ok(time) = counter.next(counter)
+    let cntr = counter.monotonic(monotonic.Nanosecond)
+    let time = counter.next(cntr)
 
     let _timer = process.send_after(started.data, pool.interval, Interval)
     let _poll_timer =
@@ -138,7 +161,11 @@ pub fn start(
         Poll(time:, last_sent: time),
       )
 
-    started
+    // Extract the shared state by sending a GetShared request
+    let shared =
+      process.call_forever(started.data, fn(reply) { GetShared(reply) })
+
+    #(started, shared)
   })
 }
 
@@ -148,8 +175,15 @@ pub fn supervised(
   pool: Pool(conn, err),
   name: process.Name(Message(conn, err)),
   timeout: Int,
-) -> supervision.ChildSpecification(Subject(Message(conn, err))) {
-  supervision.worker(fn() { start(pool, name, timeout) })
+) -> supervision.ChildSpecification(PoolHandle(conn, err)) {
+  supervision.worker(fn() {
+    start_raw(pool, name, timeout)
+    |> result.map(fn(pair) {
+      let #(started, shared) = pair
+      let handle = PoolHandle(subject: started.data, shared:)
+      actor.Started(pid: started.pid, data: handle)
+    })
+  })
   |> supervision.timeout(timeout)
   |> supervision.restart(supervision.Transient)
 }
@@ -190,46 +224,136 @@ fn initialise_pool(
 
 pub opaque type Message(conn, err) {
   Interval
-  CheckIn(conn: conn, caller: Pid)
+  /// Slow-path checkout request (client waits for actor)
   CheckOut(
     client: Subject(Result(conn, PoolError(err))),
     caller: Pid,
     timeout: Int,
     deadline: Int,
   )
+  /// Fast-path notification: client already has the holder, pool sets up monitor/deadline
+  FastCheckoutNotify(caller: Pid, holder_ref: HolderRef(conn), deadline: Int)
+  /// Fast-path checkin: client returns holder to pool
+  CheckIn(caller: Pid, holder_ref: HolderRef(conn))
   Timeout(time_sent: Int, timeout: Int)
   DeadlineExpired(caller: Pid, checkout_time: Int)
   Poll(time: Int, last_sent: Int)
   PoolExit(process.ExitMessage)
   CallerDown(process.Down)
   Shutdown(client: process.Subject(Result(Nil, PoolError(err))))
+  /// Internal message to extract shared state after init
+  GetShared(reply: Subject(Shared(conn)))
 }
 
 /// Attempts to check out a connection from the pool.
+/// Uses the fast-path (atomic counter + ETS) when idle connections are available,
+/// falling back to the slow-path (actor mailbox) when the pool is busy.
 pub fn checkout(
-  pool: Subject(Message(conn, err)),
+  handle: PoolHandle(conn, err),
   caller: Pid,
   timeout: Int,
   deadline: Int,
 ) -> Result(conn, PoolError(err)) {
-  process.call_forever(pool, CheckOut(_, caller:, timeout:, deadline:))
+  let shared = handle.shared
+
+  // Check if caller already has a connection checked out (re-entrant checkout)
+  case table.lookup(shared.checkout_map, caller) {
+    Ok(existing_holder) -> {
+      case state.get_conn(existing_holder) {
+        Ok(conn) -> Ok(conn)
+        Error(_) -> Error(ConnectionUnavailable)
+      }
+    }
+    Error(_) -> {
+      // Fast path: atomically claim an idle connection slot
+      case state.counter_checkout(shared.pool_counter) {
+        Ok(_count) -> {
+          // We won a slot. Grab the first idle holder from the ETS ordered_set.
+          case table.delete_first(shared.idle_queue) {
+            Ok(#(_key, holder_ref)) -> {
+              // Record in checkout_map for checkin lookup
+              let assert Ok(Nil) =
+                table.insert(shared.checkout_map, caller, holder_ref)
+
+              // Notify the pool actor to set up monitor + deadline
+              process.send(
+                handle.subject,
+                FastCheckoutNotify(caller:, holder_ref:, deadline:),
+              )
+
+              // Read the connection from the holder (public table, no ownership needed)
+              case state.get_conn(holder_ref) {
+                Ok(conn) -> Ok(conn)
+                Error(_) -> {
+                  // Holder lost its conn somehow; clean up and error
+                  let _ = table.delete(shared.checkout_map, caller)
+                  let _ = state.counter_checkin(shared.pool_counter)
+                  Error(ConnectionUnavailable)
+                }
+              }
+            }
+            Error(_) -> {
+              // Counter said idle conns exist but ETS empty (race). Undo and slow path.
+              let _ = state.counter_checkin(shared.pool_counter)
+              slow_path_checkout(handle, caller, timeout, deadline)
+            }
+          }
+        }
+        Error(_) -> {
+          // No idle connections available — slow path
+          slow_path_checkout(handle, caller, timeout, deadline)
+        }
+      }
+    }
+  }
+}
+
+fn slow_path_checkout(
+  handle: PoolHandle(conn, err),
+  caller: Pid,
+  timeout: Int,
+  deadline: Int,
+) -> Result(conn, PoolError(err)) {
+  process.call_forever(handle.subject, CheckOut(_, caller:, timeout:, deadline:))
 }
 
 /// Returns a connection back to the pool.
-pub fn checkin(
-  pool: Subject(Message(conn, err)),
-  conn: conn,
-  caller: Pid,
-) -> Nil {
-  process.send(pool, CheckIn(conn:, caller:))
+/// Client-side fast-path: immediately makes the holder available for other
+/// callers by inserting into idle_queue and incrementing pool_counter,
+/// then notifies the actor for cleanup (demonitor, cancel deadline, serve waiters).
+pub fn checkin(handle: PoolHandle(conn, err), _conn: conn, caller: Pid) -> Nil {
+  let shared = handle.shared
+
+  // Look up the holder from checkout_map
+  case table.lookup(shared.checkout_map, caller) {
+    Ok(holder_ref) -> {
+      // Remove from checkout map (client side)
+      let _ = table.delete(shared.checkout_map, caller)
+
+      // CLIENT-SIDE FAST PATH: make holder immediately available
+      // Use unique_integer([monotonic]) for a key that is both unique
+      // and monotonically increasing — safe for concurrent insertions.
+      let key = monotonic.unique()
+      let assert Ok(Nil) = table.insert(shared.idle_queue, key, holder_ref)
+      let _ = state.counter_checkin(shared.pool_counter)
+
+      // Notify actor for cleanup (demonitor, cancel deadline timer, serve waiters)
+      process.send(handle.subject, CheckIn(caller:, holder_ref:))
+      Nil
+    }
+    Error(_) -> {
+      // No holder found — might be a stale checkin. Ignore.
+      Nil
+    }
+  }
 }
 
 /// Shuts down the pool and any idle connections.
 pub fn shutdown(
-  pool: Subject(Message(conn, err)),
+  handle: PoolHandle(conn, err),
   timeout: Int,
 ) -> Result(Nil, PoolError(err)) {
-  process.call(pool, timeout, Shutdown)
+  process.call(handle.subject, timeout, Shutdown)
 }
 
 fn handle_message(
@@ -240,6 +364,10 @@ fn handle_message(
   Message(conn, err),
 ) {
   case msg {
+    GetShared(reply) -> {
+      process.send(reply, state.shared(state))
+      actor.continue(state)
+    }
     Interval -> {
       let state = state.ping(state, Interval)
 
@@ -248,18 +376,33 @@ fn handle_message(
       actor.continue(state)
       |> actor.with_selector(selector)
     }
-    CheckIn(conn:, caller:) -> {
-      let handler = fn(client, conn) { actor.send(client, Ok(conn)) }
-      let on_drop = actor.send(_, Error(ConnectionUnavailable))
+    CheckIn(caller:, holder_ref: _) -> {
+      let on_drop = fn(client) {
+        actor.send(client, Error(ConnectionUnavailable))
+      }
       let state =
-        state.dequeue(
+        state.checkin_notify(
           state,
-          Some(conn),
           caller,
           CallerDown,
-          handler,
-          on_drop:,
+          on_drop: on_drop,
           on_deadline: DeadlineExpired,
+        )
+
+      use selector <- state.with_selector(state)
+
+      actor.continue(state)
+      |> actor.with_selector(selector)
+    }
+    FastCheckoutNotify(caller:, holder_ref:, deadline:) -> {
+      let state =
+        state.register_fast_checkout(
+          state,
+          caller,
+          holder_ref,
+          deadline,
+          CallerDown,
+          DeadlineExpired,
         )
 
       use selector <- state.with_selector(state)
@@ -308,16 +451,16 @@ fn handle_message(
       |> actor.with_selector(selector)
     }
     DeadlineExpired(caller:, checkout_time:) -> {
-      let handler = fn(client, conn) { actor.send(client, Ok(conn)) }
-      let on_drop = actor.send(_, Error(ConnectionUnavailable))
+      let on_drop = fn(client) {
+        actor.send(client, Error(ConnectionUnavailable))
+      }
       let state =
         state.deadline_expired(
           state,
           caller,
           checkout_time,
           CallerDown,
-          handler,
-          on_drop:,
+          on_drop: on_drop,
           on_deadline: DeadlineExpired,
         )
 
@@ -329,16 +472,15 @@ fn handle_message(
     CallerDown(down) -> {
       let assert process.ProcessDown(pid:, ..) = down
 
-      let handler = fn(client, conn) { actor.send(client, Ok(conn)) }
-      let on_drop = actor.send(_, Error(ConnectionUnavailable))
+      let on_drop = fn(client) {
+        actor.send(client, Error(ConnectionUnavailable))
+      }
       let state =
-        state.dequeue(
+        state.caller_down(
           state,
-          None,
           pid,
           CallerDown,
-          handler,
-          on_drop:,
+          on_drop: on_drop,
           on_deadline: DeadlineExpired,
         )
 
@@ -374,3 +516,4 @@ fn handle_message(
     }
   }
 }
+// --- FFI bindings ---

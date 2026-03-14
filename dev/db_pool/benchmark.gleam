@@ -6,6 +6,7 @@ import gleam/io
 import gleam/list
 import gleam/string
 import rasa/counter
+import rasa/monotonic
 
 // ---------------------------------------------------------------------------
 // Types
@@ -122,16 +123,17 @@ fn run_scenario(scenario: Scenario) -> Nil {
   let collector = process.new_subject()
 
   // Microsecond counter for latency measurement
-  let timer = counter.monotonic(counter.Microsecond)
+  let timer = counter.monotonic(monotonic.Microsecond)
 
   // Compute the absolute stop time so workers can check autonomously
-  let assert Ok(now) = counter.next(timer)
+  let now = counter.next(timer)
   let stop_time = now + scenario.duration_ms * 1000
 
   // Spawn workers
-  list.range(1, scenario.workers)
-  |> list.each(fn(_) {
-    spawn_worker(pool.data, collector, stop_time, timer, scenario)
+  int.range(from: 1, to: scenario.workers, with: "", run: fn(_, _) {
+    spawn_worker(pool, collector, stop_time, timer, scenario)
+
+    ""
   })
 
   // Wait for the benchmark duration plus a drain buffer
@@ -144,8 +146,10 @@ fn run_scenario(scenario: Scenario) -> Nil {
   let stats = compute_stats(samples, scenario.duration_ms)
   print_stats(stats)
 
-  // Shut down the pool
-  let _ = db_pool.shutdown(pool.data, 5000)
+  // Pool cleanup is not needed for benchmarks — the actor will be
+  // garbage collected when the process exits. With ~3M ops and 2 messages
+  // each, the actor mailbox has millions of pending messages that would
+  // take too long to drain.
 
   io.println("")
 }
@@ -155,7 +159,7 @@ fn run_scenario(scenario: Scenario) -> Nil {
 // ---------------------------------------------------------------------------
 
 fn spawn_worker(
-  pool: process.Subject(db_pool.Message(Nil, err)),
+  pool: db_pool.PoolHandle(Nil, err),
   collector: process.Subject(Sample),
   stop_time: Int,
   timer: counter.Counter,
@@ -167,14 +171,14 @@ fn spawn_worker(
 }
 
 fn worker_loop(
-  pool: process.Subject(db_pool.Message(Nil, err)),
+  pool: db_pool.PoolHandle(Nil, err),
   collector: process.Subject(Sample),
   stop_time: Int,
   timer: counter.Counter,
   scenario: Scenario,
 ) -> Nil {
   // Check if we've exceeded the stop time
-  let assert Ok(now) = counter.next(timer)
+  let now = counter.next(timer)
   case now >= stop_time {
     True -> Nil
     False -> {
@@ -197,11 +201,11 @@ fn worker_loop(
           }
           db_pool.checkin(pool, conn, self)
 
-          let assert Ok(t1) = counter.next(timer)
+          let t1 = counter.next(timer)
           process.send(collector, Sample(latency_us: t1 - now, ok: True))
         }
         Error(_) -> {
-          let assert Ok(t1) = counter.next(timer)
+          let t1 = counter.next(timer)
           process.send(collector, Sample(latency_us: t1 - now, ok: False))
         }
       }

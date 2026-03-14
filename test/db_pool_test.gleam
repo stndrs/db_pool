@@ -31,7 +31,7 @@ pub fn start_test() {
 
   let assert Ok(pool) = db_pool.start(new_pool, name, 200)
 
-  let assert Ok(_) = db_pool.shutdown(pool.data, 200)
+  let assert Ok(_) = db_pool.shutdown(pool, 200)
 }
 
 pub fn start_error_test() {
@@ -80,16 +80,16 @@ pub fn checkout_current_connection_test() {
 
   let self = process.self()
 
-  let assert Ok(conn1) = db_pool.checkout(pool.data, self, 200, 30_000)
+  let assert Ok(conn1) = db_pool.checkout(pool, self, 200, 30_000)
 
-  let assert Ok(conn2) = db_pool.checkout(pool.data, self, 200, 30_000)
+  let assert Ok(conn2) = db_pool.checkout(pool, self, 200, 30_000)
 
   assert conn1 == conn2
 
   process.spawn(fn() {
     let self = process.self()
 
-    let assert Ok(conn3) = db_pool.checkout(pool.data, self, 200, 30_000)
+    let assert Ok(conn3) = db_pool.checkout(pool, self, 200, 30_000)
 
     assert conn1 != conn3
   })
@@ -152,7 +152,7 @@ pub fn caller_down_test() {
     process.spawn_unlinked(fn() {
       let self = process.self()
 
-      let assert Ok(_conn) = db_pool.checkout(pool.data, self, 100, 30_000)
+      let assert Ok(_conn) = db_pool.checkout(pool, self, 100, 30_000)
 
       process.sleep_forever()
     })
@@ -163,9 +163,9 @@ pub fn caller_down_test() {
 
   let self = process.self()
 
-  let assert Ok(_conn) = db_pool.checkout(pool.data, self, 200, 30_000)
+  let assert Ok(_conn) = db_pool.checkout(pool, self, 200, 30_000)
 
-  let assert Ok(_) = db_pool.shutdown(pool.data, 200)
+  let assert Ok(_) = db_pool.shutdown(pool, 200)
 }
 
 pub fn waiting_caller_test() {
@@ -183,24 +183,24 @@ pub fn waiting_caller_test() {
   process.spawn(fn() {
     let self = process.self()
 
-    let assert Ok(Nil) = db_pool.checkout(pool.data, self, 50, 30_000)
+    let assert Ok(Nil) = db_pool.checkout(pool, self, 50, 30_000)
 
     process.sleep(100)
 
-    db_pool.checkin(pool.data, Nil, self)
+    db_pool.checkin(pool, Nil, self)
   })
 
   process.spawn(fn() {
     let self = process.self()
 
-    let assert Ok(Nil) = db_pool.checkout(pool.data, self, 200, 30_000)
+    let assert Ok(Nil) = db_pool.checkout(pool, self, 200, 30_000)
 
-    db_pool.checkin(pool.data, Nil, self)
+    db_pool.checkin(pool, Nil, self)
   })
 
   process.sleep(250)
 
-  let assert Ok(_) = db_pool.shutdown(pool.data, 100)
+  let assert Ok(_) = db_pool.shutdown(pool, 100)
 }
 
 pub fn waiting_caller_timeout_test() {
@@ -218,25 +218,25 @@ pub fn waiting_caller_timeout_test() {
   process.spawn(fn() {
     let self = process.self()
 
-    let assert Ok(Nil) = db_pool.checkout(pool.data, self, 100, 30_000)
+    let assert Ok(Nil) = db_pool.checkout(pool, self, 100, 30_000)
 
     process.sleep(100)
 
-    db_pool.checkin(pool.data, Nil, self)
+    db_pool.checkin(pool, Nil, self)
   })
 
   process.spawn(fn() {
     let self = process.self()
 
     let assert Error(db_pool.ConnectionTimeout) =
-      db_pool.checkout(pool.data, self, 100, 30_000)
+      db_pool.checkout(pool, self, 100, 30_000)
 
-    db_pool.checkin(pool.data, Nil, self)
+    db_pool.checkin(pool, Nil, self)
   })
 
   process.sleep(150)
 
-  let assert Ok(_) = db_pool.shutdown(pool.data, 100)
+  let assert Ok(_) = db_pool.shutdown(pool, 100)
 }
 
 pub fn pool_exit_test() {
@@ -251,7 +251,7 @@ pub fn pool_exit_test() {
 
   let assert Ok(pool) = db_pool.start(db_pool, name, 200)
 
-  let assert Ok(pid) = process.subject_owner(pool.data)
+  let assert Ok(pid) = process.subject_owner(pool.subject)
 
   // Doesn't crash
   process.send_exit(pid)
@@ -274,7 +274,7 @@ pub fn deadline_expires_and_pool_recovers_test() {
   // First caller checks out with a 50ms deadline, then holds it forever
   process.spawn_unlinked(fn() {
     let self = process.self()
-    let assert Ok(_conn) = db_pool.checkout(pool.data, self, 200, 50)
+    let assert Ok(_conn) = db_pool.checkout(pool, self, 200, 50)
     // Hold the connection indefinitely (deadline should fire after 50ms)
     process.sleep_forever()
   })
@@ -285,9 +285,9 @@ pub fn deadline_expires_and_pool_recovers_test() {
   // Second caller should be able to check out successfully because the pool
   // replaced the deadline-expired connection
   let self = process.self()
-  let assert Ok(_conn) = db_pool.checkout(pool.data, self, 200, 30_000)
+  let assert Ok(_conn) = db_pool.checkout(pool, self, 200, 30_000)
 
-  let assert Ok(_) = db_pool.shutdown(pool.data, 200)
+  let assert Ok(_) = db_pool.shutdown(pool, 200)
 }
 
 /// When a caller checks in before the deadline, the deadline timer is
@@ -307,18 +307,18 @@ pub fn deadline_cancelled_by_checkin_test() {
   let self = process.self()
 
   // Checkout with a 100ms deadline
-  let assert Ok(conn) = db_pool.checkout(pool.data, self, 200, 100)
+  let assert Ok(conn) = db_pool.checkout(pool, self, 200, 100)
 
   // Return the connection well before the deadline
-  db_pool.checkin(pool.data, conn, self)
+  db_pool.checkin(pool, conn, self)
 
   // Sleep past the deadline period
   process.sleep(200)
 
   // Pool should still be fully operational -- checkout again
-  let assert Ok(_conn2) = db_pool.checkout(pool.data, self, 200, 30_000)
+  let assert Ok(_conn2) = db_pool.checkout(pool, self, 200, 30_000)
 
-  let assert Ok(_) = db_pool.shutdown(pool.data, 200)
+  let assert Ok(_) = db_pool.shutdown(pool, 200)
 }
 
 /// When a deadline fires and a waiting caller exists, the replacement
@@ -338,7 +338,7 @@ pub fn deadline_expires_serves_waiting_caller_test() {
   // First caller takes the only connection with a 50ms deadline, holds forever
   process.spawn_unlinked(fn() {
     let self = process.self()
-    let assert Ok(_conn) = db_pool.checkout(pool.data, self, 200, 50)
+    let assert Ok(_conn) = db_pool.checkout(pool, self, 200, 50)
     process.sleep_forever()
   })
 
@@ -349,13 +349,13 @@ pub fn deadline_expires_serves_waiting_caller_test() {
   // When the deadline fires after 50ms, the replacement should serve this waiter.
   process.spawn(fn() {
     let self = process.self()
-    let assert Ok(Nil) = db_pool.checkout(pool.data, self, 300, 30_000)
-    db_pool.checkin(pool.data, Nil, self)
+    let assert Ok(Nil) = db_pool.checkout(pool, self, 300, 30_000)
+    db_pool.checkin(pool, Nil, self)
   })
 
   process.sleep(300)
 
-  let assert Ok(_) = db_pool.shutdown(pool.data, 200)
+  let assert Ok(_) = db_pool.shutdown(pool, 200)
 }
 
 // When a waiting caller dies before a connection becomes available,
@@ -374,13 +374,13 @@ pub fn dead_waiter_skipped_test() {
 
   // Caller A takes the only connection
   let self = process.self()
-  let assert Ok(Nil) = db_pool.checkout(pool.data, self, 200, 30_000)
+  let assert Ok(Nil) = db_pool.checkout(pool, self, 200, 30_000)
 
   // Caller B enqueues as a waiter, then dies
   let waiter_b =
     process.spawn_unlinked(fn() {
       let self = process.self()
-      let _result = db_pool.checkout(pool.data, self, 5000, 30_000)
+      let _result = db_pool.checkout(pool, self, 5000, 30_000)
       Nil
     })
 
@@ -393,7 +393,7 @@ pub fn dead_waiter_skipped_test() {
   let result_subject = process.new_subject()
   process.spawn(fn() {
     let self = process.self()
-    let result = db_pool.checkout(pool.data, self, 5000, 30_000)
+    let result = db_pool.checkout(pool, self, 5000, 30_000)
     process.send(result_subject, result)
   })
 
@@ -401,12 +401,12 @@ pub fn dead_waiter_skipped_test() {
   process.sleep(50)
 
   // A returns the connection -- should skip dead B and serve C
-  db_pool.checkin(pool.data, Nil, self)
+  db_pool.checkin(pool, Nil, self)
 
   // C should receive the connection
   let assert Ok(Ok(Nil)) = process.receive(result_subject, 500)
 
-  let assert Ok(_) = db_pool.shutdown(pool.data, 200)
+  let assert Ok(_) = db_pool.shutdown(pool, 200)
 }
 
 /// When all waiting callers are dead, the connection returns to idle.
@@ -424,13 +424,13 @@ pub fn all_dead_waiters_connection_returns_to_idle_test() {
 
   // Caller A takes the only connection
   let self = process.self()
-  let assert Ok(Nil) = db_pool.checkout(pool.data, self, 200, 30_000)
+  let assert Ok(Nil) = db_pool.checkout(pool, self, 200, 30_000)
 
   // Caller B enqueues as a waiter, then dies
   let waiter_b =
     process.spawn_unlinked(fn() {
       let self = process.self()
-      let _result = db_pool.checkout(pool.data, self, 5000, 30_000)
+      let _result = db_pool.checkout(pool, self, 5000, 30_000)
       Nil
     })
 
@@ -440,17 +440,17 @@ pub fn all_dead_waiters_connection_returns_to_idle_test() {
   process.sleep(50)
 
   // A returns the connection -- should skip dead B and return conn to idle
-  db_pool.checkin(pool.data, Nil, self)
+  db_pool.checkin(pool, Nil, self)
 
   process.sleep(50)
 
   // A new caller should be able to checkout immediately (conn is idle)
-  let assert Ok(Nil) = db_pool.checkout(pool.data, self, 200, 30_000)
+  let assert Ok(Nil) = db_pool.checkout(pool, self, 200, 30_000)
 
-  let assert Ok(_) = db_pool.shutdown(pool.data, 200)
+  let assert Ok(_) = db_pool.shutdown(pool, 200)
 }
 
-fn db_pool() -> process.Subject(db_pool.Message(Nil, err)) {
+fn db_pool() -> db_pool.PoolHandle(Nil, err) {
   global_value.create_with_unique_name("db_pool_test", fn() {
     let name = process.new_name("db_pool_test")
 
@@ -463,6 +463,6 @@ fn db_pool() -> process.Subject(db_pool.Message(Nil, err)) {
 
     let assert Ok(pool) = db_pool.start(db_pool, name, 200)
 
-    pool.data
+    pool
   })
 }
