@@ -251,7 +251,7 @@ pub fn pool_exit_test() {
 
   let assert Ok(pool) = db_pool.start(db_pool, name, 200)
 
-  let assert Ok(pid) = process.subject_owner(pool.subject)
+  let assert Ok(pid) = process.subject_owner(pool)
 
   // Doesn't crash
   process.send_exit(pid)
@@ -450,7 +450,7 @@ pub fn all_dead_waiters_connection_returns_to_idle_test() {
   let assert Ok(_) = db_pool.shutdown(pool, 200)
 }
 
-fn db_pool() -> db_pool.PoolHandle(Nil, err) {
+fn db_pool() -> process.Subject(db_pool.Message(Nil, err)) {
   global_value.create_with_unique_name("db_pool_test", fn() {
     let name = process.new_name("db_pool_test")
 

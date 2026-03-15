@@ -1,11 +1,10 @@
-import db_pool/internal/state.{type HolderRef, type Shared, type State}
+import db_pool/internal/state.{type State}
 import gleam/erlang/process.{type Pid, type Subject}
 import gleam/otp/actor
 import gleam/otp/supervision
 import gleam/result
 import rasa/counter
 import rasa/monotonic
-import rasa/table
 
 pub type PoolError(err) {
   ConnectionError(err)
@@ -117,34 +116,13 @@ pub fn queue_interval(pool: Pool(conn, err), interval: Int) -> Pool(conn, err) {
   Pool(..pool, queue_interval: interval)
 }
 
-/// Handle returned by `start` — wraps the actor subject plus shared state
-/// needed for fast-path checkout/checkin.
-pub type PoolHandle(conn, err) {
-  PoolHandle(subject: Subject(Message(conn, err)), shared: Shared(conn))
-}
-
-/// Starts a connection pool.
+/// Starts a connection pool. Returns a Subject for sending messages
+/// to the pool actor.
 pub fn start(
   pool: Pool(conn, err),
   name: process.Name(Message(conn, err)),
   timeout: Int,
-) -> Result(PoolHandle(conn, err), actor.StartError) {
-  start_raw(pool, name, timeout)
-  |> result.map(fn(pair) {
-    let #(started, shared) = pair
-    PoolHandle(subject: started.data, shared:)
-  })
-}
-
-/// Internal start that returns the raw Started + Shared for supervised use.
-fn start_raw(
-  pool: Pool(conn, err),
-  name: process.Name(Message(conn, err)),
-  timeout: Int,
-) -> Result(
-  #(actor.Started(Subject(Message(conn, err))), Shared(conn)),
-  actor.StartError,
-) {
+) -> Result(Subject(Message(conn, err)), actor.StartError) {
   actor.new_with_initialiser(timeout, initialise_pool(_, pool))
   |> actor.on_message(handle_message)
   |> actor.named(name)
@@ -161,11 +139,7 @@ fn start_raw(
         Poll(time:, last_sent: time),
       )
 
-    // Extract the shared state by sending a GetShared request
-    let shared =
-      process.call_forever(started.data, fn(reply) { GetShared(reply) })
-
-    #(started, shared)
+    started.data
   })
 }
 
@@ -175,13 +149,12 @@ pub fn supervised(
   pool: Pool(conn, err),
   name: process.Name(Message(conn, err)),
   timeout: Int,
-) -> supervision.ChildSpecification(PoolHandle(conn, err)) {
+) -> supervision.ChildSpecification(Subject(Message(conn, err))) {
   supervision.worker(fn() {
-    start_raw(pool, name, timeout)
-    |> result.map(fn(pair) {
-      let #(started, shared) = pair
-      let handle = PoolHandle(subject: started.data, shared:)
-      actor.Started(pid: started.pid, data: handle)
+    start(pool, name, timeout)
+    |> result.map(fn(subject) {
+      let assert Ok(pid) = process.subject_owner(subject)
+      actor.Started(pid:, data: subject)
     })
   })
   |> supervision.timeout(timeout)
@@ -225,136 +198,49 @@ fn initialise_pool(
 
 pub opaque type Message(conn, err) {
   Interval
-  /// Slow-path checkout request (client waits for actor)
+  /// Checkout request: client waits for actor to serve or enqueue
   CheckOut(
     client: Subject(Result(conn, PoolError(err))),
     caller: Pid,
     timeout: Int,
     deadline: Int,
   )
-  /// Fast-path notification: client already has the holder, pool sets up monitor/deadline
-  FastCheckoutNotify(caller: Pid, holder_ref: HolderRef(conn), deadline: Int)
-  /// Fast-path checkin: client returns holder to pool
-  CheckIn(caller: Pid, holder_ref: HolderRef(conn))
+  /// Checkin: client returns a connection to the pool
+  CheckIn(caller: Pid, conn: conn)
   Timeout(time_sent: Int, timeout: Int)
   DeadlineExpired(caller: Pid, checkout_time: Int)
   Poll(time: Int, last_sent: Int)
   PoolExit(process.ExitMessage)
   CallerDown(process.Down)
   Shutdown(client: process.Subject(Result(Nil, PoolError(err))))
-  /// Internal message to extract shared state after init
-  GetShared(reply: Subject(Shared(conn)))
 }
 
-/// Attempts to check out a connection from the pool.
-/// Uses the fast-path (atomic counter + ETS) when idle connections are available,
-/// falling back to the slow-path (actor mailbox) when the pool is busy.
+/// Checks out a connection from the pool. All checkouts go through
+/// the actor mailbox.
 pub fn checkout(
-  handle: PoolHandle(conn, err),
+  pool: Subject(Message(conn, err)),
   caller: Pid,
   timeout: Int,
   deadline: Int,
 ) -> Result(conn, PoolError(err)) {
-  let shared = handle.shared
-
-  // Check if caller already has a connection checked out (re-entrant checkout)
-  case table.lookup(shared.checkout_map, caller) {
-    Ok(existing_holder) -> {
-      case state.get_conn(existing_holder) {
-        Ok(conn) -> Ok(conn)
-        Error(_) -> Error(ConnectionUnavailable)
-      }
-    }
-    Error(_) -> {
-      // Fast path: atomically claim an idle connection slot
-      case state.counter_checkout(shared.pool_counter) {
-        Ok(_count) -> {
-          // We won a slot. Grab the first idle holder from the ETS ordered_set.
-          case table.delete_first(shared.idle_queue) {
-            Ok(#(_key, holder_ref)) -> {
-              // Record in checkout_map for checkin lookup
-              let assert Ok(Nil) =
-                table.insert(shared.checkout_map, caller, holder_ref)
-
-              // Notify the pool actor to set up monitor + deadline
-              process.send(
-                handle.subject,
-                FastCheckoutNotify(caller:, holder_ref:, deadline:),
-              )
-
-              // Read the connection from the holder (public table, no ownership needed)
-              case state.get_conn(holder_ref) {
-                Ok(conn) -> Ok(conn)
-                Error(_) -> {
-                  // Holder lost its conn somehow; clean up and error
-                  let _ = table.delete(shared.checkout_map, caller)
-                  let _ = state.counter_checkin(shared.pool_counter)
-                  Error(ConnectionUnavailable)
-                }
-              }
-            }
-            Error(_) -> {
-              // Counter said idle conns exist but ETS empty (race). Undo and slow path.
-              let _ = state.counter_checkin(shared.pool_counter)
-              slow_path_checkout(handle, caller, timeout, deadline)
-            }
-          }
-        }
-        Error(_) -> {
-          // No idle connections available — slow path
-          slow_path_checkout(handle, caller, timeout, deadline)
-        }
-      }
-    }
-  }
-}
-
-fn slow_path_checkout(
-  handle: PoolHandle(conn, err),
-  caller: Pid,
-  timeout: Int,
-  deadline: Int,
-) -> Result(conn, PoolError(err)) {
-  process.call_forever(handle.subject, CheckOut(_, caller:, timeout:, deadline:))
+  process.call_forever(pool, CheckOut(_, caller:, timeout:, deadline:))
 }
 
 /// Returns a connection back to the pool.
-/// Client-side fast-path: immediately makes the holder available for other
-/// callers by inserting into idle_queue and incrementing pool_counter,
-/// then notifies the actor for cleanup (demonitor, cancel deadline, serve waiters).
-pub fn checkin(handle: PoolHandle(conn, err), _conn: conn, caller: Pid) -> Nil {
-  let shared = handle.shared
-
-  // Look up the holder from checkout_map
-  case table.lookup(shared.checkout_map, caller) {
-    Ok(holder_ref) -> {
-      // Remove from checkout map (client side)
-      let _ = table.delete(shared.checkout_map, caller)
-
-      // CLIENT-SIDE FAST PATH: make holder immediately available
-      // Use unique_integer([monotonic]) for a key that is both unique
-      // and monotonically increasing — safe for concurrent insertions.
-      let key = monotonic.unique()
-      let assert Ok(Nil) = table.insert(shared.idle_queue, key, holder_ref)
-      let _ = state.counter_checkin(shared.pool_counter)
-
-      // Notify actor for cleanup (demonitor, cancel deadline timer, serve waiters)
-      process.send(handle.subject, CheckIn(caller:, holder_ref:))
-      Nil
-    }
-    Error(_) -> {
-      // No holder found — might be a stale checkin. Ignore.
-      Nil
-    }
-  }
+pub fn checkin(
+  pool: Subject(Message(conn, err)),
+  conn: conn,
+  caller: Pid,
+) -> Nil {
+  process.send(pool, CheckIn(caller:, conn:))
 }
 
 /// Shuts down the pool and any idle connections.
 pub fn shutdown(
-  handle: PoolHandle(conn, err),
+  pool: Subject(Message(conn, err)),
   timeout: Int,
 ) -> Result(Nil, PoolError(err)) {
-  process.call(handle.subject, timeout, Shutdown)
+  process.call(pool, timeout, Shutdown)
 }
 
 fn handle_message(
@@ -365,37 +251,21 @@ fn handle_message(
   Message(conn, err),
 ) {
   case msg {
-    GetShared(reply) -> {
-      process.send(reply, state.shared(state))
-      actor.continue(state)
-    }
     Interval -> {
       let state = state.ping(state, Interval)
 
       actor.continue(state)
     }
-    CheckIn(caller:, holder_ref: _) -> {
+    CheckIn(caller:, conn: _) -> {
       let on_drop = fn(client) {
         actor.send(client, Error(ConnectionUnavailable))
       }
       let state =
-        state.checkin_notify(
+        state.checkin(
           state,
           caller,
           on_drop: on_drop,
           on_deadline: DeadlineExpired,
-        )
-
-      actor.continue(state)
-    }
-    FastCheckoutNotify(caller:, holder_ref:, deadline:) -> {
-      let state =
-        state.register_fast_checkout(
-          state,
-          caller,
-          holder_ref,
-          deadline,
-          DeadlineExpired,
         )
 
       actor.continue(state)
@@ -483,4 +353,3 @@ fn handle_message(
     }
   }
 }
-// --- FFI bindings ---

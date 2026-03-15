@@ -159,7 +159,7 @@ fn run_scenario(scenario: Scenario) -> Nil {
 // ---------------------------------------------------------------------------
 
 fn spawn_worker(
-  pool: db_pool.PoolHandle(Nil, err),
+  pool: process.Subject(db_pool.Message(Nil, err)),
   collector: process.Subject(Sample),
   stop_time: Int,
   timer: counter.Counter,
@@ -171,7 +171,7 @@ fn spawn_worker(
 }
 
 fn worker_loop(
-  pool: db_pool.PoolHandle(Nil, err),
+  pool: process.Subject(db_pool.Message(Nil, err)),
   collector: process.Subject(Sample),
   stop_time: Int,
   timer: counter.Counter,
