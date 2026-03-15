@@ -215,7 +215,7 @@ fn initialise_pool(
   |> state.interval(pool.interval)
   |> state.queue_target(pool.queue_target)
   |> state.queue_interval(pool.queue_interval)
-  |> state.build(selector)
+  |> state.build(self)
   |> result.map(fn(state) {
     actor.initialised(state)
     |> actor.selecting(selector)
@@ -372,10 +372,7 @@ fn handle_message(
     Interval -> {
       let state = state.ping(state, Interval)
 
-      use selector <- state.with_selector(state)
-
       actor.continue(state)
-      |> actor.with_selector(selector)
     }
     CheckIn(caller:, holder_ref: _) -> {
       let on_drop = fn(client) {
@@ -389,10 +386,7 @@ fn handle_message(
           on_deadline: DeadlineExpired,
         )
 
-      use selector <- state.with_selector(state)
-
       actor.continue(state)
-      |> actor.with_selector(selector)
     }
     FastCheckoutNotify(caller:, holder_ref:, deadline:) -> {
       let state =
@@ -404,10 +398,7 @@ fn handle_message(
           DeadlineExpired,
         )
 
-      use selector <- state.with_selector(state)
-
       actor.continue(state)
-      |> actor.with_selector(selector)
     }
     CheckOut(client:, caller:, timeout:, deadline:) -> {
       let state = {
@@ -426,10 +417,7 @@ fn handle_message(
         })
       }
 
-      use selector <- state.with_selector(state)
-
       actor.continue(state)
-      |> actor.with_selector(selector)
     }
     Timeout(time_sent:, timeout:) -> {
       let state = {
@@ -438,10 +426,7 @@ fn handle_message(
         state.expire(state, time_sent, timeout, on_expiry:, or_else: Timeout)
       }
 
-      use selector <- state.with_selector(state)
-
       actor.continue(state)
-      |> actor.with_selector(selector)
     }
     DeadlineExpired(caller:, checkout_time:) -> {
       let on_drop = fn(client) {
@@ -456,10 +441,7 @@ fn handle_message(
           on_deadline: DeadlineExpired,
         )
 
-      use selector <- state.with_selector(state)
-
       actor.continue(state)
-      |> actor.with_selector(selector)
     }
     CallerDown(down) -> {
       let assert process.ProcessDown(pid:, ..) = down
@@ -475,19 +457,13 @@ fn handle_message(
           on_deadline: DeadlineExpired,
         )
 
-      use selector <- state.with_selector(state)
-
       actor.continue(state)
-      |> actor.with_selector(selector)
     }
     Poll(time:, last_sent:) -> {
       let on_drop = actor.send(_, Error(ConnectionUnavailable))
       let state = state.poll(state, time, last_sent, on_poll: Poll, on_drop:)
 
-      use selector <- state.with_selector(state)
-
       actor.continue(state)
-      |> actor.with_selector(selector)
     }
     PoolExit(exit) -> {
       state.close(state)

@@ -193,7 +193,7 @@ pub type Shared(conn) {
 
 pub opaque type State(conn, msg, err) {
   State(
-    selector: process.Selector(msg),
+    self: process.Subject(msg),
     // pool capacity
     max_size: Int,
     // current number of connections
@@ -229,7 +229,7 @@ pub opaque type State(conn, msg, err) {
 
 pub fn build(
   builder: Builder(conn, err),
-  selector: process.Selector(msg),
+  self: process.Subject(msg),
 ) -> Result(State(conn, msg, err), String) {
   let connections = {
     list.repeat("", builder.max_size)
@@ -275,7 +275,7 @@ pub fn build(
   let now = counter.next(counter)
 
   State(
-    selector:,
+    self:,
     max_size: builder.max_size,
     current_size: builder.max_size,
     handle_open: builder.handle_open,
@@ -297,13 +297,6 @@ pub fn build(
 /// Returns the shared state needed by clients for fast-path operations.
 pub fn shared(state: State(conn, msg, err)) -> Shared(conn) {
   state.shared
-}
-
-pub fn with_selector(
-  state: State(conn, msg, err),
-  next: fn(process.Selector(msg)) -> t,
-) -> t {
-  next(state.selector)
 }
 
 pub fn current_size(state: State(conn, msg, err)) -> Int {
@@ -339,17 +332,14 @@ pub fn register_fast_checkout(
   let monitor = process.monitor(caller)
   let now = counter.next(state.counter)
 
-  let deadline_subject = process.new_subject()
   let deadline_timer =
-    process.send_after(deadline_subject, deadline, on_deadline(caller, now))
+    process.send_after(state.self, deadline, on_deadline(caller, now))
 
   let activated =
     Active(holder: holder_ref, monitor:, deadline_timer:, checkout_time: now)
   let active = dict.insert(state.active, caller, activated)
 
-  let selector = process.select(state.selector, deadline_subject)
-
-  State(..state, selector:, active:)
+  State(..state, active:)
 }
 
 /// Called when a client-side fast-path checkin notification arrives.
@@ -563,13 +553,8 @@ pub fn checkout(
             let monitor = process.monitor(caller)
             let now = counter.next(state.counter)
 
-            let deadline_subject = process.new_subject()
             let deadline_timer =
-              process.send_after(
-                deadline_subject,
-                deadline,
-                on_deadline(caller, now),
-              )
+              process.send_after(state.self, deadline, on_deadline(caller, now))
 
             let activated =
               Active(holder: ref, monitor:, deadline_timer:, checkout_time: now)
@@ -577,14 +562,7 @@ pub fn checkout(
             let assert Ok(Nil) =
               table.insert(state.shared.checkout_map, caller, ref)
 
-            let selector = process.select(state.selector, deadline_subject)
-
-            State(
-              ..state,
-              current_size: state.current_size + 1,
-              selector:,
-              active:,
-            )
+            State(..state, current_size: state.current_size + 1, active:)
           })
           |> result.replace_error(Nil)
         }
@@ -615,13 +593,10 @@ pub fn enqueue(
 
   let assert Ok(now_in_ms) = queue.push(state.queue, waiting)
 
-  let subject = process.new_subject()
   let _timer =
-    process.send_after(subject, timeout, handle_timeout(now_in_ms, timeout))
+    process.send_after(state.self, timeout, handle_timeout(now_in_ms, timeout))
 
-  let selector = process.select(state.selector, subject)
-
-  State(..state, selector:)
+  state
 }
 
 pub fn expire(
@@ -638,12 +613,10 @@ pub fn expire(
     use <- bool.lazy_guard(
       when: { now < { sent + timeout * ns_per_ms } },
       return: fn() {
-        let subject = process.new_subject()
-        let _timer = process.send_after(subject, timeout, extend(sent, timeout))
+        let _timer =
+          process.send_after(state.self, timeout, extend(sent, timeout))
 
-        let selector = process.select(state.selector, subject)
-
-        State(..state, selector:)
+        state
       },
     )
 
@@ -823,10 +796,9 @@ fn serve_waiter(
       // Set up monitoring and deadline for the checkout
       let monitor = process.monitor(waiting.caller)
 
-      let deadline_subject = process.new_subject()
       let deadline_timer =
         process.send_after(
-          deadline_subject,
+          state.self,
           waiting.deadline,
           on_deadline(waiting.caller, now),
         )
@@ -842,9 +814,7 @@ fn serve_waiter(
 
       process.demonitor_process(waiting.monitor)
 
-      let selector = process.select(state.selector, deadline_subject)
-
-      State(..state, selector:, active:)
+      State(..state, active:)
     }
   }
 }
@@ -919,16 +889,14 @@ fn start_poll(
   schedule_poll: fn(Int, Int) -> msg,
 ) -> State(conn, msg, err) {
   let poll_time = now + state.queue_interval
-  let subject = process.new_subject()
   let _timer =
     process.send_after(
-      subject,
+      state.self,
       state.queue_interval / ns_per_ms,
       schedule_poll(poll_time, last_sent),
     )
-  let selector = process.select(state.selector, subject)
 
-  State(..state, selector:)
+  state
 }
 
 pub fn shutdown(state: State(conn, msg, err)) -> Nil {
@@ -956,11 +924,9 @@ pub fn ping(state: State(conn, msg, err), message: msg) -> State(conn, msg, err)
     Error(_) -> Nil
   }
 
-  let subject = process.new_subject()
-  let _timer = process.send_after(subject, state.interval, message)
-  let selector = process.select(state.selector, subject)
+  let _timer = process.send_after(state.self, state.interval, message)
 
-  State(..state, selector:)
+  state
 }
 
 pub fn close(state: State(conn, msg, err)) -> Nil {

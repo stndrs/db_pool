@@ -12,7 +12,7 @@ pub fn current_connection_error_test() {
   let assert Ok(state) =
     state.new()
     |> state.on_open(fn() { Ok(reference.new()) })
-    |> state.build(process.new_selector())
+    |> state.build(process.new_subject())
 
   let self = process.self()
 
@@ -20,10 +20,11 @@ pub fn current_connection_error_test() {
 }
 
 pub fn enqueue_test() {
+  let self_subject = process.new_subject()
   let assert Ok(state) =
     state.new()
     |> state.on_open(fn() { Ok(reference.new()) })
-    |> state.build(process.new_selector())
+    |> state.build(self_subject)
 
   let self = process.self()
   let subject = process.new_subject()
@@ -36,18 +37,17 @@ pub fn enqueue_test() {
       "Timeout!"
     })
 
-  use selector <- state.with_selector(state)
-
-  let assert Ok("Timeout!") = process.selector_receive(selector, 150)
+  let assert Ok("Timeout!") = process.receive(self_subject, 150)
 
   assert 1 == state.queue_size(state)
 }
 
 pub fn expire_test() {
+  let self_subject = process.new_subject()
   let assert Ok(state) =
     state.new()
     |> state.on_open(fn() { Ok(reference.new()) })
-    |> state.build(process.new_selector())
+    |> state.build(self_subject)
 
   assert 0 == state.queue_size(state)
 
@@ -71,8 +71,7 @@ pub fn expire_test() {
   assert 1 == state.queue_size(state)
 
   // Receive the queue key from the timeout callback (fires after 1ms)
-  use selector <- state.with_selector(state)
-  let assert Ok(Nil) = process.selector_receive(selector, 50)
+  let assert Ok(Nil) = process.receive(self_subject, 50)
   let assert Ok(sent) = process.receive(key_subject, 0)
 
   let extend = fn(_, _) { panic as "should not be called" }
@@ -86,10 +85,11 @@ pub fn expire_test() {
 }
 
 pub fn expire_retry_test() {
+  let self_subject = process.new_subject()
   let assert Ok(state) =
     state.new()
     |> state.on_open(fn() { Ok(reference.new()) })
-    |> state.build(process.new_selector())
+    |> state.build(self_subject)
 
   assert 0 == state.queue_size(state)
 
@@ -112,8 +112,7 @@ pub fn expire_retry_test() {
   assert 1 == state.queue_size(state)
 
   // Receive the queue key from the timeout callback (fires after 1ms)
-  use selector <- state.with_selector(state)
-  let assert Ok("") = process.selector_receive(selector, 50)
+  let assert Ok("") = process.receive(self_subject, 50)
   let assert Ok(sent) = process.receive(key_subject, 0)
 
   let extend = fn(_, _) { "Extend!" }
@@ -126,31 +125,27 @@ pub fn expire_retry_test() {
   // Ensure queued process is still in the queue
   assert 1 == state.queue_size(state)
 
-  use selector <- state.with_selector(state)
-
-  let assert Ok("Extend!") = process.selector_receive(selector, 150)
+  let assert Ok("Extend!") = process.receive(self_subject, 150)
 }
 
 pub fn ping_test() {
-  let selector = process.new_selector()
+  let self_subject = process.new_subject()
 
-  let assert Ok(state) =
+  let assert Ok(_state) =
     state.new()
     |> state.on_open(fn() { Ok(reference.new()) })
     |> state.interval(10)
-    |> state.build(selector)
+    |> state.build(self_subject)
     |> result.map(state.ping(_, "Ping!"))
 
-  use selector <- state.with_selector(state)
-
-  let assert Ok("Ping!") = process.selector_receive(selector, 100)
+  let assert Ok("Ping!") = process.receive(self_subject, 100)
 }
 
 pub fn shutdown_test() {
   let assert Ok(state) =
     state.new()
     |> state.on_open(fn() { Ok(reference.new()) })
-    |> state.build(process.new_selector())
+    |> state.build(process.new_subject())
 
   assert Nil == state.shutdown(state)
 }
@@ -159,7 +154,7 @@ pub fn close_test() {
   let assert Ok(state) =
     state.new()
     |> state.on_open(fn() { Ok(reference.new()) })
-    |> state.build(process.new_selector())
+    |> state.build(process.new_subject())
 
   assert Nil == state.close(state)
 }
@@ -167,11 +162,12 @@ pub fn close_test() {
 // The poll function should schedule the next poll timer and return
 // updated state.
 pub fn poll_schedules_next_poll_test() {
+  let self_subject = process.new_subject()
   let assert Ok(state) =
     state.new()
     |> state.on_open(fn() { Ok(reference.new()) })
     |> state.queue_interval(50)
-    |> state.build(process.new_selector())
+    |> state.build(self_subject)
 
   let now =
     monotonic.Nanosecond
@@ -179,7 +175,7 @@ pub fn poll_schedules_next_poll_test() {
     |> counter.next
 
   // Poll with no queue entries should just schedule next poll
-  let state =
+  let _state =
     state.poll(
       state,
       now,
@@ -188,10 +184,8 @@ pub fn poll_schedules_next_poll_test() {
       on_drop: fn(_) { Nil },
     )
 
-  use selector <- state.with_selector(state)
-
   // The poll timer should fire within queue_interval + buffer
-  let assert Ok(#("Poll", _, _)) = process.selector_receive(selector, 150)
+  let assert Ok(#("Poll", _, _)) = process.receive(self_subject, 150)
 }
 
 /// Poll should trigger CoDel slow mode when the queue has stalled
@@ -202,7 +196,7 @@ pub fn poll_enters_slow_on_stall_test() {
     |> state.on_open(fn() { Ok(reference.new()) })
     |> state.queue_target(1)
     |> state.queue_interval(1)
-    |> state.build(process.new_selector())
+    |> state.build(process.new_subject())
 
   assert False == state.is_slow(state)
 
