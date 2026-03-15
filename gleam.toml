@@ -16,4 +16,3 @@ rasa = { path = "../rasa" }
 [dev-dependencies]
 gleeunit = ">= 1.0.0 and < 2.0.0"
 global_value = ">= 1.0.0 and < 2.0.0"
-exception = ">= 2.1.0 and < 3.0.0"

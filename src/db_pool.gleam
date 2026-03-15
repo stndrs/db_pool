@@ -390,6 +390,10 @@ fn do_checkout(
 ) -> Result(State(conn, err), Nil) {
   case dict.get(state.active, caller) {
     Ok(active) -> {
+      // Subsequent checkouts: return the same connection. The original
+      // deadline is preserved as callers cannot extend their deadline
+      // by checking out again. A single process is limited to one
+      // connection at a time.
       actor.send(client, Ok(active.conn))
       Ok(state)
     }
