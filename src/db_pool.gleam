@@ -323,7 +323,11 @@ fn handle_message(
 ) -> actor.Next(State(conn, err), Message(conn, err)) {
   case msg {
     Interval -> {
-      list.each(state.idle, fn(conn) { state.handle_interval(conn) })
+      // Spawn unlinked processes so health checks don't block the actor
+      // mailbox and a crashing callback doesn't take down the pool.
+      list.each(state.idle, fn(conn) {
+        process.spawn_unlinked(fn() { state.handle_interval(conn) })
+      })
       let _timer = process.send_after(state.self, state.interval, Interval)
       actor.continue(state)
     }
