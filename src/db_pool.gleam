@@ -1,6 +1,7 @@
 import gleam/bool
 import gleam/dict.{type Dict}
 import gleam/erlang/process.{type Pid, type Subject}
+import gleam/int
 import gleam/list
 import gleam/otp/actor
 import gleam/otp/supervision
@@ -13,6 +14,10 @@ import rasa/table
 // --- Constants ---
 
 const ns_per_ms = 1_000_000
+
+const reconnect_min_ms = 1000
+
+const reconnect_max_ms = 30_000
 
 // --- Public types ---
 
@@ -227,6 +232,7 @@ pub opaque type Message(conn, err) {
   Poll(time: Int, last_sent: Int)
   PoolExit(process.ExitMessage)
   CallerDown(process.Down)
+  Reconnect(backoff: Int)
   Shutdown(client: Subject(Result(Nil, PoolError(err))))
 }
 
@@ -361,9 +367,13 @@ fn handle_message(
       let state = do_poll(state, time, last_sent)
       actor.continue(state)
     }
-    // Note: Interval, Poll, and deadline timers are not explicitly cancelled
-    // on exit/shutdown. Their messages are silently dropped once the actor
-    // stops and the subject becomes unreachable.
+    Reconnect(backoff:) -> {
+      let state = do_reconnect(state, backoff)
+      actor.continue(state)
+    }
+    // Note: Interval, Poll, Reconnect, and deadline timers are not explicitly
+    // cancelled on exit/shutdown. Their messages are silently dropped once the
+    // actor stops and the subject becomes unreachable.
     PoolExit(exit) -> {
       close_idle(state)
       case exit.reason {
@@ -518,13 +528,18 @@ fn do_caller_down(state: State(conn, err), pid: Pid) -> State(conn, err) {
       let state = State(..state, active:)
 
       let _ = state.handle_close(prev.conn)
+      let state = State(..state, current_size: state.current_size - 1)
 
       case state.handle_open() {
         Ok(conn) -> {
+          let state = State(..state, current_size: state.current_size + 1)
           let now = counter.next(state.counter)
           codel_dequeue(state, now, conn)
         }
-        Error(_) -> State(..state, current_size: state.current_size - 1)
+        Error(_) -> {
+          schedule_reconnect(state, reconnect_min_ms)
+          state
+        }
       }
     }
     Error(_) -> state
@@ -555,16 +570,47 @@ fn do_deadline_expired(
     let state = State(..state, active: active_dict)
 
     let _ = state.handle_close(active.conn)
+    let state = State(..state, current_size: state.current_size - 1)
 
     case state.handle_open() {
       Ok(conn) -> {
+        let state = State(..state, current_size: state.current_size + 1)
         let now = counter.next(state.counter)
         codel_dequeue(state, now, conn)
       }
-      Error(_) -> State(..state, current_size: state.current_size - 1)
+      Error(_) -> {
+        schedule_reconnect(state, reconnect_min_ms)
+        state
+      }
     }
   })
   |> result.unwrap(state)
+}
+
+/// Called when a reconnect timer fires. Attempts to open a replacement
+/// connection. On success, the connection is fed through CoDel to serve
+/// a waiter or return to idle. On failure, another reconnect is scheduled
+/// with increased backoff (randomized exponential, capped at 30s).
+fn do_reconnect(state: State(conn, err), backoff: Int) -> State(conn, err) {
+  case state.handle_open() {
+    Ok(conn) -> {
+      let state = State(..state, current_size: state.current_size + 1)
+      let now = counter.next(state.counter)
+      codel_dequeue(state, now, conn)
+    }
+    Error(_) -> {
+      schedule_reconnect(state, backoff)
+      state
+    }
+  }
+}
+
+fn schedule_reconnect(state: State(conn, err), backoff: Int) -> Nil {
+  let half = backoff / 2
+  let delay = half + int.random(half + 1)
+  let next_backoff = int.min(backoff * 2, reconnect_max_ms)
+  let _timer = process.send_after(state.self, delay, Reconnect(next_backoff))
+  Nil
 }
 
 // --- CoDel algorithm ---

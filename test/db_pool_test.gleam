@@ -7,6 +7,7 @@ import gleam/otp/actor
 import gleam/otp/static_supervisor
 import gleeunit
 import global_value
+import rasa/table
 
 pub fn main() -> Nil {
   gleeunit.main()
@@ -564,6 +565,62 @@ pub fn codel_fast_mode_serves_immediately_test() {
   // Waiter should be served, not dropped
   let assert Ok(Ok(Nil)) = process.receive(collector, 500)
 
+  let assert Ok(_) = db_pool.shutdown(pool, 200)
+}
+
+pub fn reconnect_after_failed_replacement_test() {
+  // Shared flag: when True, handle_open succeeds; when False, it fails.
+  let flag =
+    table.build()
+    |> table.with_access(table.Public)
+    |> table.new()
+  let assert Ok(Nil) = table.insert(flag, "open", True)
+
+  let name = process.new_name("db_pool_test")
+  let pool =
+    db_pool.new()
+    |> db_pool.size(1)
+    |> db_pool.on_open(fn() {
+      case table.lookup(flag, "open") {
+        Ok(True) -> Ok(Nil)
+        _ -> Error(Nil)
+      }
+    })
+    |> db_pool.on_close(fn(_) { Ok(Nil) })
+    |> db_pool.on_interval(fn(_) { Nil })
+
+  let assert Ok(pool) = db_pool.start(pool, name, 200)
+
+  // Check out the only connection
+  let caller =
+    process.spawn_unlinked(fn() {
+      let self = process.self()
+      let assert Ok(Nil) = db_pool.checkout(pool, self, 200, 30_000)
+      // Hold the connection until killed
+      process.sleep(30_000)
+    })
+
+  // Wait for checkout to complete
+  process.sleep(20)
+
+  // Disable handle_open so replacement fails, then kill the caller
+  let assert Ok(Nil) = table.insert(flag, "open", False)
+  process.kill(caller)
+
+  // Wait for the pool to attempt replacement (and fail)
+  process.sleep(50)
+
+  // Pool has 0 usable connections now. Re-enable handle_open so
+  // the reconnect backoff timer succeeds on the next attempt.
+  let assert Ok(Nil) = table.insert(flag, "open", True)
+
+  // The reconnect timer fires at ~500-1000ms (first backoff).
+  // Wait for it, then verify checkout works again.
+  let self = process.self()
+  let assert Ok(Nil) = db_pool.checkout(pool, self, 2000, 30_000)
+  db_pool.checkin(pool, Nil, self)
+
+  let assert Ok(Nil) = table.drop(flag)
   let assert Ok(_) = db_pool.shutdown(pool, 200)
 }
 
