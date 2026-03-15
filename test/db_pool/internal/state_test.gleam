@@ -32,14 +32,9 @@ pub fn enqueue_test() {
 
   let state =
     state
-    |> state.enqueue(
-      self,
-      subject,
-      100,
-      no_deadline,
-      on_timeout: fn(_, _) { "Timeout!" },
-      on_down: fn(_) { "" },
-    )
+    |> state.enqueue(self, subject, 100, no_deadline, on_timeout: fn(_, _) {
+      "Timeout!"
+    })
 
   use selector <- state.with_selector(state)
 
@@ -70,7 +65,6 @@ pub fn expire_test() {
         process.send(key_subject, sent)
         Nil
       },
-      on_down: fn(_) { Nil },
     )
 
   // Enqueue waiting process
@@ -113,7 +107,6 @@ pub fn expire_retry_test() {
         process.send(key_subject, sent)
         ""
       },
-      on_down: fn(_) { "" },
     )
 
   assert 1 == state.queue_size(state)
@@ -222,7 +215,6 @@ pub fn poll_enters_slow_on_stall_test() {
       5000,
       no_deadline,
       on_timeout: fn(_, _) { Nil },
-      on_down: fn(_) { Nil },
     )
 
   assert 1 == state.queue_size(state)

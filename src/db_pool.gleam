@@ -205,6 +205,7 @@ fn initialise_pool(
     process.new_selector()
     |> process.select(self)
     |> process.select_trapped_exits(PoolExit)
+    |> process.select_monitors(CallerDown)
 
   state.new()
   |> state.max_size(pool.size)
@@ -384,7 +385,6 @@ fn handle_message(
         state.checkin_notify(
           state,
           caller,
-          CallerDown,
           on_drop: on_drop,
           on_deadline: DeadlineExpired,
         )
@@ -401,7 +401,6 @@ fn handle_message(
           caller,
           holder_ref,
           deadline,
-          CallerDown,
           DeadlineExpired,
         )
 
@@ -412,14 +411,9 @@ fn handle_message(
     }
     CheckOut(client:, caller:, timeout:, deadline:) -> {
       let state = {
-        state.checkout(
-          state,
-          caller,
-          CallerDown,
-          deadline,
-          DeadlineExpired,
-          fn(conn) { actor.send(client, Ok(conn)) },
-        )
+        state.checkout(state, caller, deadline, DeadlineExpired, fn(conn) {
+          actor.send(client, Ok(conn))
+        })
         |> result.lazy_unwrap(fn() {
           state.enqueue(
             state,
@@ -428,7 +422,6 @@ fn handle_message(
             timeout,
             deadline,
             on_timeout: Timeout,
-            on_down: CallerDown,
           )
         })
       }
@@ -459,7 +452,6 @@ fn handle_message(
           state,
           caller,
           checkout_time,
-          CallerDown,
           on_drop: on_drop,
           on_deadline: DeadlineExpired,
         )
@@ -479,7 +471,6 @@ fn handle_message(
         state.caller_down(
           state,
           pid,
-          CallerDown,
           on_drop: on_drop,
           on_deadline: DeadlineExpired,
         )

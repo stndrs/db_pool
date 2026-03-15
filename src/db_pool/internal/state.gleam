@@ -334,7 +334,6 @@ pub fn register_fast_checkout(
   caller: process.Pid,
   holder_ref: HolderRef(conn),
   deadline: Int,
-  mapping: fn(process.Down) -> msg,
   on_deadline: fn(process.Pid, Int) -> msg,
 ) -> State(conn, msg, err) {
   let monitor = process.monitor(caller)
@@ -348,10 +347,7 @@ pub fn register_fast_checkout(
     Active(holder: holder_ref, monitor:, deadline_timer:, checkout_time: now)
   let active = dict.insert(state.active, caller, activated)
 
-  let selector =
-    state.selector
-    |> process.select_specific_monitor(activated.monitor, mapping)
-    |> process.select(deadline_subject)
+  let selector = process.select(state.selector, deadline_subject)
 
   State(..state, selector:, active:)
 }
@@ -364,7 +360,6 @@ pub fn register_fast_checkout(
 pub fn checkin_notify(
   state: State(conn, msg, err),
   caller: process.Pid,
-  mapping: fn(process.Down) -> msg,
   on_drop drop: fn(process.Subject(Result(conn, err))) -> Nil,
   on_deadline on_deadline: fn(process.Pid, Int) -> msg,
 ) -> State(conn, msg, err) {
@@ -373,10 +368,8 @@ pub fn checkin_notify(
     Ok(prev) -> {
       let _ = process.cancel_timer(prev.deadline_timer)
       process.demonitor_process(prev.monitor)
-      let selector =
-        process.deselect_specific_monitor(state.selector, prev.monitor)
       let active = dict.delete(state.active, caller)
-      State(..state, selector:, active:)
+      State(..state, active:)
     }
     Error(_) -> {
       // Already cleaned up (duplicate message or fast-path race). Continue
@@ -395,7 +388,7 @@ pub fn checkin_notify(
           case table.delete_first(state.shared.idle_queue) {
             Ok(#(_key, holder_ref)) -> {
               let now = counter.next(state.counter)
-              codel_dequeue(state, now, holder_ref, mapping, drop, on_deadline)
+              codel_dequeue(state, now, holder_ref, drop, on_deadline)
             }
             Error(_) -> {
               // Counter said idle but ETS empty (race). Undo.
@@ -423,7 +416,6 @@ pub fn checkin_notify(
 pub fn caller_down(
   state: State(conn, msg, err),
   pid: process.Pid,
-  mapping: fn(process.Down) -> msg,
   on_drop drop: fn(process.Subject(Result(conn, err))) -> Nil,
   on_deadline on_deadline: fn(process.Pid, Int) -> msg,
 ) -> State(conn, msg, err) {
@@ -431,10 +423,8 @@ pub fn caller_down(
     Ok(prev) -> {
       let _ = process.cancel_timer(prev.deadline_timer)
       process.demonitor_process(prev.monitor)
-      let selector =
-        process.deselect_specific_monitor(state.selector, prev.monitor)
       let active = dict.delete(state.active, pid)
-      let state = State(..state, selector:, active:)
+      let state = State(..state, active:)
 
       // Check if the caller already did a client-side checkin (holder is
       // in idle_queue). Erlang guarantees CheckIn arrives before DOWN, so
@@ -462,7 +452,7 @@ pub fn caller_down(
               let new_ref = new_holder(conn)
 
               let now = counter.next(state.counter)
-              codel_dequeue(state, now, new_ref, mapping, drop, on_deadline)
+              codel_dequeue(state, now, new_ref, drop, on_deadline)
             }
             Error(_) -> State(..state, current_size: state.current_size - 1)
           }
@@ -485,7 +475,6 @@ pub fn deadline_expired(
   state: State(conn, msg, err),
   caller: process.Pid,
   checkout_time: Int,
-  mapping: fn(process.Down) -> msg,
   on_drop drop: fn(process.Subject(Result(conn, err))) -> Nil,
   on_deadline on_deadline: fn(process.Pid, Int) -> msg,
 ) -> State(conn, msg, err) {
@@ -504,20 +493,16 @@ pub fn deadline_expired(
         // Client already checked in. Just clean up actor-side state.
         let _ = process.cancel_timer(active.deadline_timer)
         process.demonitor_process(active.monitor)
-        let selector =
-          process.deselect_specific_monitor(state.selector, active.monitor)
         let active_dict = dict.delete(state.active, caller)
-        State(..state, selector:, active: active_dict)
+        State(..state, active: active_dict)
       }
       Ok(_) -> {
         // Normal deadline expiry — caller still holds the connection.
         process.demonitor_process(active.monitor)
-        let selector =
-          process.deselect_specific_monitor(state.selector, active.monitor)
 
         let active_dict = dict.delete(state.active, caller)
         let _ = table.delete(state.shared.checkout_map, caller)
-        let state = State(..state, selector:, active: active_dict)
+        let state = State(..state, active: active_dict)
 
         // Close old connection and destroy holder
         case get_conn(active.holder) {
@@ -534,7 +519,7 @@ pub fn deadline_expired(
             let new_ref = new_holder(conn)
 
             let now = counter.next(state.counter)
-            codel_dequeue(state, now, new_ref, mapping, drop, on_deadline)
+            codel_dequeue(state, now, new_ref, drop, on_deadline)
           }
           Error(_) -> State(..state, current_size: state.current_size - 1)
         }
@@ -550,7 +535,6 @@ pub fn deadline_expired(
 pub fn checkout(
   state: State(conn, msg, err),
   caller: process.Pid,
-  handle_down: fn(process.Down) -> msg,
   deadline: Int,
   on_deadline: fn(process.Pid, Int) -> msg,
   next: fn(conn) -> Nil,
@@ -593,10 +577,7 @@ pub fn checkout(
             let assert Ok(Nil) =
               table.insert(state.shared.checkout_map, caller, ref)
 
-            let selector =
-              state.selector
-              |> process.select_specific_monitor(activated.monitor, handle_down)
-              |> process.select(deadline_subject)
+            let selector = process.select(state.selector, deadline_subject)
 
             State(
               ..state,
@@ -628,7 +609,6 @@ pub fn enqueue(
   timeout: Int,
   deadline: Int,
   on_timeout handle_timeout: fn(Int, Int) -> msg,
-  on_down handle_down: fn(process.Down) -> msg,
 ) -> State(conn, msg, err) {
   let monitor = process.monitor(caller)
   let waiting = Waiting(caller:, monitor:, client:, deadline:)
@@ -639,10 +619,7 @@ pub fn enqueue(
   let _timer =
     process.send_after(subject, timeout, handle_timeout(now_in_ms, timeout))
 
-  let selector =
-    state.selector
-    |> process.select(subject)
-    |> process.select_specific_monitor(waiting.monitor, handle_down)
+  let selector = process.select(state.selector, subject)
 
   State(..state, selector:)
 }
@@ -676,10 +653,7 @@ pub fn expire(
 
     process.demonitor_process(waiting.monitor)
 
-    let selector =
-      process.deselect_specific_monitor(state.selector, waiting.monitor)
-
-    State(..state, selector:)
+    state
   })
   |> result.unwrap(state)
 }
@@ -690,25 +664,22 @@ fn codel_dequeue(
   state: State(conn, msg, err),
   now: Int,
   holder_ref: HolderRef(conn),
-  mapping: fn(process.Down) -> msg,
   on_drop drop: fn(process.Subject(Result(conn, err))) -> Nil,
   on_deadline on_deadline: fn(process.Pid, Int) -> msg,
 ) -> State(conn, msg, err) {
   case now >= state.next {
     // evaluate whether we should be slow or fast
-    True -> dequeue_first(state, now, holder_ref, mapping, drop, on_deadline)
+    True -> dequeue_first(state, now, holder_ref, drop, on_deadline)
     // Mid-interval
     False ->
       case state.slow {
-        False ->
-          dequeue_fast(state, now, holder_ref, mapping, drop, on_deadline)
+        False -> dequeue_fast(state, now, holder_ref, drop, on_deadline)
         True ->
           dequeue_slow(
             state,
             now,
             state.queue_target * 2,
             holder_ref,
-            mapping,
             drop,
             on_deadline,
           )
@@ -721,7 +692,6 @@ fn dequeue_first(
   state: State(conn, msg, err),
   now: Int,
   holder_ref: HolderRef(conn),
-  mapping: fn(process.Down) -> msg,
   on_drop drop: fn(process.Subject(Result(conn, err))) -> Nil,
   on_deadline on_deadline: fn(process.Pid, Int) -> msg,
 ) -> State(conn, msg, err) {
@@ -735,7 +705,7 @@ fn dequeue_first(
       let delay = now - sent
       let state = State(..state, next:, delay:, slow:)
 
-      serve_waiter(state, waiting, holder_ref, mapping, drop, on_deadline)
+      serve_waiter(state, waiting, holder_ref, drop, on_deadline)
     }
     _ -> {
       // No waiters so return holder to idle
@@ -750,7 +720,6 @@ fn dequeue_fast(
   state: State(conn, msg, err),
   now: Int,
   holder_ref: HolderRef(conn),
-  mapping: fn(process.Down) -> msg,
   on_drop drop: fn(process.Subject(Result(conn, err))) -> Nil,
   on_deadline on_deadline: fn(process.Pid, Int) -> msg,
 ) -> State(conn, msg, err) {
@@ -763,7 +732,7 @@ fn dequeue_fast(
         True -> State(..state, delay:)
         False -> state
       }
-      serve_waiter(state, waiting, holder_ref, mapping, drop, on_deadline)
+      serve_waiter(state, waiting, holder_ref, drop, on_deadline)
     }
     _ -> {
       // No waiters, return holder to idle
@@ -779,7 +748,6 @@ fn dequeue_slow(
   now: Int,
   timeout: Int,
   holder_ref: HolderRef(conn),
-  mapping: fn(process.Down) -> msg,
   on_drop drop: fn(process.Subject(Result(conn, err))) -> Nil,
   on_deadline on_deadline: fn(process.Pid, Int) -> msg,
 ) -> State(conn, msg, err) {
@@ -791,11 +759,8 @@ fn dequeue_slow(
       drop(waiting.client)
       process.demonitor_process(waiting.monitor)
 
-      let selector =
-        process.deselect_specific_monitor(state.selector, waiting.monitor)
-
-      State(..state, selector:)
-      |> dequeue_slow(now, timeout, holder_ref, mapping, drop, on_deadline)
+      state
+      |> dequeue_slow(now, timeout, holder_ref, drop, on_deadline)
     }
     Ok(#(sent, waiting)) -> {
       // This waiter is fresh enough
@@ -807,7 +772,7 @@ fn dequeue_slow(
         False -> state
       }
 
-      serve_waiter(state, waiting, holder_ref, mapping, drop, on_deadline)
+      serve_waiter(state, waiting, holder_ref, drop, on_deadline)
     }
     _ -> {
       // No waiters, return holder to idle
@@ -831,7 +796,6 @@ fn serve_waiter(
   state: State(conn, msg, err),
   waiting: Waiting(conn, err),
   holder_ref: HolderRef(conn),
-  mapping: fn(process.Down) -> msg,
   on_drop drop: fn(process.Subject(Result(conn, err))) -> Nil,
   on_deadline on_deadline: fn(process.Pid, Int) -> msg,
 ) -> State(conn, msg, err) {
@@ -839,12 +803,9 @@ fn serve_waiter(
   case process.is_alive(waiting.caller) {
     False -> {
       process.demonitor_process(waiting.monitor)
-      let selector =
-        process.deselect_specific_monitor(state.selector, waiting.monitor)
-      let state = State(..state, selector:)
 
       let now = counter.next(state.counter)
-      codel_dequeue(state, now, holder_ref, mapping, drop, on_deadline)
+      codel_dequeue(state, now, holder_ref, drop, on_deadline)
     }
     True -> {
       // Serve the connection to the waiter
@@ -881,11 +842,7 @@ fn serve_waiter(
 
       process.demonitor_process(waiting.monitor)
 
-      let selector =
-        state.selector
-        |> process.deselect_specific_monitor(waiting.monitor)
-        |> process.select_specific_monitor(activated.monitor, mapping)
-        |> process.select(deadline_subject)
+      let selector = process.select(state.selector, deadline_subject)
 
       State(..state, selector:, active:)
     }
@@ -948,10 +905,7 @@ fn poll_drop_slow(
       drop(waiting.client)
       process.demonitor_process(waiting.monitor)
 
-      let selector =
-        process.deselect_specific_monitor(state.selector, waiting.monitor)
-
-      State(..state, selector:)
+      state
       |> poll_drop_slow(now, timeout, drop)
     }
     _ -> state
