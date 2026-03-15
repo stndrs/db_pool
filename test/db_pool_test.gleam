@@ -122,22 +122,27 @@ pub fn checkout_exhaustion_test() {
   let pool = db_pool()
 
   // Two callers hold both connections for 200ms
+  let holder1 = process.new_subject()
   process.spawn(fn() {
     let self = process.self()
-    let assert Ok(Nil) = db_pool.checkout(pool, self, 200, 30_000)
+    let result = db_pool.checkout(pool, self, 200, 30_000)
+    process.send(holder1, result)
     process.sleep(200)
     db_pool.checkin(pool, Nil, self)
   })
 
+  let holder2 = process.new_subject()
   process.spawn(fn() {
     let self = process.self()
-    let assert Ok(Nil) = db_pool.checkout(pool, self, 200, 30_000)
+    let result = db_pool.checkout(pool, self, 200, 30_000)
+    process.send(holder2, result)
     process.sleep(200)
     db_pool.checkin(pool, Nil, self)
   })
 
-  // Give time for both to acquire
-  process.sleep(50)
+  // Verify both acquired connections
+  let assert Ok(Ok(Nil)) = process.receive(holder1, 500)
+  let assert Ok(Ok(Nil)) = process.receive(holder2, 500)
 
   // Third caller should time out -- pool exhausted for another ~150ms
   let result_subject = process.new_subject()
