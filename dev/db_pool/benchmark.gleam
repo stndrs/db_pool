@@ -194,6 +194,9 @@ fn worker_loop(
 
       case result {
         Ok(conn) -> {
+          // Measure only checkout wait time, not hold time or checkin
+          let checkout_end = counter.next(timer)
+
           // Simulate work
           case scenario.hold_ms > 0 {
             True -> process.sleep(scenario.hold_ms)
@@ -201,8 +204,10 @@ fn worker_loop(
           }
           db_pool.checkin(pool, conn, self)
 
-          let t1 = counter.next(timer)
-          process.send(collector, Sample(latency_us: t1 - now, ok: True))
+          process.send(
+            collector,
+            Sample(latency_us: checkout_end - now, ok: True),
+          )
         }
         Error(_) -> {
           let t1 = counter.next(timer)
