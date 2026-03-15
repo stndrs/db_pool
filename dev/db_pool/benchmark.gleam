@@ -130,7 +130,7 @@ fn run_scenario(scenario: Scenario) -> Nil {
   let stop_time = now + scenario.duration_ms * 1000
 
   // Spawn workers
-  int.range(from: 1, to: scenario.workers, with: "", run: fn(_, _) {
+  int.range(from: 0, to: scenario.workers, with: "", run: fn(_, _) {
     spawn_worker(pool, collector, stop_time, timer, scenario)
 
     ""

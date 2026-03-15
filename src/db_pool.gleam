@@ -357,6 +357,9 @@ fn handle_message(
       let state = do_poll(state, time, last_sent)
       actor.continue(state)
     }
+    // Note: Interval, Poll, and deadline timers are not explicitly cancelled
+    // on exit/shutdown. Their messages are silently dropped once the actor
+    // stops and the subject becomes unreachable.
     PoolExit(exit) -> {
       close_idle(state)
       case exit.reason {
@@ -367,10 +370,7 @@ fn handle_message(
       }
     }
     Shutdown(client:) -> {
-      case dict.size(state.active) {
-        0 -> close_idle(state)
-        _ -> Nil
-      }
+      close_idle(state)
       actor.send(client, Ok(Nil))
       actor.stop()
     }
@@ -474,8 +474,11 @@ fn do_expire(
     use <- bool.lazy_guard(
       when: { now < { sent + timeout * ns_per_ms } },
       return: fn() {
+        let remaining_ns = sent + timeout * ns_per_ms - now
+        let remaining_ms = remaining_ns / ns_per_ms
+
         let _timer =
-          process.send_after(state.self, timeout, Timeout(sent, timeout))
+          process.send_after(state.self, remaining_ms, Timeout(sent, timeout))
 
         state
       },
@@ -493,6 +496,11 @@ fn do_expire(
 }
 
 /// Called when a caller process dies while holding a connection or waiting.
+/// If the caller held an active connection, the connection is closed and
+/// replaced. If the caller was waiting in the queue, the entry is cleaned
+/// up lazily: `serve_waiter` checks `process.is_alive` at dequeue time,
+/// and `do_expire` removes entries when their timeout fires. The queue is
+/// keyed by timestamp, so there is no efficient PID-based removal.
 fn do_caller_down(state: State(conn, err), pid: Pid) -> State(conn, err) {
   case dict.get(state.active, pid) {
     Ok(prev) -> {
@@ -659,8 +667,6 @@ fn serve_waiter(
 
       let now = counter.next(state.counter)
 
-      let monitor = process.monitor(waiting.caller)
-
       let deadline_timer =
         process.send_after(
           state.self,
@@ -669,10 +675,13 @@ fn serve_waiter(
         )
 
       let activated =
-        Active(conn:, monitor:, deadline_timer:, checkout_time: now)
+        Active(
+          conn:,
+          monitor: waiting.monitor,
+          deadline_timer:,
+          checkout_time: now,
+        )
       let active = dict.insert(state.active, waiting.caller, activated)
-
-      process.demonitor_process(waiting.monitor)
 
       State(..state, active:)
     }

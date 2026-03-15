@@ -2,6 +2,7 @@ import db_pool
 import gleam/erlang/process
 import gleam/erlang/reference
 import gleam/int
+import gleam/list
 import gleam/otp/actor
 import gleam/otp/static_supervisor
 import gleeunit
@@ -64,6 +65,13 @@ pub fn supervised_test() {
     static_supervisor.new(static_supervisor.OneForOne)
     |> static_supervisor.add(pool_spec)
     |> static_supervisor.start
+
+  // Verify the pool is functional by checking out and checking in
+  let pool = process.named_subject(name)
+  let self = process.self()
+
+  let assert Ok(Nil) = db_pool.checkout(pool, self, 200, 30_000)
+  db_pool.checkin(pool, Nil, self)
 }
 
 pub fn checkout_current_connection_test() {
@@ -215,28 +223,35 @@ pub fn waiting_caller_timeout_test() {
 
   let assert Ok(pool) = db_pool.start(pool, name, 100)
 
+  // First caller holds the connection for 200ms
   process.spawn(fn() {
     let self = process.self()
 
-    let assert Ok(Nil) = db_pool.checkout(pool, self, 100, 30_000)
+    let assert Ok(Nil) = db_pool.checkout(pool, self, 200, 30_000)
 
-    process.sleep(100)
+    process.sleep(200)
 
     db_pool.checkin(pool, Nil, self)
   })
 
+  // Give time for first caller to acquire
+  process.sleep(20)
+
+  // Second caller times out after 50ms — connection won't be back for ~180ms
+  let result_subject = process.new_subject()
   process.spawn(fn() {
     let self = process.self()
 
-    let assert Error(db_pool.ConnectionTimeout) =
-      db_pool.checkout(pool, self, 100, 30_000)
-
-    db_pool.checkin(pool, Nil, self)
+    let result = db_pool.checkout(pool, self, 50, 30_000)
+    process.send(result_subject, result)
   })
 
-  process.sleep(150)
+  let assert Ok(Error(db_pool.ConnectionTimeout)) =
+    process.receive(result_subject, 500)
 
-  let assert Ok(_) = db_pool.shutdown(pool, 100)
+  process.sleep(250)
+
+  let assert Ok(_) = db_pool.shutdown(pool, 200)
 }
 
 pub fn pool_exit_test() {
@@ -448,6 +463,110 @@ pub fn all_dead_waiters_connection_returns_to_idle_test() {
   let assert Ok(Nil) = db_pool.checkout(pool, self, 200, 30_000)
 
   let assert Ok(_) = db_pool.shutdown(pool, 200)
+}
+
+/// When the pool is overloaded and CoDel enters slow mode, waiters that
+/// have been in the queue longer than queue_target * 2 are dropped with
+/// ConnectionUnavailable.
+pub fn codel_drops_slow_waiters_test() {
+  let name = process.new_name("db_pool_test")
+
+  let pool =
+    db_pool.new()
+    |> db_pool.size(1)
+    |> db_pool.queue_target(1)
+    |> db_pool.queue_interval(50)
+    |> db_pool.on_open(fn() { Ok(Nil) })
+    |> db_pool.on_close(fn(_) { Ok(Nil) })
+    |> db_pool.on_interval(fn(_) { Nil })
+
+  let assert Ok(pool) = db_pool.start(pool, name, 200)
+
+  // Exhaust the only connection
+  let self = process.self()
+  let assert Ok(Nil) = db_pool.checkout(pool, self, 200, 30_000)
+
+  // Spawn 5 waiters that will be queued
+  let collector = process.new_subject()
+  list.repeat(Nil, 5)
+  |> list.each(fn(_) {
+    process.spawn(fn() {
+      let self = process.self()
+      let result = db_pool.checkout(pool, self, 5000, 30_000)
+      process.send(collector, result)
+    })
+  })
+
+  // Wait for CoDel to detect overload:
+  // - queue_interval=50ms: first poll fires at 50ms, sees delay > 1ms (target),
+  //   enters slow mode and drops waiters older than 2ms (target * 2)
+  process.sleep(150)
+
+  // Return the connection — may serve one surviving waiter via codel_dequeue
+  db_pool.checkin(pool, Nil, self)
+
+  // Give time for the served waiter to complete
+  process.sleep(100)
+
+  // Collect all results
+  let results = collect_results(collector, [])
+
+  // At least one waiter should have been dropped with ConnectionUnavailable
+  let dropped =
+    list.filter(results, fn(r) { r == Error(db_pool.ConnectionUnavailable) })
+  assert list.length(dropped) >= 1
+
+  let assert Ok(_) = db_pool.shutdown(pool, 200)
+}
+
+/// In fast mode (delay < queue_target), waiters are served immediately
+/// without being dropped.
+pub fn codel_fast_mode_serves_immediately_test() {
+  let name = process.new_name("db_pool_test")
+
+  let pool =
+    db_pool.new()
+    |> db_pool.size(1)
+    |> db_pool.queue_target(5000)
+    |> db_pool.queue_interval(5000)
+    |> db_pool.on_open(fn() { Ok(Nil) })
+    |> db_pool.on_close(fn(_) { Ok(Nil) })
+    |> db_pool.on_interval(fn(_) { Nil })
+
+  let assert Ok(pool) = db_pool.start(pool, name, 200)
+
+  // Exhaust the connection briefly
+  let self = process.self()
+  let assert Ok(Nil) = db_pool.checkout(pool, self, 200, 30_000)
+
+  // Spawn a waiter
+  let collector = process.new_subject()
+  process.spawn(fn() {
+    let self = process.self()
+    let result = db_pool.checkout(pool, self, 2000, 30_000)
+    process.send(collector, result)
+  })
+
+  // Let the waiter enqueue
+  process.sleep(20)
+
+  // Return the connection quickly — delay will be well under queue_target
+  db_pool.checkin(pool, Nil, self)
+
+  // Waiter should be served, not dropped
+  let assert Ok(Ok(Nil)) = process.receive(collector, 500)
+
+  let assert Ok(_) = db_pool.shutdown(pool, 200)
+}
+
+fn collect_results(
+  collector: process.Subject(Result(Nil, db_pool.PoolError(err))),
+  acc: List(Result(Nil, db_pool.PoolError(err))),
+) -> List(Result(Nil, db_pool.PoolError(err))) {
+  case process.receive(collector, 0) {
+    Ok(result) -> collect_results(collector, [result, ..acc])
+    Error(Nil) -> acc
+  }
 }
 
 fn db_pool() -> process.Subject(db_pool.Message(Nil, err)) {

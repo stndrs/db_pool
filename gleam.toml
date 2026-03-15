@@ -6,11 +6,6 @@ licences = ["MIT"]
 repository = { type = "github", user = "stndrs", repo = "db_pool" }
 target = "erlang"
 
-internal_modules = [
-  "db_pool/internal/*",
-  "db_pool/internal"
-]
-
 [dependencies]
 gleam_stdlib = ">= 0.44.0 and < 2.0.0"
 gleam_erlang = ">= 1.3.0 and < 2.0.0"
