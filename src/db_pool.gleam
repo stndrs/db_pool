@@ -327,8 +327,8 @@ fn handle_message(
       let _timer = process.send_after(state.self, state.interval, Interval)
       actor.continue(state)
     }
-    CheckIn(caller:, conn: _) -> {
-      let state = do_checkin(state, caller)
+    CheckIn(caller:, conn:) -> {
+      let state = do_checkin(state, caller, conn)
       actor.continue(state)
     }
     CheckOut(client:, caller:, timeout:, deadline:) -> {
@@ -423,9 +423,15 @@ fn do_checkout(
 /// Called when a client returns a connection to the pool.
 /// Cleans up monitoring/deadline, then either serves a waiter
 /// via CoDel or returns the connection to idle.
-fn do_checkin(state: State(conn, err), caller: Pid) -> State(conn, err) {
+fn do_checkin(
+  state: State(conn, err),
+  caller: Pid,
+  conn: conn,
+) -> State(conn, err) {
   case dict.get(state.active, caller) {
     Ok(prev) -> {
+      assert prev.conn == conn
+
       let _ = process.cancel_timer(prev.deadline_timer)
       process.demonitor_process(prev.monitor)
       let active = dict.delete(state.active, caller)
