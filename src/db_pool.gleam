@@ -531,7 +531,12 @@ fn do_caller_down(state: State(conn, err), pid: Pid) -> State(conn, err) {
   }
 }
 
-/// Called when a deadline timer fires.
+/// Called when a deadline timer fires. The connection is closed and the
+/// caller is removed from active, but the caller process is NOT killed
+/// or notified — they still hold a reference to the now-closed connection
+/// and will discover it is dead on their next operation. The deadline is
+/// a hard cutoff, and the pool must reclaim connections from overrunning
+/// callers to stay healthy.
 fn do_deadline_expired(
   state: State(conn, err),
   caller: Pid,
