@@ -1,10 +1,20 @@
-import db_pool/internal/state.{type State}
+import gleam/bool
+import gleam/dict.{type Dict}
 import gleam/erlang/process.{type Pid, type Subject}
+import gleam/list
 import gleam/otp/actor
 import gleam/otp/supervision
 import gleam/result
 import rasa/counter
 import rasa/monotonic
+import rasa/queue.{type Queue}
+import rasa/table
+
+// --- Constants ---
+
+const ns_per_ms = 1_000_000
+
+// --- Public types ---
 
 pub type PoolError(err) {
   ConnectionError(err)
@@ -116,6 +126,49 @@ pub fn queue_interval(pool: Pool(conn, err), interval: Int) -> Pool(conn, err) {
   Pool(..pool, queue_interval: interval)
 }
 
+// --- Internal types ---
+
+type Waiting(conn, err) {
+  Waiting(
+    caller: Pid,
+    monitor: process.Monitor,
+    client: Subject(Result(conn, err)),
+    deadline: Int,
+  )
+}
+
+type Active(conn) {
+  Active(
+    conn: conn,
+    monitor: process.Monitor,
+    deadline_timer: process.Timer,
+    checkout_time: Int,
+  )
+}
+
+type State(conn, msg, err) {
+  State(
+    self: Subject(msg),
+    max_size: Int,
+    current_size: Int,
+    handle_open: fn() -> Result(conn, err),
+    handle_close: fn(conn) -> Result(Nil, err),
+    handle_interval: fn(conn) -> Nil,
+    interval: Int,
+    idle: List(conn),
+    active: Dict(Pid, Active(conn)),
+    queue: Queue(Waiting(conn, err)),
+    counter: counter.Counter,
+    queue_target: Int,
+    queue_interval: Int,
+    delay: Int,
+    slow: Bool,
+    next: Int,
+  )
+}
+
+// --- Public API ---
+
 /// Starts a connection pool. Returns a Subject for sending messages
 /// to the pool actor.
 pub fn start(
@@ -161,58 +214,21 @@ pub fn supervised(
   |> supervision.restart(supervision.Transient)
 }
 
-fn initialise_pool(
-  self: Subject(Message(conn, err)),
-  pool: Pool(conn, err),
-) -> Result(
-  actor.Initialised(
-    State(conn, Message(conn, err), PoolError(err)),
-    Message(conn, err),
-    Subject(Message(conn, err)),
-  ),
-  String,
-) {
-  process.trap_exits(True)
-
-  let selector =
-    process.new_selector()
-    |> process.select(self)
-    |> process.select_trapped_exits(PoolExit)
-    |> process.select_monitors(CallerDown)
-
-  state.new()
-  |> state.max_size(pool.size)
-  |> state.on_open(pool.handle_open)
-  |> state.on_close(pool.handle_close)
-  |> state.on_interval(pool.handle_interval)
-  |> state.interval(pool.interval)
-  |> state.queue_target(pool.queue_target)
-  |> state.queue_interval(pool.queue_interval)
-  |> state.build(self)
-  |> result.map(fn(state) {
-    actor.initialised(state)
-    |> actor.selecting(selector)
-    |> actor.returning(self)
-  })
-}
-
 pub opaque type Message(conn, err) {
   Interval
-  /// Checkout request: client waits for actor to serve or enqueue
   CheckOut(
     client: Subject(Result(conn, PoolError(err))),
     caller: Pid,
     timeout: Int,
     deadline: Int,
   )
-  /// Checkin: client returns a connection to the pool
   CheckIn(caller: Pid, conn: conn)
   Timeout(time_sent: Int, timeout: Int)
   DeadlineExpired(caller: Pid, checkout_time: Int)
   Poll(time: Int, last_sent: Int)
   PoolExit(process.ExitMessage)
   CallerDown(process.Down)
-  Shutdown(client: process.Subject(Result(Nil, PoolError(err))))
+  Shutdown(client: Subject(Result(Nil, PoolError(err))))
 }
 
 /// Checks out a connection from the pool. All checkouts go through
@@ -243,6 +259,65 @@ pub fn shutdown(
   process.call(pool, timeout, Shutdown)
 }
 
+// --- Actor initialisation ---
+
+fn initialise_pool(
+  self: Subject(Message(conn, err)),
+  pool: Pool(conn, err),
+) -> Result(
+  actor.Initialised(
+    State(conn, Message(conn, err), PoolError(err)),
+    Message(conn, err),
+    Subject(Message(conn, err)),
+  ),
+  String,
+) {
+  process.trap_exits(True)
+
+  let selector =
+    process.new_selector()
+    |> process.select(self)
+    |> process.select_trapped_exits(PoolExit)
+    |> process.select_monitors(CallerDown)
+
+  let connections =
+    list.repeat("", pool.size)
+    |> list.try_map(fn(_) { pool.handle_open() })
+    |> result.map_error(fn(_) { "(db_pool) Failed to open connections" })
+
+  use conns <- result.map(connections)
+
+  let cntr = counter.monotonic(monotonic.Nanosecond)
+  let q = queue.new(cntr, table.Private)
+  let now = counter.next(cntr)
+
+  let state =
+    State(
+      self:,
+      max_size: pool.size,
+      current_size: pool.size,
+      handle_open: pool.handle_open,
+      handle_close: pool.handle_close,
+      handle_interval: pool.handle_interval,
+      interval: pool.interval,
+      idle: conns,
+      active: dict.new(),
+      queue: q,
+      counter: cntr,
+      queue_target: pool.queue_target * ns_per_ms,
+      queue_interval: pool.queue_interval * ns_per_ms,
+      delay: 0,
+      slow: False,
+      next: now + pool.queue_interval * ns_per_ms,
+    )
+
+  actor.initialised(state)
+  |> actor.selecting(selector)
+  |> actor.returning(self)
+}
+
+// --- Message handler ---
+
 fn handle_message(
   state: State(conn, Message(conn, err), PoolError(err)),
   msg: Message(conn, err),
@@ -252,8 +327,8 @@ fn handle_message(
 ) {
   case msg {
     Interval -> {
-      let state = state.ping(state, Interval)
-
+      list.each(state.idle, fn(conn) { state.handle_interval(conn) })
+      let _timer = process.send_after(state.self, state.interval, Interval)
       actor.continue(state)
     }
     CheckIn(caller:, conn: _) -> {
@@ -261,22 +336,16 @@ fn handle_message(
         actor.send(client, Error(ConnectionUnavailable))
       }
       let state =
-        state.checkin(
-          state,
-          caller,
-          on_drop: on_drop,
-          on_deadline: DeadlineExpired,
-        )
-
+        do_checkin(state, caller, on_drop:, on_deadline: DeadlineExpired)
       actor.continue(state)
     }
     CheckOut(client:, caller:, timeout:, deadline:) -> {
       let state = {
-        state.checkout(state, caller, deadline, DeadlineExpired, fn(conn) {
+        do_checkout(state, caller, deadline, DeadlineExpired, fn(conn) {
           actor.send(client, Ok(conn))
         })
         |> result.lazy_unwrap(fn() {
-          state.enqueue(
+          do_enqueue(
             state,
             caller,
             client,
@@ -286,16 +355,12 @@ fn handle_message(
           )
         })
       }
-
       actor.continue(state)
     }
     Timeout(time_sent:, timeout:) -> {
-      let state = {
-        let on_expiry = actor.send(_, Error(ConnectionTimeout))
-
-        state.expire(state, time_sent, timeout, on_expiry:, or_else: Timeout)
-      }
-
+      let on_expiry = actor.send(_, Error(ConnectionTimeout))
+      let state =
+        do_expire(state, time_sent, timeout, on_expiry:, or_else: Timeout)
       actor.continue(state)
     }
     DeadlineExpired(caller:, checkout_time:) -> {
@@ -303,41 +368,31 @@ fn handle_message(
         actor.send(client, Error(ConnectionUnavailable))
       }
       let state =
-        state.deadline_expired(
+        do_deadline_expired(
           state,
           caller,
           checkout_time,
-          on_drop: on_drop,
+          on_drop:,
           on_deadline: DeadlineExpired,
         )
-
       actor.continue(state)
     }
     CallerDown(down) -> {
       let assert process.ProcessDown(pid:, ..) = down
-
       let on_drop = fn(client) {
         actor.send(client, Error(ConnectionUnavailable))
       }
       let state =
-        state.caller_down(
-          state,
-          pid,
-          on_drop: on_drop,
-          on_deadline: DeadlineExpired,
-        )
-
+        do_caller_down(state, pid, on_drop:, on_deadline: DeadlineExpired)
       actor.continue(state)
     }
     Poll(time:, last_sent:) -> {
       let on_drop = actor.send(_, Error(ConnectionUnavailable))
-      let state = state.poll(state, time, last_sent, on_poll: Poll, on_drop:)
-
+      let state = do_poll(state, time, last_sent, on_poll: Poll, on_drop:)
       actor.continue(state)
     }
     PoolExit(exit) -> {
-      state.close(state)
-
+      close_idle(state)
       case exit.reason {
         process.Normal -> actor.stop()
         process.Killed -> actor.stop_abnormal("pool killed")
@@ -346,10 +401,424 @@ fn handle_message(
       }
     }
     Shutdown(client:) -> {
-      state.shutdown(state)
-
+      case dict.size(state.active) {
+        0 -> close_idle(state)
+        _ -> Nil
+      }
       actor.send(client, Ok(Nil))
       actor.stop()
     }
   }
+}
+
+// --- State machine operations ---
+
+/// Try to check out a connection. Returns Ok(state) if served
+/// (re-entrant checkout or idle conn available), Error(Nil) if the
+/// caller should be enqueued.
+fn do_checkout(
+  state: State(conn, msg, err),
+  caller: Pid,
+  deadline: Int,
+  on_deadline: fn(Pid, Int) -> msg,
+  next: fn(conn) -> Nil,
+) -> Result(State(conn, msg, err), Nil) {
+  case dict.get(state.active, caller) {
+    Ok(active) -> {
+      next(active.conn)
+      Ok(state)
+    }
+    Error(_) -> {
+      case state.idle {
+        [conn, ..rest] -> {
+          next(conn)
+
+          let monitor = process.monitor(caller)
+          let now = counter.next(state.counter)
+
+          let deadline_timer =
+            process.send_after(state.self, deadline, on_deadline(caller, now))
+
+          let activated =
+            Active(conn:, monitor:, deadline_timer:, checkout_time: now)
+          let active = dict.insert(state.active, caller, activated)
+
+          Ok(State(..state, idle: rest, active:))
+        }
+        [] -> Error(Nil)
+      }
+    }
+  }
+}
+
+/// Called when a client returns a connection to the pool.
+/// Cleans up monitoring/deadline, then either serves a waiter
+/// via CoDel or returns the connection to idle.
+fn do_checkin(
+  state: State(conn, msg, err),
+  caller: Pid,
+  on_drop drop: fn(Subject(Result(conn, err))) -> Nil,
+  on_deadline on_deadline: fn(Pid, Int) -> msg,
+) -> State(conn, msg, err) {
+  case dict.get(state.active, caller) {
+    Ok(prev) -> {
+      let _ = process.cancel_timer(prev.deadline_timer)
+      process.demonitor_process(prev.monitor)
+      let active = dict.delete(state.active, caller)
+      let state = State(..state, active:)
+
+      let now = counter.next(state.counter)
+      codel_dequeue(state, now, prev.conn, drop, on_deadline)
+    }
+    Error(_) -> state
+  }
+}
+
+fn do_enqueue(
+  state: State(conn, msg, err),
+  caller: Pid,
+  client: Subject(Result(conn, err)),
+  timeout: Int,
+  deadline: Int,
+  on_timeout handle_timeout: fn(Int, Int) -> msg,
+) -> State(conn, msg, err) {
+  let monitor = process.monitor(caller)
+  let waiting = Waiting(caller:, monitor:, client:, deadline:)
+
+  let assert Ok(now_in_ms) = queue.push(state.queue, waiting)
+
+  let _timer =
+    process.send_after(state.self, timeout, handle_timeout(now_in_ms, timeout))
+
+  state
+}
+
+fn do_expire(
+  state: State(conn, msg, err),
+  sent: Int,
+  timeout: Int,
+  on_expiry next: fn(Subject(Result(conn, err))) -> Nil,
+  or_else extend: fn(Int, Int) -> msg,
+) -> State(conn, msg, err) {
+  queue.at(state.queue, sent)
+  |> result.map(fn(waiting) {
+    let now = counter.next(state.counter)
+
+    use <- bool.lazy_guard(
+      when: { now < { sent + timeout * ns_per_ms } },
+      return: fn() {
+        let _timer =
+          process.send_after(state.self, timeout, extend(sent, timeout))
+
+        state
+      },
+    )
+
+    let assert Ok(Nil) = queue.delete(state.queue, sent)
+
+    next(waiting.client)
+
+    process.demonitor_process(waiting.monitor)
+
+    state
+  })
+  |> result.unwrap(state)
+}
+
+/// Called when a caller process dies while holding a connection or waiting.
+fn do_caller_down(
+  state: State(conn, msg, err),
+  pid: Pid,
+  on_drop drop: fn(Subject(Result(conn, err))) -> Nil,
+  on_deadline on_deadline: fn(Pid, Int) -> msg,
+) -> State(conn, msg, err) {
+  case dict.get(state.active, pid) {
+    Ok(prev) -> {
+      let _ = process.cancel_timer(prev.deadline_timer)
+      process.demonitor_process(prev.monitor)
+      let active = dict.delete(state.active, pid)
+      let state = State(..state, active:)
+
+      let _ = state.handle_close(prev.conn)
+
+      case state.handle_open() {
+        Ok(conn) -> {
+          let now = counter.next(state.counter)
+          codel_dequeue(state, now, conn, drop, on_deadline)
+        }
+        Error(_) -> State(..state, current_size: state.current_size - 1)
+      }
+    }
+    Error(_) -> state
+  }
+}
+
+/// Called when a deadline timer fires.
+fn do_deadline_expired(
+  state: State(conn, msg, err),
+  caller: Pid,
+  checkout_time: Int,
+  on_drop drop: fn(Subject(Result(conn, err))) -> Nil,
+  on_deadline on_deadline: fn(Pid, Int) -> msg,
+) -> State(conn, msg, err) {
+  dict.get(state.active, caller)
+  |> result.map(fn(active) {
+    use <- bool.guard(
+      when: active.checkout_time != checkout_time,
+      return: state,
+    )
+
+    process.demonitor_process(active.monitor)
+
+    let active_dict = dict.delete(state.active, caller)
+    let state = State(..state, active: active_dict)
+
+    let _ = state.handle_close(active.conn)
+
+    case state.handle_open() {
+      Ok(conn) -> {
+        let now = counter.next(state.counter)
+        codel_dequeue(state, now, conn, drop, on_deadline)
+      }
+      Error(_) -> State(..state, current_size: state.current_size - 1)
+    }
+  })
+  |> result.unwrap(state)
+}
+
+// --- CoDel algorithm ---
+
+// Dispatches to the appropriate strategy based on
+// whether we're at an interval boundary, in slow mode, or in fast mode.
+fn codel_dequeue(
+  state: State(conn, msg, err),
+  now: Int,
+  conn: conn,
+  on_drop drop: fn(Subject(Result(conn, err))) -> Nil,
+  on_deadline on_deadline: fn(Pid, Int) -> msg,
+) -> State(conn, msg, err) {
+  case now >= state.next {
+    True -> dequeue_first(state, now, conn, drop, on_deadline)
+    False ->
+      case state.slow {
+        False -> dequeue_fast(state, now, conn, drop, on_deadline)
+        True ->
+          dequeue_slow(
+            state,
+            now,
+            state.queue_target * 2,
+            conn,
+            drop,
+            on_deadline,
+          )
+      }
+  }
+}
+
+// Called at an interval boundary.
+fn dequeue_first(
+  state: State(conn, msg, err),
+  now: Int,
+  conn: conn,
+  on_drop drop: fn(Subject(Result(conn, err))) -> Nil,
+  on_deadline on_deadline: fn(Pid, Int) -> msg,
+) -> State(conn, msg, err) {
+  let next = now + state.queue_interval
+  let slow = state.delay > state.queue_target
+
+  case queue.first(state.queue) {
+    Ok(#(sent, waiting)) -> {
+      let assert Ok(Nil) = queue.delete(state.queue, sent)
+
+      let delay = now - sent
+      let state = State(..state, next:, delay:, slow:)
+
+      serve_waiter(state, waiting, conn, drop, on_deadline)
+    }
+    _ -> {
+      let state = State(..state, idle: [conn, ..state.idle])
+      State(..state, next:, delay: 0, slow:)
+    }
+  }
+}
+
+// Serve the first waiter immediately, tracking minimum delay.
+fn dequeue_fast(
+  state: State(conn, msg, err),
+  now: Int,
+  conn: conn,
+  on_drop drop: fn(Subject(Result(conn, err))) -> Nil,
+  on_deadline on_deadline: fn(Pid, Int) -> msg,
+) -> State(conn, msg, err) {
+  case queue.first(state.queue) {
+    Ok(#(sent, waiting)) -> {
+      let assert Ok(Nil) = queue.delete(state.queue, sent)
+      let delay = now - sent
+      let state = case delay < state.delay {
+        True -> State(..state, delay:)
+        False -> state
+      }
+      serve_waiter(state, waiting, conn, drop, on_deadline)
+    }
+    _ -> State(..state, idle: [conn, ..state.idle])
+  }
+}
+
+// Drop waiters that have been waiting longer than the timeout
+// threshold (target * 2), then serve the first valid waiter.
+fn dequeue_slow(
+  state: State(conn, msg, err),
+  now: Int,
+  timeout: Int,
+  conn: conn,
+  on_drop drop: fn(Subject(Result(conn, err))) -> Nil,
+  on_deadline on_deadline: fn(Pid, Int) -> msg,
+) -> State(conn, msg, err) {
+  case queue.first(state.queue) {
+    Ok(#(sent, waiting)) if now - sent > timeout -> {
+      let assert Ok(Nil) = queue.delete(state.queue, sent)
+
+      drop(waiting.client)
+      process.demonitor_process(waiting.monitor)
+
+      state
+      |> dequeue_slow(now, timeout, conn, drop, on_deadline)
+    }
+    Ok(#(sent, waiting)) -> {
+      let assert Ok(Nil) = queue.delete(state.queue, sent)
+
+      let delay = now - sent
+      let state = case delay < state.delay {
+        True -> State(..state, delay:)
+        False -> state
+      }
+
+      serve_waiter(state, waiting, conn, drop, on_deadline)
+    }
+    _ -> State(..state, idle: [conn, ..state.idle])
+  }
+}
+
+fn serve_waiter(
+  state: State(conn, msg, err),
+  waiting: Waiting(conn, err),
+  conn: conn,
+  on_drop drop: fn(Subject(Result(conn, err))) -> Nil,
+  on_deadline on_deadline: fn(Pid, Int) -> msg,
+) -> State(conn, msg, err) {
+  case process.is_alive(waiting.caller) {
+    False -> {
+      process.demonitor_process(waiting.monitor)
+
+      let now = counter.next(state.counter)
+      codel_dequeue(state, now, conn, drop, on_deadline)
+    }
+    True -> {
+      process.send(waiting.client, Ok(conn))
+
+      let now = counter.next(state.counter)
+
+      let monitor = process.monitor(waiting.caller)
+
+      let deadline_timer =
+        process.send_after(
+          state.self,
+          waiting.deadline,
+          on_deadline(waiting.caller, now),
+        )
+
+      let activated =
+        Active(conn:, monitor:, deadline_timer:, checkout_time: now)
+      let active = dict.insert(state.active, waiting.caller, activated)
+
+      process.demonitor_process(waiting.monitor)
+
+      State(..state, active:)
+    }
+  }
+}
+
+// --- CoDel polling ---
+
+fn do_poll(
+  state: State(conn, msg, err),
+  time: Int,
+  last_sent: Int,
+  on_poll schedule_poll: fn(Int, Int) -> msg,
+  on_drop drop: fn(Subject(Result(conn, err))) -> Nil,
+) -> State(conn, msg, err) {
+  case queue.first(state.queue) {
+    Ok(#(sent, _)) if sent <= last_sent -> {
+      let delay = time - sent
+
+      state
+      |> codel_timeout(delay, time, drop)
+      |> start_poll(time, sent, schedule_poll)
+    }
+    Ok(#(sent, _)) -> start_poll(state, time, sent, schedule_poll)
+    _ -> start_poll(state, time, time, schedule_poll)
+  }
+}
+
+fn codel_timeout(
+  state: State(conn, msg, err),
+  delay: Int,
+  time: Int,
+  on_drop drop: fn(Subject(Result(conn, err))) -> Nil,
+) -> State(conn, msg, err) {
+  case time >= state.next, state.delay > state.queue_target {
+    True, True -> {
+      State(..state, slow: True, delay:, next: time + state.queue_interval)
+      |> poll_drop_slow(time, state.queue_target * 2, drop)
+    }
+    True, False ->
+      State(..state, slow: False, delay:, next: time + state.queue_interval)
+    _, _ -> state
+  }
+}
+
+fn poll_drop_slow(
+  state: State(conn, msg, err),
+  now: Int,
+  timeout: Int,
+  on_drop drop: fn(Subject(Result(conn, err))) -> Nil,
+) -> State(conn, msg, err) {
+  case queue.first(state.queue) {
+    Ok(#(sent, waiting)) if now - sent > timeout -> {
+      let assert Ok(Nil) = queue.delete(state.queue, sent)
+
+      drop(waiting.client)
+      process.demonitor_process(waiting.monitor)
+
+      state
+      |> poll_drop_slow(now, timeout, drop)
+    }
+    _ -> state
+  }
+}
+
+fn start_poll(
+  state: State(conn, msg, err),
+  now: Int,
+  last_sent: Int,
+  schedule_poll: fn(Int, Int) -> msg,
+) -> State(conn, msg, err) {
+  let poll_time = now + state.queue_interval
+  let _timer =
+    process.send_after(
+      state.self,
+      state.queue_interval / ns_per_ms,
+      schedule_poll(poll_time, last_sent),
+    )
+
+  state
+}
+
+// --- Helpers ---
+
+fn close_idle(state: State(conn, msg, err)) -> Nil {
+  list.each(state.idle, fn(conn) {
+    let _ = state.handle_close(conn)
+    Nil
+  })
 }
