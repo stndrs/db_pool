@@ -20,7 +20,6 @@ pub type PoolError(err) {
   ConnectionError(err)
   ConnectionTimeout
   ConnectionUnavailable
-  ConnectionDeadlineExceeded
 }
 
 /// A `Pool` configuration. Holds the size of the pool and functions
@@ -334,9 +333,7 @@ fn handle_message(
     }
     CheckOut(client:, caller:, timeout:, deadline:) -> {
       let state = {
-        do_checkout(state, caller, deadline, fn(conn) {
-          actor.send(client, Ok(conn))
-        })
+        do_checkout(state, caller, client, deadline)
         |> result.lazy_unwrap(fn() {
           do_enqueue(state, caller, client, timeout, deadline)
         })
@@ -344,8 +341,7 @@ fn handle_message(
       actor.continue(state)
     }
     Timeout(time_sent:, timeout:) -> {
-      let on_expiry = actor.send(_, Error(ConnectionTimeout))
-      let state = do_expire(state, time_sent, timeout, on_expiry:)
+      let state = do_expire(state, time_sent, timeout)
       actor.continue(state)
     }
     DeadlineExpired(caller:, checkout_time:) -> {
@@ -389,18 +385,18 @@ fn handle_message(
 fn do_checkout(
   state: State(conn, err),
   caller: Pid,
+  client: Subject(Result(conn, PoolError(err))),
   deadline: Int,
-  next: fn(conn) -> Nil,
 ) -> Result(State(conn, err), Nil) {
   case dict.get(state.active, caller) {
     Ok(active) -> {
-      next(active.conn)
+      actor.send(client, Ok(active.conn))
       Ok(state)
     }
     Error(_) -> {
       case state.idle {
         [conn, ..rest] -> {
-          next(conn)
+          actor.send(client, Ok(conn))
 
           let monitor = process.monitor(caller)
           let now = counter.next(state.counter)
@@ -464,7 +460,6 @@ fn do_expire(
   state: State(conn, err),
   sent: Int,
   timeout: Int,
-  on_expiry next: fn(Subject(Result(conn, PoolError(err)))) -> Nil,
 ) -> State(conn, err) {
   queue.at(state.queue, sent)
   |> result.map(fn(waiting) {
@@ -482,7 +477,7 @@ fn do_expire(
 
     let assert Ok(Nil) = queue.delete(state.queue, sent)
 
-    next(waiting.client)
+    actor.send(waiting.client, Error(ConnectionTimeout))
 
     process.demonitor_process(waiting.monitor)
 
