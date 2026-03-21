@@ -576,9 +576,10 @@ pub fn codel_fast_mode_serves_immediately_test() {
 pub fn reconnect_after_failed_replacement_test() {
   // Shared flag: when True, handle_open succeeds; when False, it fails.
   let flag =
-    table.build()
+    table.new()
     |> table.with_access(table.Public)
-    |> table.new()
+    |> table.build()
+
   let assert Ok(Nil) = table.insert(flag, "open", True)
 
   let name = process.new_name("db_pool_test")

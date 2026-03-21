@@ -185,7 +185,7 @@ pub fn start(
   |> actor.named(name)
   |> actor.start
   |> result.map(fn(started) {
-    let cntr = counter.monotonic(monotonic.Nanosecond)
+    let cntr = counter.monotonic_time(monotonic.Nanosecond)
     let time = counter.next(cntr)
 
     let _timer = process.send_after(started.data, pool.interval, Interval)
@@ -292,8 +292,13 @@ fn initialise_pool(
 
   use conns <- result.map(connections)
 
-  let cntr = counter.monotonic(monotonic.Nanosecond)
-  let q = queue.new(cntr, table.Private)
+  let cntr = counter.monotonic_time(monotonic.Nanosecond)
+  let q =
+    queue.new()
+    |> queue.with_access(table.Private)
+    |> queue.with_counter(cntr)
+    |> queue.build
+
   let now = counter.next(cntr)
 
   let state =

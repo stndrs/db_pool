@@ -123,7 +123,7 @@ fn run_scenario(scenario: Scenario) -> Nil {
   let collector = process.new_subject()
 
   // Microsecond counter for latency measurement
-  let timer = counter.monotonic(monotonic.Microsecond)
+  let timer = counter.monotonic_time(monotonic.Microsecond)
 
   // Compute the absolute stop time so workers can check autonomously
   let now = counter.next(timer)
