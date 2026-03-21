@@ -11,15 +11,11 @@ import rasa/monotonic
 import rasa/queue.{type Queue}
 import rasa/table
 
-// --- Constants ---
-
 const ns_per_ms = 1_000_000
 
 const reconnect_min_ms = 1000
 
 const reconnect_max_ms = 30_000
-
-// --- Public types ---
 
 pub type PoolError(err) {
   ConnectionError(err)
@@ -170,8 +166,6 @@ type State(conn, err) {
     next: Int,
   )
 }
-
-// --- Public API ---
 
 /// Starts a connection pool. Returns a Subject for sending messages
 /// to the pool actor.
@@ -360,21 +354,26 @@ fn handle_message(
       actor.continue(state)
     }
     DeadlineExpired(caller:, checkout_time:) -> {
-      let state = do_deadline_expired(state, caller, checkout_time)
-      actor.continue(state)
+      state
+      |> do_deadline_expired(caller, checkout_time)
+      |> actor.continue
     }
     CallerDown(down) -> {
       let assert process.ProcessDown(pid:, ..) = down
-      let state = do_caller_down(state, pid)
-      actor.continue(state)
+
+      state
+      |> do_caller_down(pid)
+      |> actor.continue
     }
     Poll(time:, last_sent:) -> {
-      let state = do_poll(state, time, last_sent)
-      actor.continue(state)
+      state
+      |> do_poll(time, last_sent)
+      |> actor.continue
     }
     Reconnect(backoff:) -> {
-      let state = do_reconnect(state, backoff)
-      actor.continue(state)
+      state
+      |> do_reconnect(backoff)
+      |> actor.continue
     }
     // Note: Interval, Poll, Reconnect, and deadline timers are not explicitly
     // cancelled on exit/shutdown. Their messages are silently dropped once the
@@ -396,8 +395,6 @@ fn handle_message(
   }
 }
 
-// --- State machine operations ---
-
 /// Try to check out a connection. Returns Ok(state) if served
 /// (re-entrant checkout or idle conn available), Error(Nil) if the
 /// caller should be enqueued.
@@ -416,7 +413,7 @@ fn do_checkout(
       actor.send(client, Ok(active.conn))
       Ok(state)
     }
-    Error(_) -> {
+    _ -> {
       case state.idle {
         [conn, ..rest] -> {
           actor.send(client, Ok(conn))
@@ -463,7 +460,7 @@ fn do_checkin(
       let now = counter.next(state.counter)
       codel_dequeue(state, now, prev.conn)
     }
-    Error(_) -> state
+    _ -> state
   }
 }
 
@@ -477,6 +474,8 @@ fn do_enqueue(
   let monitor = process.monitor(caller)
   let waiting = Waiting(caller:, monitor:, client:, deadline:)
 
+  // Shouldn't fail since enqueueing is done via the actor's message queue.
+  // It shouldn't be possible for two waiters to be pushed at the same time.
   let assert Ok(now_in_ms) = queue.push(state.queue, waiting)
 
   let _timer =
@@ -541,13 +540,13 @@ fn do_caller_down(state: State(conn, err), pid: Pid) -> State(conn, err) {
           let now = counter.next(state.counter)
           codel_dequeue(state, now, conn)
         }
-        Error(_) -> {
+        _ -> {
           schedule_reconnect(state, reconnect_min_ms)
           state
         }
       }
     }
-    Error(_) -> state
+    _ -> state
   }
 }
 
@@ -583,7 +582,7 @@ fn do_deadline_expired(
         let now = counter.next(state.counter)
         codel_dequeue(state, now, conn)
       }
-      Error(_) -> {
+      _ -> {
         schedule_reconnect(state, reconnect_min_ms)
         state
       }
@@ -603,7 +602,7 @@ fn do_reconnect(state: State(conn, err), backoff: Int) -> State(conn, err) {
       let now = counter.next(state.counter)
       codel_dequeue(state, now, conn)
     }
-    Error(_) -> {
+    _ -> {
       schedule_reconnect(state, backoff)
       state
     }
@@ -627,13 +626,10 @@ fn codel_dequeue(
   now: Int,
   conn: conn,
 ) -> State(conn, err) {
-  case now >= state.next {
-    True -> dequeue_first(state, now, conn)
-    False ->
-      case state.slow {
-        False -> dequeue_fast(state, now, conn)
-        True -> dequeue_slow(state, now, state.queue_target * 2, conn)
-      }
+  case { now >= state.next }, state.slow {
+    True, _ -> dequeue_first(state, now, conn)
+    False, False -> dequeue_fast(state, now, conn)
+    False, True -> dequeue_slow(state, now, state.queue_target * 2, conn)
   }
 }
 

@@ -1,5 +1,5 @@
 name = "db_pool"
-version = "1.0.0"
+version = "2.0.0"
 
 description = "A database connection pool"
 licences = ["MIT"]
