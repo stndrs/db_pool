@@ -26,13 +26,11 @@ pub fn main() -> Nil {
     |> db_pool.on_close(database.close)
     |> db_pool.on_interval(database.ping)
 
-  let assert Ok(started) = db_pool.start(db_pool, name, 1000)
-
-  let pool = started.data
+  let assert Ok(pool) = db_pool.start(db_pool, name, 1000)
 
   let self = process.self()
 
-  let assert Ok(conn) = db_pool.checkout(pool, self, 500)
+  let assert Ok(conn) = db_pool.checkout(pool, self, 500, 30_000)
 
   let assert Ok(users) = database.query("SELECT * FROM users", conn)
 

@@ -190,13 +190,14 @@ pub fn start(
   name: process.Name(Message(conn, err)),
   timeout: Int,
 ) -> Result(Subject(Message(conn, err)), actor.StartError) {
-  actor.new_with_initialiser(timeout, initialise_pool(_, pool))
+  let counter = counter.monotonic_time(monotonic.Nanosecond)
+
+  actor.new_with_initialiser(timeout, initialise_pool(_, pool, counter))
   |> actor.on_message(handle_message)
   |> actor.named(name)
   |> actor.start
   |> result.map(fn(started) {
-    let cntr = counter.monotonic_time(monotonic.Nanosecond)
-    let time = counter.next(cntr)
+    let time = counter.next(counter)
 
     let _timer = process.send_after(started.data, pool.interval, Interval)
     let _poll_timer =
@@ -315,6 +316,7 @@ pub fn shutdown(
 fn initialise_pool(
   self: Subject(Message(conn, err)),
   pool: Pool(conn, err),
+  counter: counter.Counter,
 ) -> Result(
   actor.Initialised(
     State(conn, err),
@@ -338,14 +340,13 @@ fn initialise_pool(
 
   use conns <- result.map(connections)
 
-  let cntr = counter.monotonic_time(monotonic.Nanosecond)
   let q =
     queue.new()
     |> queue.with_access(table.Private)
-    |> queue.with_counter(cntr)
+    |> queue.with_counter(counter)
     |> queue.build
 
-  let now = counter.next(cntr)
+  let now = counter.next(counter)
 
   let state =
     State(
@@ -359,7 +360,7 @@ fn initialise_pool(
       idle: conns,
       active: dict.new(),
       queue: q,
-      counter: cntr,
+      counter:,
       queue_target: pool.queue_target * ns_per_ms,
       queue_interval: pool.queue_interval * ns_per_ms,
       delay: 0,
