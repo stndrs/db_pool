@@ -9,7 +9,7 @@ This library eagerly opens connections at startup. Connections can be checked ou
 
 If all connections are checked out, new callers attempting to check out will be added to a FIFO queue. Callers waiting in the queue will be given connections as they become available.
 
-Callers are monitored so if they crash their checked out connections can be added back to the pool.
+Callers are monitored so if they crash their checked out connections are closed and replaced with new ones.
 
 ```gleam
 import database
@@ -51,7 +51,6 @@ gleam add db_pool
 ## Development
 
 ```sh
-gleam run   # Run the project
 gleam test  # Run the tests
 ```
 

@@ -630,6 +630,43 @@ pub fn reconnect_after_failed_replacement_test() {
   let assert Ok(_) = db_pool.shutdown(pool, 200)
 }
 
+/// When the pool shuts down while callers are waiting in the queue,
+/// those callers receive ConnectionUnavailable instead of blocking forever.
+pub fn shutdown_drains_waiters_test() {
+  let name = process.new_name("db_pool_test")
+
+  let pool =
+    db_pool.new()
+    |> db_pool.size(1)
+    |> db_pool.on_open(fn() { Ok(Nil) })
+    |> db_pool.on_close(fn(_) { Ok(Nil) })
+    |> db_pool.on_interval(fn(_) { Nil })
+
+  let assert Ok(pool) = db_pool.start(pool, name, 200)
+
+  // Take the only connection so subsequent checkouts must wait
+  let self = process.self()
+  let assert Ok(Nil) = db_pool.checkout(pool, self, 200, 30_000)
+
+  // Spawn a waiter that will be queued
+  let result_subject = process.new_subject()
+  process.spawn(fn() {
+    let self = process.self()
+    let result = db_pool.checkout(pool, self, 5000, 30_000)
+    process.send(result_subject, result)
+  })
+
+  // Give time for the waiter to enqueue
+  process.sleep(50)
+
+  // Shut down the pool -- the waiter should be drained
+  let assert Ok(_) = db_pool.shutdown(pool, 200)
+
+  // The waiting caller should have received ConnectionUnavailable
+  let assert Ok(Error(db_pool.ConnectionUnavailable)) =
+    process.receive(result_subject, 500)
+}
+
 fn collect_results(
   collector: process.Subject(Result(Nil, db_pool.PoolError(err))),
   acc: List(Result(Nil, db_pool.PoolError(err))),

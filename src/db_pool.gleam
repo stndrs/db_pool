@@ -17,6 +17,15 @@ const reconnect_min_ms = 1000
 
 const reconnect_max_ms = 30_000
 
+/// Errors that can occur when interacting with the pool.
+///
+/// - `ConnectionError(err)` wraps an error returned by the `on_open` or
+///   `on_close` callback.
+/// - `ConnectionTimeout` is returned when a checkout request times out
+///   while waiting in the queue.
+/// - `ConnectionUnavailable` is returned when the CoDel algorithm drops
+///   a request due to sustained overload, or when the pool shuts down
+///   while callers are waiting.
 pub type PoolError(err) {
   ConnectionError(err)
   ConnectionTimeout
@@ -167,8 +176,15 @@ type State(conn, err) {
   )
 }
 
-/// Starts a connection pool. Returns a Subject for sending messages
-/// to the pool actor.
+/// Starts a connection pool and registers it under `name`. All
+/// configured connections are opened eagerly during initialisation.
+///
+/// The `timeout` parameter is the maximum time in milliseconds allowed
+/// for the actor to initialise (open all connections). It is **not**
+/// a checkout timeout.
+///
+/// The pool actor traps exits so it can perform cleanup when its
+/// parent or linked processes terminate.
 pub fn start(
   pool: Pool(conn, err),
   name: process.Name(Message(conn, err)),
@@ -196,6 +212,11 @@ pub fn start(
 
 /// Creates a `supervision.ChildSpecification` so the pool can be
 /// added to an application's supervision tree.
+///
+/// The `timeout` parameter is used for both the actor initialisation
+/// timeout and the supervisor's shutdown timeout. The restart strategy
+/// is set to `Transient` — the pool is restarted only if it terminates
+/// abnormally.
 pub fn supervised(
   pool: Pool(conn, err),
   name: process.Name(Message(conn, err)),
@@ -230,8 +251,28 @@ pub opaque type Message(conn, err) {
   Shutdown(client: Subject(Result(Nil, PoolError(err))))
 }
 
-/// Checks out a connection from the pool. All checkouts go through
-/// the actor mailbox.
+/// Checks out a connection from the pool.
+///
+/// The `caller` should be `process.self()` of the calling process. The
+/// pool monitors this process and reclaims the connection if it crashes.
+///
+/// If a connection is available it is returned immediately. If all
+/// connections are in use the caller is added to a FIFO queue and will
+/// receive a connection when one becomes available, or a
+/// `ConnectionTimeout` error after `timeout` milliseconds.
+///
+/// The `deadline` parameter sets the maximum time in milliseconds that
+/// the connection may be held. If the caller has not checked in by then,
+/// the pool forcibly closes the connection, replaces it, and the caller
+/// is left holding a now-closed connection.
+///
+/// Re-entrant: calling `checkout` again from the same process returns
+/// the already checked-out connection. The original deadline is
+/// preserved — a second checkout cannot extend it.
+///
+/// Note: this function uses `call_forever` internally. The `timeout` is
+/// enforced by the pool actor, not on the client side. If the pool
+/// actor is unreachable the caller will block indefinitely.
 pub fn checkout(
   pool: Subject(Message(conn, err)),
   caller: Pid,
@@ -242,6 +283,11 @@ pub fn checkout(
 }
 
 /// Returns a connection back to the pool.
+///
+/// The `conn` value must be the same connection that was originally
+/// checked out, and `caller` should be the `Pid` that checked it out.
+/// If the caller has no active connection the checkin is silently
+/// ignored.
 pub fn checkin(
   pool: Subject(Message(conn, err)),
   conn: conn,
@@ -250,7 +296,13 @@ pub fn checkin(
   process.send(pool, CheckIn(caller:, conn:))
 }
 
-/// Shuts down the pool and any idle connections.
+/// Shuts down the pool gracefully within `timeout` milliseconds.
+///
+/// All waiting callers in the queue are drained and sent a
+/// `ConnectionUnavailable` error. Active (checked-out) connections
+/// are closed, their deadline timers cancelled, and their monitors
+/// removed. Idle connections are then closed via the configured
+/// `on_close` callback.
 pub fn shutdown(
   pool: Subject(Message(conn, err)),
   timeout: Int,
@@ -379,6 +431,8 @@ fn handle_message(
     // cancelled on exit/shutdown. Their messages are silently dropped once the
     // actor stops and the subject becomes unreachable.
     PoolExit(exit) -> {
+      drain_queue(state)
+      let _ = close_active(state)
       close_idle(state)
       case exit.reason {
         process.Normal -> actor.stop()
@@ -388,6 +442,8 @@ fn handle_message(
       }
     }
     Shutdown(client:) -> {
+      drain_queue(state)
+      let _ = close_active(state)
       close_idle(state)
       actor.send(client, Ok(Nil))
       actor.stop()
@@ -476,10 +532,10 @@ fn do_enqueue(
 
   // Shouldn't fail since enqueueing is done via the actor's message queue.
   // It shouldn't be possible for two waiters to be pushed at the same time.
-  let assert Ok(now_in_ms) = queue.push(state.queue, waiting)
+  let assert Ok(sent_at) = queue.push(state.queue, waiting)
 
   let _timer =
-    process.send_after(state.self, timeout, Timeout(now_in_ms, timeout))
+    process.send_after(state.self, timeout, Timeout(sent_at, timeout))
 
   state
 }
@@ -823,6 +879,25 @@ fn start_poll(
 fn drop_waiter(waiting: Waiting(conn, PoolError(err))) -> Nil {
   actor.send(waiting.client, Error(ConnectionUnavailable))
   process.demonitor_process(waiting.monitor)
+}
+
+fn drain_queue(state: State(conn, err)) -> Nil {
+  case queue.pop(state.queue) {
+    Ok(waiting) -> {
+      drop_waiter(waiting)
+      drain_queue(state)
+    }
+    _ -> Nil
+  }
+}
+
+fn close_active(state: State(conn, err)) -> Nil {
+  dict.each(state.active, fn(_pid, active) {
+    let _ = process.cancel_timer(active.deadline_timer)
+    process.demonitor_process(active.monitor)
+    let _ = state.handle_close(active.conn)
+    Nil
+  })
 }
 
 fn close_idle(state: State(conn, err)) -> Nil {
