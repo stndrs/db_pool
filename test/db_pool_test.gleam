@@ -7,6 +7,7 @@ import gleam/otp/actor
 import gleam/otp/static_supervisor
 import gleeunit
 import global_value
+import rasa/atomic
 import rasa/table
 
 pub fn main() -> Nil {
@@ -665,6 +666,128 @@ pub fn shutdown_drains_waiters_test() {
   // The waiting caller should have received ConnectionUnavailable
   let assert Ok(Error(db_pool.ConnectionUnavailable)) =
     process.receive(result_subject, 500)
+}
+
+pub fn on_close_called_on_shutdown_test() {
+  let close_count = atomic.new()
+
+  let name = process.new_name("db_pool_test")
+
+  let pool =
+    db_pool.new()
+    |> db_pool.size(3)
+    |> db_pool.on_open(fn() { Ok(Nil) })
+    |> db_pool.on_close(fn(_) {
+      atomic.add(close_count, 1)
+      Ok(Nil)
+    })
+    |> db_pool.on_interval(fn(_) { Nil })
+
+  let assert Ok(pool) = db_pool.start(pool, name, 200)
+
+  let assert Ok(_) = db_pool.shutdown(pool, 200)
+
+  assert atomic.get(close_count) == 3
+}
+
+pub fn shutdown_closes_active_connections_test() {
+  let close_count = atomic.new()
+
+  let name = process.new_name("db_pool_test")
+
+  let pool =
+    db_pool.new()
+    |> db_pool.size(2)
+    |> db_pool.on_open(fn() { Ok(Nil) })
+    |> db_pool.on_close(fn(_) {
+      atomic.add(close_count, 1)
+      Ok(Nil)
+    })
+    |> db_pool.on_interval(fn(_) { Nil })
+
+  let assert Ok(pool) = db_pool.start(pool, name, 200)
+
+  let self = process.self()
+  let assert Ok(Nil) = db_pool.checkout(pool, self, 200, 30_000)
+
+  let assert Ok(_) = db_pool.shutdown(pool, 200)
+
+  assert atomic.get(close_count) == 2
+}
+
+pub fn on_interval_called_periodically_test() {
+  let ping_count = atomic.new()
+
+  let name = process.new_name("db_pool_test")
+
+  let pool =
+    db_pool.new()
+    |> db_pool.size(1)
+    |> db_pool.interval(50)
+    |> db_pool.on_open(fn() { Ok(Nil) })
+    |> db_pool.on_close(fn(_) { Ok(Nil) })
+    |> db_pool.on_interval(fn(_) { atomic.add(ping_count, 1) })
+
+  let assert Ok(pool) = db_pool.start(pool, name, 200)
+
+  process.sleep(150)
+
+  assert atomic.get(ping_count) >= 1
+
+  let assert Ok(_) = db_pool.shutdown(pool, 200)
+}
+
+pub fn checkin_by_non_active_caller_ignored_test() {
+  let name = process.new_name("db_pool_test")
+
+  let pool =
+    db_pool.new()
+    |> db_pool.size(1)
+    |> db_pool.on_open(fn() { Ok(reference.new()) })
+    |> db_pool.on_close(fn(_) { Ok(Nil) })
+    |> db_pool.on_interval(fn(_) { Nil })
+
+  let assert Ok(pool) = db_pool.start(pool, name, 200)
+
+  let self = process.self()
+  let assert Ok(conn) = db_pool.checkout(pool, self, 200, 30_000)
+
+  let done = process.new_subject()
+  process.spawn(fn() {
+    let fake_caller = process.self()
+    db_pool.checkin(pool, conn, fake_caller)
+    process.send(done, Nil)
+  })
+  let assert Ok(Nil) = process.receive(done, 500)
+
+  process.sleep(50)
+
+  let assert Ok(conn2) = db_pool.checkout(pool, self, 200, 30_000)
+  assert conn == conn2
+
+  db_pool.checkin(pool, conn, self)
+  let assert Ok(_) = db_pool.shutdown(pool, 200)
+}
+
+pub fn pool_exit_abnormal_test() {
+  let name = process.new_name("db_pool_test")
+
+  let pool =
+    db_pool.new()
+    |> db_pool.size(2)
+    |> db_pool.on_open(fn() { Ok(Nil) })
+    |> db_pool.on_close(fn(_) { Ok(Nil) })
+    |> db_pool.on_interval(fn(_) { Nil })
+
+  let assert Ok(pool) = db_pool.start(pool, name, 200)
+
+  let assert Ok(pid) = process.subject_owner(pool)
+
+  process.send_abnormal_exit(pid, "test crash")
+
+  process.sleep(50)
+
+  assert process.is_alive(pid) == False
 }
 
 fn collect_results(
