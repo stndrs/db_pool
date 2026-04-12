@@ -28,7 +28,8 @@ pub fn start_test() {
     |> db_pool.size(2)
     |> db_pool.on_open(fn() { Ok(Nil) })
     |> db_pool.on_close(fn(_) { Ok(Nil) })
-    |> db_pool.on_interval(fn(_) { Nil })
+    |> db_pool.on_idle(fn(_) { Nil })
+    |> db_pool.on_active(fn(_) { Nil })
 
   let name = process.new_name("db_pool_test")
 
@@ -43,7 +44,8 @@ pub fn start_error_test() {
     |> db_pool.size(2)
     |> db_pool.on_open(fn() { Error("oops") })
     |> db_pool.on_close(fn(_) { Ok(Nil) })
-    |> db_pool.on_interval(fn(_) { Nil })
+    |> db_pool.on_idle(fn(_) { Nil })
+    |> db_pool.on_active(fn(_) { Nil })
 
   let name = process.new_name("db_pool_test")
 
@@ -59,7 +61,8 @@ pub fn supervised_test() {
     |> db_pool.size(2)
     |> db_pool.on_open(fn() { Ok(Nil) })
     |> db_pool.on_close(fn(_) { Ok(Nil) })
-    |> db_pool.on_interval(fn(_) { Nil })
+    |> db_pool.on_idle(fn(_) { Nil })
+    |> db_pool.on_active(fn(_) { Nil })
 
   let pool_spec = db_pool.supervised(new_pool, name, 200)
 
@@ -84,7 +87,8 @@ pub fn checkout_current_connection_test() {
     |> db_pool.size(2)
     |> db_pool.on_open(fn() { Ok(reference.new()) })
     |> db_pool.on_close(fn(_) { Ok(Nil) })
-    |> db_pool.on_interval(fn(_) { Nil })
+    |> db_pool.on_idle(fn(_) { Nil })
+    |> db_pool.on_active(fn(_) { Nil })
 
   let assert Ok(pool) = db_pool.start(new_pool, name, 200)
 
@@ -165,7 +169,8 @@ pub fn caller_down_test() {
     |> db_pool.size(1)
     |> db_pool.on_open(fn() { Ok(int.random(10)) })
     |> db_pool.on_close(fn(_) { Ok(Nil) })
-    |> db_pool.on_interval(fn(_) { Nil })
+    |> db_pool.on_idle(fn(_) { Nil })
+    |> db_pool.on_active(fn(_) { Nil })
 
   let assert Ok(pool) = db_pool.start(pool, name, 200)
 
@@ -197,7 +202,8 @@ pub fn waiting_caller_test() {
     |> db_pool.size(1)
     |> db_pool.on_open(fn() { Ok(Nil) })
     |> db_pool.on_close(fn(_) { Ok(Nil) })
-    |> db_pool.on_interval(fn(_) { Nil })
+    |> db_pool.on_idle(fn(_) { Nil })
+    |> db_pool.on_active(fn(_) { Nil })
 
   let assert Ok(pool) = db_pool.start(pool, name, 200)
 
@@ -233,7 +239,8 @@ pub fn waiting_caller_timeout_test() {
     |> db_pool.size(1)
     |> db_pool.on_open(fn() { Ok(Nil) })
     |> db_pool.on_close(fn(_) { Ok(Nil) })
-    |> db_pool.on_interval(fn(_) { Nil })
+    |> db_pool.on_idle(fn(_) { Nil })
+    |> db_pool.on_active(fn(_) { Nil })
 
   let assert Ok(pool) = db_pool.start(pool, name, 100)
 
@@ -276,7 +283,8 @@ pub fn pool_exit_test() {
     |> db_pool.size(2)
     |> db_pool.on_open(fn() { Ok(Nil) })
     |> db_pool.on_close(fn(_) { Ok(Nil) })
-    |> db_pool.on_interval(fn(_) { Nil })
+    |> db_pool.on_idle(fn(_) { Nil })
+    |> db_pool.on_active(fn(_) { Nil })
 
   let assert Ok(pool) = db_pool.start(db_pool, name, 200)
 
@@ -296,7 +304,8 @@ pub fn deadline_expires_and_pool_recovers_test() {
     |> db_pool.size(1)
     |> db_pool.on_open(fn() { Ok(int.random(10_000)) })
     |> db_pool.on_close(fn(_) { Ok(Nil) })
-    |> db_pool.on_interval(fn(_) { Nil })
+    |> db_pool.on_idle(fn(_) { Nil })
+    |> db_pool.on_active(fn(_) { Nil })
 
   let assert Ok(pool) = db_pool.start(pool, name, 200)
 
@@ -329,7 +338,8 @@ pub fn deadline_cancelled_by_checkin_test() {
     |> db_pool.size(1)
     |> db_pool.on_open(fn() { Ok(Nil) })
     |> db_pool.on_close(fn(_) { Ok(Nil) })
-    |> db_pool.on_interval(fn(_) { Nil })
+    |> db_pool.on_idle(fn(_) { Nil })
+    |> db_pool.on_active(fn(_) { Nil })
 
   let assert Ok(pool) = db_pool.start(pool, name, 200)
 
@@ -360,7 +370,8 @@ pub fn deadline_expires_serves_waiting_caller_test() {
     |> db_pool.size(1)
     |> db_pool.on_open(fn() { Ok(Nil) })
     |> db_pool.on_close(fn(_) { Ok(Nil) })
-    |> db_pool.on_interval(fn(_) { Nil })
+    |> db_pool.on_idle(fn(_) { Nil })
+    |> db_pool.on_active(fn(_) { Nil })
 
   let assert Ok(pool) = db_pool.start(pool, name, 200)
 
@@ -398,7 +409,8 @@ pub fn dead_waiter_skipped_test() {
     |> db_pool.size(1)
     |> db_pool.on_open(fn() { Ok(Nil) })
     |> db_pool.on_close(fn(_) { Ok(Nil) })
-    |> db_pool.on_interval(fn(_) { Nil })
+    |> db_pool.on_idle(fn(_) { Nil })
+    |> db_pool.on_active(fn(_) { Nil })
 
   let assert Ok(pool) = db_pool.start(pool, name, 200)
 
@@ -448,7 +460,8 @@ pub fn all_dead_waiters_connection_returns_to_idle_test() {
     |> db_pool.size(1)
     |> db_pool.on_open(fn() { Ok(Nil) })
     |> db_pool.on_close(fn(_) { Ok(Nil) })
-    |> db_pool.on_interval(fn(_) { Nil })
+    |> db_pool.on_idle(fn(_) { Nil })
+    |> db_pool.on_active(fn(_) { Nil })
 
   let assert Ok(pool) = db_pool.start(pool, name, 200)
 
@@ -493,7 +506,8 @@ pub fn codel_drops_slow_waiters_test() {
     |> db_pool.queue_interval(50)
     |> db_pool.on_open(fn() { Ok(Nil) })
     |> db_pool.on_close(fn(_) { Ok(Nil) })
-    |> db_pool.on_interval(fn(_) { Nil })
+    |> db_pool.on_idle(fn(_) { Nil })
+    |> db_pool.on_active(fn(_) { Nil })
 
   let assert Ok(pool) = db_pool.start(pool, name, 200)
 
@@ -546,7 +560,8 @@ pub fn codel_fast_mode_serves_immediately_test() {
     |> db_pool.queue_interval(5000)
     |> db_pool.on_open(fn() { Ok(Nil) })
     |> db_pool.on_close(fn(_) { Ok(Nil) })
-    |> db_pool.on_interval(fn(_) { Nil })
+    |> db_pool.on_idle(fn(_) { Nil })
+    |> db_pool.on_active(fn(_) { Nil })
 
   let assert Ok(pool) = db_pool.start(pool, name, 200)
 
@@ -594,7 +609,8 @@ pub fn reconnect_after_failed_replacement_test() {
       }
     })
     |> db_pool.on_close(fn(_) { Ok(Nil) })
-    |> db_pool.on_interval(fn(_) { Nil })
+    |> db_pool.on_idle(fn(_) { Nil })
+    |> db_pool.on_active(fn(_) { Nil })
 
   let assert Ok(pool) = db_pool.start(pool, name, 200)
 
@@ -641,7 +657,8 @@ pub fn shutdown_drains_waiters_test() {
     |> db_pool.size(1)
     |> db_pool.on_open(fn() { Ok(Nil) })
     |> db_pool.on_close(fn(_) { Ok(Nil) })
-    |> db_pool.on_interval(fn(_) { Nil })
+    |> db_pool.on_idle(fn(_) { Nil })
+    |> db_pool.on_active(fn(_) { Nil })
 
   let assert Ok(pool) = db_pool.start(pool, name, 200)
 
@@ -681,7 +698,8 @@ pub fn on_close_called_on_shutdown_test() {
       atomic.add(close_count, 1)
       Ok(Nil)
     })
-    |> db_pool.on_interval(fn(_) { Nil })
+    |> db_pool.on_idle(fn(_) { Nil })
+    |> db_pool.on_active(fn(_) { Nil })
 
   let assert Ok(pool) = db_pool.start(pool, name, 200)
 
@@ -703,7 +721,8 @@ pub fn shutdown_closes_active_connections_test() {
       atomic.add(close_count, 1)
       Ok(Nil)
     })
-    |> db_pool.on_interval(fn(_) { Nil })
+    |> db_pool.on_idle(fn(_) { Nil })
+    |> db_pool.on_active(fn(_) { Nil })
 
   let assert Ok(pool) = db_pool.start(pool, name, 200)
 
@@ -715,24 +734,35 @@ pub fn shutdown_closes_active_connections_test() {
   assert atomic.get(close_count) == 2
 }
 
-pub fn on_interval_called_periodically_test() {
-  let ping_count = atomic.new()
+pub fn on_idle_and_on_active_called_at_checkin_and_checkout_test() {
+  let idle_count = atomic.new()
+  let active_count = atomic.new()
 
   let name = process.new_name("db_pool_test")
 
   let pool =
     db_pool.new()
-    |> db_pool.size(1)
-    |> db_pool.interval(50)
+    |> db_pool.size(2)
     |> db_pool.on_open(fn() { Ok(Nil) })
     |> db_pool.on_close(fn(_) { Ok(Nil) })
-    |> db_pool.on_interval(fn(_) { atomic.add(ping_count, 1) })
+    |> db_pool.on_idle(fn(_) { atomic.add(idle_count, 1) })
+    |> db_pool.on_active(fn(_) { atomic.add(active_count, 1) })
 
   let assert Ok(pool) = db_pool.start(pool, name, 200)
 
+  let self = process.self()
+  let assert Ok(_conn) = db_pool.checkout(pool, self, 200, 30_000)
+
+  db_pool.checkin(pool, Nil, self)
+
+  // must sleep to give time for checkin to be processed
   process.sleep(150)
 
-  assert atomic.get(ping_count) >= 1
+  // idle count is pool size + 1 from calling handle_idle on initial
+  // creation, and on checkin after checkout
+  assert 3 == atomic.get(idle_count)
+  // active count is only the number of times checkout was called
+  assert 1 == atomic.get(active_count)
 
   let assert Ok(_) = db_pool.shutdown(pool, 200)
 }
@@ -745,7 +775,8 @@ pub fn checkin_by_non_active_caller_ignored_test() {
     |> db_pool.size(1)
     |> db_pool.on_open(fn() { Ok(reference.new()) })
     |> db_pool.on_close(fn(_) { Ok(Nil) })
-    |> db_pool.on_interval(fn(_) { Nil })
+    |> db_pool.on_idle(fn(_) { Nil })
+    |> db_pool.on_active(fn(_) { Nil })
 
   let assert Ok(pool) = db_pool.start(pool, name, 200)
 
@@ -777,7 +808,8 @@ pub fn pool_exit_abnormal_test() {
     |> db_pool.size(2)
     |> db_pool.on_open(fn() { Ok(Nil) })
     |> db_pool.on_close(fn(_) { Ok(Nil) })
-    |> db_pool.on_interval(fn(_) { Nil })
+    |> db_pool.on_idle(fn(_) { Nil })
+    |> db_pool.on_active(fn(_) { Nil })
 
   let assert Ok(pool) = db_pool.start(pool, name, 200)
 
@@ -809,7 +841,8 @@ fn db_pool() -> process.Subject(db_pool.Message(Nil, err)) {
       |> db_pool.size(2)
       |> db_pool.on_open(fn() { Ok(Nil) })
       |> db_pool.on_close(fn(_) { Ok(Nil) })
-      |> db_pool.on_interval(fn(_) { Nil })
+      |> db_pool.on_idle(fn(_) { Nil })
+      |> db_pool.on_active(fn(_) { Nil })
 
     let assert Ok(pool) = db_pool.start(db_pool, name, 200)
 

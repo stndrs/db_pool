@@ -33,29 +33,16 @@ pub type PoolError(err) {
 }
 
 /// A `Pool` configuration. Holds the size of the pool and functions
-/// for opening and closing connections. Can also be provided
-/// a function to be run every `interval` milliseconds.
-///
-/// Example:
-///
-/// ```gleam
-///   let db_pool = db_pool.new()
-///     |> db_pool.size(5)
-///     |> db_pool.interval(1000)
-///     |> db_pool.on_open(database.open)
-///     |> db_pool.on_close(database.close)
-///     |> db_pool.on_interval(database.ping)
-/// ```
-///
+/// for opening and closing connections.
 pub opaque type Pool(conn, err) {
   Pool(
     size: Int,
-    interval: Int,
     queue_target: Int,
     queue_interval: Int,
     handle_open: fn() -> Result(conn, PoolError(err)),
     handle_close: fn(conn) -> Result(Nil, PoolError(err)),
-    handle_interval: fn(conn) -> Nil,
+    handle_idle: fn(conn) -> Nil,
+    handle_active: fn(conn) -> Nil,
   )
 }
 
@@ -63,16 +50,15 @@ pub opaque type Pool(conn, err) {
 pub fn new() -> Pool(conn, err) {
   let handle_open = fn() { Error(ConnectionTimeout) }
   let handle_close = fn(_) { Ok(Nil) }
-  let handle_interval = fn(_) { Nil }
 
   Pool(
     size: 5,
-    interval: 1000,
     queue_target: 50,
     queue_interval: 1000,
     handle_open:,
     handle_close:,
-    handle_interval:,
+    handle_idle: fn(_) { Nil },
+    handle_active: fn(_) { Nil },
   )
 }
 
@@ -80,12 +66,6 @@ pub fn new() -> Pool(conn, err) {
 /// number of connections.
 pub fn size(pool: Pool(conn, err), size: Int) -> Pool(conn, err) {
   Pool(..pool, size:)
-}
-
-/// Sets the `Pool`'s `interval` value. The pool will call the
-/// configured `on_interval` function every `interval` milliseconds.
-pub fn interval(pool: Pool(conn, err), interval: Int) -> Pool(conn, err) {
-  Pool(..pool, interval:)
 }
 
 /// Sets the `Pool`'s `on_open` function. The provided function will be
@@ -112,13 +92,24 @@ pub fn on_close(
   Pool(..pool, handle_close:)
 }
 
-/// Sets the `Pool`'s `on_interval` function. The provided function
-/// will be called every `interval` milliseconds.
-pub fn on_interval(
+/// Sets the `Pool`'s `on_idle` function. The provided function will be
+/// called on connections as they're returned to the pool's list of
+/// idle connections.
+pub fn on_idle(
   pool: Pool(conn, err),
-  handle_interval: fn(conn) -> Nil,
+  handle_idle: fn(conn) -> Nil,
 ) -> Pool(conn, err) {
-  Pool(..pool, handle_interval:)
+  Pool(..pool, handle_idle:)
+}
+
+/// Sets the `Pool`'s `on_active` function. The provided function will be
+/// called on connections as they're removed to the pool's list of
+/// idle connections and become active.
+pub fn on_active(
+  pool: Pool(conn, err),
+  handle_active: fn(conn) -> Nil,
+) -> Pool(conn, err) {
+  Pool(..pool, handle_active:)
 }
 
 /// Sets the CoDel queue target in milliseconds. This is the maximum
@@ -162,8 +153,8 @@ type State(conn, err) {
     current_size: Int,
     handle_open: fn() -> Result(conn, PoolError(err)),
     handle_close: fn(conn) -> Result(Nil, PoolError(err)),
-    handle_interval: fn(conn) -> Nil,
-    interval: Int,
+    handle_idle: fn(conn) -> Nil,
+    handle_active: fn(conn) -> Nil,
     idle: List(conn),
     active: Dict(Pid, Active(conn)),
     queue: Queue(Waiting(conn, PoolError(err))),
@@ -199,7 +190,6 @@ pub fn start(
   |> result.map(fn(started) {
     let time = counter.next(counter)
 
-    let _timer = process.send_after(started.data, pool.interval, Interval)
     let _poll_timer =
       process.send_after(
         started.data,
@@ -235,7 +225,6 @@ pub fn supervised(
 }
 
 pub opaque type Message(conn, err) {
-  Interval
   CheckOut(
     client: Subject(Result(conn, PoolError(err))),
     caller: Pid,
@@ -340,6 +329,8 @@ fn initialise_pool(
 
   use conns <- result.map(connections)
 
+  list.each(conns, pool.handle_idle)
+
   let q =
     queue.new()
     |> queue.with_access(table.Private)
@@ -355,8 +346,8 @@ fn initialise_pool(
       current_size: pool.size,
       handle_open: pool.handle_open,
       handle_close: pool.handle_close,
-      handle_interval: pool.handle_interval,
-      interval: pool.interval,
+      handle_idle: pool.handle_idle,
+      handle_active: pool.handle_active,
       idle: conns,
       active: dict.new(),
       queue: q,
@@ -373,22 +364,11 @@ fn initialise_pool(
   |> actor.returning(self)
 }
 
-// --- Message handler ---
-
 fn handle_message(
   state: State(conn, err),
   msg: Message(conn, err),
 ) -> actor.Next(State(conn, err), Message(conn, err)) {
   case msg {
-    Interval -> {
-      // Spawn unlinked processes so health checks don't block the actor
-      // mailbox and a crashing callback doesn't take down the pool.
-      list.each(state.idle, fn(conn) {
-        process.spawn_unlinked(fn() { state.handle_interval(conn) })
-      })
-      let _timer = process.send_after(state.self, state.interval, Interval)
-      actor.continue(state)
-    }
     CheckIn(caller:, conn:) -> {
       let state = do_checkin(state, caller, conn)
       actor.continue(state)
@@ -428,7 +408,7 @@ fn handle_message(
       |> do_reconnect(backoff)
       |> actor.continue
     }
-    // Note: Interval, Poll, Reconnect, and deadline timers are not explicitly
+    // Note: Poll, Reconnect, and deadline timers are not explicitly
     // cancelled on exit/shutdown. Their messages are silently dropped once the
     // actor stops and the subject becomes unreachable.
     PoolExit(exit) -> {
@@ -487,7 +467,10 @@ fn do_checkout(
 
           let activated =
             Active(conn:, monitor:, deadline_timer:, checkout_time: now)
+
           let active = dict.insert(state.active, caller, activated)
+
+          state.handle_active(conn)
 
           Ok(State(..state, idle: rest, active:))
         }
@@ -607,12 +590,12 @@ fn do_caller_down(state: State(conn, err), pid: Pid) -> State(conn, err) {
   }
 }
 
-/// Called when a deadline timer fires. The connection is closed and the
-/// caller is removed from active, but the caller process is NOT killed
-/// or notified — they still hold a reference to the now-closed connection
-/// and will discover it is dead on their next operation. The deadline is
-/// a hard cutoff, and the pool must reclaim connections from overrunning
-/// callers to stay healthy.
+// Called when a deadline timer fires. The connection is closed and the
+// caller is removed from active, but the caller process is NOT killed
+// or notified. The caller still holds a reference to the now-closed connection
+// and will discover it is dead on their next operation. The deadline is
+// a hard cutoff and the pool must reclaim connections from overrunning
+// callers to stay healthy.
 fn do_deadline_expired(
   state: State(conn, err),
   caller: Pid,
@@ -709,8 +692,9 @@ fn dequeue_first(
       serve_waiter(state, waiting, conn)
     }
     _ -> {
-      let state = State(..state, idle: [conn, ..state.idle])
-      State(..state, next:, delay: 0, slow:)
+      state.handle_idle(conn)
+
+      State(..state, idle: [conn, ..state.idle], next:, delay: 0, slow:)
     }
   }
 }
@@ -731,7 +715,11 @@ fn dequeue_fast(
       }
       serve_waiter(state, waiting, conn)
     }
-    _ -> State(..state, idle: [conn, ..state.idle])
+    _ -> {
+      state.handle_idle(conn)
+
+      State(..state, idle: [conn, ..state.idle])
+    }
   }
 }
 
@@ -763,7 +751,11 @@ fn dequeue_slow(
 
       serve_waiter(state, waiting, conn)
     }
-    _ -> State(..state, idle: [conn, ..state.idle])
+    _ -> {
+      state.handle_idle(conn)
+
+      State(..state, idle: [conn, ..state.idle])
+    }
   }
 }
 
@@ -799,6 +791,8 @@ fn serve_waiter(
           checkout_time: now,
         )
       let active = dict.insert(state.active, waiting.caller, activated)
+
+      state.handle_active(conn)
 
       State(..state, active:)
     }
