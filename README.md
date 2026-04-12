@@ -24,7 +24,8 @@ pub fn main() -> Nil {
     |> db_pool.size(5)
     |> db_pool.on_open(database.open)
     |> db_pool.on_close(database.close)
-    |> db_pool.on_interval(database.ping)
+    |> db_pool.on_idle(database.idle)
+    |> db_pool.on_active(database.active)
 
   let assert Ok(pool) = db_pool.start(db_pool, name, 1000)
 

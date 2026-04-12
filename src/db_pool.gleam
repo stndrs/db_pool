@@ -80,7 +80,7 @@ pub fn on_open(
 }
 
 /// Sets the `Pool`'s `on_close` function. The provided function will be
-/// called on each idle connection when the pool is shut down or exits.
+/// called on each connection when the pool is shut down or exits.
 pub fn on_close(
   pool: Pool(conn, err),
   handle_close: fn(conn) -> Result(Nil, err),
@@ -93,8 +93,9 @@ pub fn on_close(
 }
 
 /// Sets the `Pool`'s `on_idle` function. The provided function will be
-/// called on connections as they're returned to the pool's list of
-/// idle connections.
+/// called on connections when they're checked back in to the pool. If
+/// the connection is immediately passed to a waiting caller, the callback
+/// will not be called.
 pub fn on_idle(
   pool: Pool(conn, err),
   handle_idle: fn(conn) -> Nil,
@@ -103,7 +104,7 @@ pub fn on_idle(
 }
 
 /// Sets the `Pool`'s `on_active` function. The provided function will be
-/// called on connections as they're removed to the pool's list of
+/// called on connections as they're removed from the pool's list of
 /// idle connections and become active.
 pub fn on_active(
   pool: Pool(conn, err),
@@ -180,25 +181,13 @@ pub fn start(
   pool: Pool(conn, err),
   name: process.Name(Message(conn, err)),
   timeout: Int,
-) -> Result(Subject(Message(conn, err)), actor.StartError) {
+) -> Result(actor.Started(Subject(Message(conn, err))), actor.StartError) {
   let counter = counter.monotonic_time(monotonic.Nanosecond)
 
   actor.new_with_initialiser(timeout, initialise_pool(_, pool, counter))
   |> actor.on_message(handle_message)
   |> actor.named(name)
   |> actor.start
-  |> result.map(fn(started) {
-    let time = counter.next(counter)
-
-    let _poll_timer =
-      process.send_after(
-        started.data,
-        pool.queue_interval,
-        Poll(time:, last_sent: time),
-      )
-
-    started.data
-  })
 }
 
 /// Creates a `supervision.ChildSpecification` so the pool can be
@@ -213,13 +202,7 @@ pub fn supervised(
   name: process.Name(Message(conn, err)),
   timeout: Int,
 ) -> supervision.ChildSpecification(Subject(Message(conn, err))) {
-  supervision.worker(fn() {
-    start(pool, name, timeout)
-    |> result.map(fn(subject) {
-      let assert Ok(pid) = process.subject_owner(subject)
-      actor.Started(pid:, data: subject)
-    })
-  })
+  supervision.worker(fn() { start(pool, name, timeout) })
   |> supervision.timeout(timeout)
   |> supervision.restart(supervision.Transient)
 }
@@ -338,6 +321,13 @@ fn initialise_pool(
     |> queue.build
 
   let now = counter.next(counter)
+
+  let _poll_timer =
+    process.send_after(
+      self,
+      pool.queue_interval,
+      Poll(time: now, last_sent: now),
+    )
 
   let state =
     State(

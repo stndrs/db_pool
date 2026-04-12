@@ -132,7 +132,7 @@ fn run_scenario(scenario: Scenario) -> Nil {
 
   // Spawn workers
   int.range(from: 0, to: scenario.workers, with: "", run: fn(_, _) {
-    spawn_worker(pool, collector, stop_time, timer, scenario)
+    spawn_worker(pool.data, collector, stop_time, timer, scenario)
 
     ""
   })
