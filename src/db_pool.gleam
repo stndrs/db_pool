@@ -95,7 +95,8 @@ pub fn on_close(
 /// Sets the `Pool`'s `on_idle` function. The provided function will be
 /// called on connections when they're checked back in to the pool. If
 /// the connection is immediately passed to a waiting caller, the callback
-/// will not be called.
+/// will not be called. The callback is also called on every connection
+/// at startup.
 pub fn on_idle(
   pool: Pool(conn, err),
   handle_idle: fn(conn) -> Nil,
@@ -172,8 +173,7 @@ type State(conn, err) {
 /// configured connections are opened eagerly during initialisation.
 ///
 /// The `timeout` parameter is the maximum time in milliseconds allowed
-/// for the actor to initialise (open all connections). It is **not**
-/// a checkout timeout.
+/// for the actor to initialise (open all connections).
 ///
 /// The pool actor traps exits so it can perform cleanup when its
 /// parent or linked processes terminate.
