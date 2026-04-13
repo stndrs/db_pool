@@ -80,6 +80,89 @@ pub fn supervised_test() {
   db_pool.checkin(pool, Nil, self)
 }
 
+pub fn with_connection_test() {
+  let name = process.new_name("db_pool_test")
+
+  let new_pool =
+    db_pool.new()
+    |> db_pool.size(2)
+    |> db_pool.on_open(fn() { Ok(Nil) })
+    |> db_pool.on_close(fn(_) { Ok(Nil) })
+    |> db_pool.on_idle(fn(_) { Nil })
+    |> db_pool.on_active(fn(_) { Nil })
+
+  let pool_spec = db_pool.supervised(new_pool, name, 200)
+
+  let assert Ok(_) =
+    static_supervisor.new(static_supervisor.OneForOne)
+    |> static_supervisor.add(pool_spec)
+    |> static_supervisor.start
+
+  let pool = process.named_subject(name)
+
+  let assert Ok("Success") =
+    db_pool.with_connection(pool, 200, 30_000, fn(_conn) { "Success" })
+}
+
+pub fn with_connection_current_connection_test() {
+  let name = process.new_name("db_pool_test")
+
+  let new_pool =
+    db_pool.new()
+    |> db_pool.size(2)
+    |> db_pool.on_open(fn() { Ok(Nil) })
+    |> db_pool.on_close(fn(_) { Ok(Nil) })
+    |> db_pool.on_idle(fn(_) { Nil })
+    |> db_pool.on_active(fn(_) { Nil })
+
+  let pool_spec = db_pool.supervised(new_pool, name, 200)
+
+  let assert Ok(_) =
+    static_supervisor.new(static_supervisor.OneForOne)
+    |> static_supervisor.add(pool_spec)
+    |> static_supervisor.start
+
+  let pool = process.named_subject(name)
+
+  let assert Ok("Success") =
+    db_pool.with_connection(pool, 200, 30_000, fn(conn) {
+      let assert Ok(value) =
+        db_pool.with_connection(pool, 200, 30_000, fn(conn1) {
+          assert conn == conn1
+
+          "Success"
+        })
+
+      value
+    })
+}
+
+pub fn with_connection_exhaustion_test() {
+  let pool = db_pool()
+
+  // Two callers hold both connections for 200ms
+  let holder1 = process.new_subject()
+  process.spawn(fn() {
+    use conn <- db_pool.with_connection(pool, 200, 30_000)
+    process.send(holder1, conn)
+    process.sleep(200)
+  })
+
+  let holder2 = process.new_subject()
+  process.spawn(fn() {
+    use conn <- db_pool.with_connection(pool, 200, 30_000)
+    process.send(holder2, conn)
+    process.sleep(200)
+  })
+
+  // Verify both acquired connections
+  let assert Ok(Nil) = process.receive(holder1, 500)
+  let assert Ok(Nil) = process.receive(holder2, 500)
+
+  let assert Error(db_pool.ConnectionTimeout) =
+    db_pool.with_connection(pool, 50, 30_000, fn(_conn) { "Nope" })
+}
+
 pub fn checkout_current_connection_test() {
   let name = process.new_name("db_pool_test")
 
@@ -98,7 +181,6 @@ pub fn checkout_current_connection_test() {
 
   let assert Ok(conn1) = db_pool.checkout(pool, self, 200, 30_000)
 
-  // Re-entrant checkout returns the same connection
   let assert Ok(conn2) = db_pool.checkout(pool, self, 200, 30_000)
 
   assert conn1 == conn2

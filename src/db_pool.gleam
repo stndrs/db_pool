@@ -2,6 +2,7 @@ import gleam/bool
 import gleam/dict.{type Dict}
 import gleam/erlang/process.{type Pid, type Subject}
 import gleam/int
+import gleam/io
 import gleam/list
 import gleam/otp/actor
 import gleam/otp/supervision
@@ -257,7 +258,7 @@ pub fn checkout(
 
 /// Returns a connection back to the pool.
 ///
-/// The `conn` value must be the same connection that was originally
+/// Expects the `conn` value to be the same connection that was originally
 /// checked out, and `caller` should be the `Pid` that checked it out.
 /// If the caller has no active connection the checkin is silently
 /// ignored.
@@ -267,6 +268,27 @@ pub fn checkin(
   caller: Pid,
 ) -> Nil {
   process.send(pool, CheckIn(caller:, conn:))
+}
+
+/// Checks out a connection from the pool and passes it to the provided
+/// callback function. The connection is automatically checked back in
+/// after the callback function returns.
+pub fn with_connection(
+  pool: Subject(Message(conn, err)),
+  timeout: Int,
+  deadline: Int,
+  next: fn(conn) -> t,
+) -> Result(t, PoolError(err)) {
+  let caller = process.self()
+
+  process.call_forever(pool, CheckOut(_, caller:, timeout:, deadline:))
+  |> result.map(fn(conn) {
+    let res = next(conn)
+
+    process.send(pool, CheckIn(caller:, conn:))
+
+    res
+  })
 }
 
 /// Shuts down the pool gracefully within `timeout` milliseconds.
@@ -480,7 +502,13 @@ fn do_checkin(
 ) -> State(conn, err) {
   case dict.get(state.active, caller) {
     Ok(prev) -> {
-      assert prev.conn == conn
+      case prev.conn == conn {
+        True -> Nil
+        False -> {
+          "(db_pool) unexpected connection checked in for the current process"
+          |> io.println_error
+        }
+      }
 
       let _ = process.cancel_timer(prev.deadline_timer)
       process.demonitor_process(prev.monitor)
