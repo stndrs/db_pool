@@ -1,6 +1,6 @@
 import gleam/bool
 import gleam/dict.{type Dict}
-import gleam/erlang/process.{type Pid, type Selector, type Subject}
+import gleam/erlang/process.{type Pid, type Subject}
 import gleam/int
 import gleam/io
 import gleam/list
@@ -225,53 +225,11 @@ pub opaque type Message(conn, err) {
   Shutdown(client: Subject(Result(Nil, PoolError(err))))
 }
 
-// The extra time in ms added to the pool-side timeout to form the
-// client-side safety net. Under normal operation the pool replies before
-// this fires. It only triggers when the pool actor is unreachable.
-const client_timeout_margin_ms = 1000
-
-// Sends a request to the pool and waits for a reply without panicking.
-//
-// Unlike `process.call` which panics on timeout and `call_forever`
-// which blocks indefinitely, this returns `Error(ConnectionUnavailable)`
-// when the pool actor is unreachable or unresponsive.
-//
-// The client-side timeout is `timeout + client_timeout_margin_ms`. Under
-// normal conditions the pool handles the timeout internally and replies
-// first.
-fn try_call(
-  pool: Subject(Message(conn, err)),
-  timeout: Int,
-  make_request: fn(Subject(Result(conn, PoolError(err)))) -> Message(conn, err),
-) -> Result(conn, PoolError(err)) {
-  let reply_subject = process.new_subject()
-
-  process.subject_owner(pool)
-  |> result.replace_error(ConnectionUnavailable)
-  |> result.try(fn(owner) {
-    let monitor = process.monitor(owner)
-
-    process.send(pool, make_request(reply_subject))
-
-    let selector: Selector(Result(conn, PoolError(err))) =
-      process.new_selector()
-      |> process.select(reply_subject)
-      |> process.select_specific_monitor(monitor, fn(_down) {
-        Error(ConnectionUnavailable)
-      })
-
-    let client_timeout = timeout + client_timeout_margin_ms
-
-    let reply = process.selector_receive(from: selector, within: client_timeout)
-
-    process.demonitor_process(monitor:)
-
-    case reply {
-      Ok(result) -> result
-      Error(Nil) -> Error(ConnectionUnavailable)
-    }
-  })
-}
+// Extra time in ms added to the pool-side timeout when making a
+// `process.call`. The pool handles timeouts internally and replies
+// before this buffer expires. If the pool actor is truly unreachable
+// the caller panics after `timeout + client_timeout_buffer_ms`.
+const client_timeout_buffer_ms = 5000
 
 /// Checks out a connection from the pool.
 ///
@@ -292,15 +250,19 @@ fn try_call(
 /// the already checked-out connection. The original deadline is
 /// preserved — a second checkout cannot extend it.
 ///
-/// Returns `ConnectionUnavailable` if the pool actor is unreachable
-/// (crashed, shut down, or unresponsive).
+/// Panics if the pool actor is unreachable.
 pub fn checkout(
   pool: Subject(Message(conn, err)),
   caller: Pid,
   timeout: Int,
   deadline: Int,
 ) -> Result(conn, PoolError(err)) {
-  try_call(pool, timeout, CheckOut(_, caller:, timeout:, deadline:))
+  process.call(pool, timeout + client_timeout_buffer_ms, CheckOut(
+    _,
+    caller:,
+    timeout:,
+    deadline:,
+  ))
 }
 
 /// Returns a connection back to the pool.
@@ -321,7 +283,11 @@ pub fn checkin(
 /// callback function. The connection is automatically checked back in
 /// after the callback function returns.
 ///
-/// Returns `ConnectionUnavailable` if the pool actor is unreachable.
+/// If the callback panics, the connection is not checked in immediately.
+/// It is reclaimed when the caller process exits (via the pool's
+/// monitor).
+///
+/// Panics if the pool actor is unreachable (crashed or shut down).
 pub fn with_connection(
   pool: Subject(Message(conn, err)),
   timeout: Int,
@@ -330,7 +296,12 @@ pub fn with_connection(
 ) -> Result(t, PoolError(err)) {
   let caller = process.self()
 
-  try_call(pool, timeout, CheckOut(_, caller:, timeout:, deadline:))
+  process.call(pool, timeout + client_timeout_buffer_ms, CheckOut(
+    _,
+    caller:,
+    timeout:,
+    deadline:,
+  ))
   |> result.map(fn(conn) {
     let res = next(conn)
 
@@ -347,11 +318,14 @@ pub fn with_connection(
 /// are closed, their deadline timers cancelled, and their monitors
 /// removed. Idle connections are then closed via the configured
 /// `on_close` callback.
+///
+/// Panics if the pool actor is unreachable or does not respond
+/// within the timeout.
 pub fn shutdown(
   pool: Subject(Message(conn, err)),
   timeout: Int,
 ) -> Result(Nil, PoolError(err)) {
-  process.call(pool, timeout, Shutdown)
+  process.call(pool, timeout + client_timeout_buffer_ms, Shutdown)
 }
 
 // --- Actor initialisation ---

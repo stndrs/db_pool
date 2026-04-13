@@ -9,8 +9,9 @@
   overload by returning `ConnectionUnavailable`
 - Added checkout deadlines — the pool forcibly closes connections held past
   their deadline, preventing runaway resource hoarding
-- Added automatic reconnection with exponential backoff and jitter (500 ms –
-  30 s) when a connection process exits unexpectedly
+- Added automatic reconnection with exponential backoff and jitter (initial
+  delay 500 ms–1 s, capped at 30 s) when a connection process exits
+  unexpectedly
 - Added `with_connection`, a convenience function that checks out a connection,
   runs a callback, and automatically checks it back in
 - Added `on_idle` callback, invoked on every checkin and once per connection at
@@ -18,8 +19,8 @@
 - Added `on_active` callback, invoked on every checkout
 - Added re-entrant checkout — a process that already holds a connection
   receives the same one instead of deadlocking
-- `checkout` and `with_connection` now return `ConnectionUnavailable` instead
-  of blocking forever or panicking when the pool actor is unreachable
+- Added `supervised`, a convenience function that creates a
+  `ChildSpecification` for adding the pool to a supervision tree
 
 ### Breaking changes
 
