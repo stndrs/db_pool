@@ -18,8 +18,8 @@
 - Added `on_active` callback, invoked on every checkout
 - Added re-entrant checkout — a process that already holds a connection
   receives the same one instead of deadlocking
-- Checkout now uses pool-side timeout enforcement (`call_forever`) so callers
-  no longer see OTP call-timeout panics
+- `checkout` and `with_connection` now return `ConnectionUnavailable` instead
+  of blocking forever or panicking when the pool actor is unreachable
 
 ### Breaking changes
 

@@ -1,6 +1,6 @@
 import gleam/bool
 import gleam/dict.{type Dict}
-import gleam/erlang/process.{type Pid, type Subject}
+import gleam/erlang/process.{type Pid, type Selector, type Subject}
 import gleam/int
 import gleam/io
 import gleam/list
@@ -225,6 +225,54 @@ pub opaque type Message(conn, err) {
   Shutdown(client: Subject(Result(Nil, PoolError(err))))
 }
 
+// The extra time in ms added to the pool-side timeout to form the
+// client-side safety net. Under normal operation the pool replies before
+// this fires. It only triggers when the pool actor is unreachable.
+const client_timeout_margin_ms = 1000
+
+// Sends a request to the pool and waits for a reply without panicking.
+//
+// Unlike `process.call` which panics on timeout and `call_forever`
+// which blocks indefinitely, this returns `Error(ConnectionUnavailable)`
+// when the pool actor is unreachable or unresponsive.
+//
+// The client-side timeout is `timeout + client_timeout_margin_ms`. Under
+// normal conditions the pool handles the timeout internally and replies
+// first.
+fn try_call(
+  pool: Subject(Message(conn, err)),
+  timeout: Int,
+  make_request: fn(Subject(Result(conn, PoolError(err)))) -> Message(conn, err),
+) -> Result(conn, PoolError(err)) {
+  let reply_subject = process.new_subject()
+
+  process.subject_owner(pool)
+  |> result.replace_error(ConnectionUnavailable)
+  |> result.try(fn(owner) {
+    let monitor = process.monitor(owner)
+
+    process.send(pool, make_request(reply_subject))
+
+    let selector: Selector(Result(conn, PoolError(err))) =
+      process.new_selector()
+      |> process.select(reply_subject)
+      |> process.select_specific_monitor(monitor, fn(_down) {
+        Error(ConnectionUnavailable)
+      })
+
+    let client_timeout = timeout + client_timeout_margin_ms
+
+    let reply = process.selector_receive(from: selector, within: client_timeout)
+
+    process.demonitor_process(monitor:)
+
+    case reply {
+      Ok(result) -> result
+      Error(Nil) -> Error(ConnectionUnavailable)
+    }
+  })
+}
+
 /// Checks out a connection from the pool.
 ///
 /// The `caller` should be `process.self()` of the calling process. The
@@ -244,16 +292,15 @@ pub opaque type Message(conn, err) {
 /// the already checked-out connection. The original deadline is
 /// preserved — a second checkout cannot extend it.
 ///
-/// Note: this function uses `call_forever` internally. The `timeout` is
-/// enforced by the pool actor, not on the client side. If the pool
-/// actor is unreachable the caller will block indefinitely.
+/// Returns `ConnectionUnavailable` if the pool actor is unreachable
+/// (crashed, shut down, or unresponsive).
 pub fn checkout(
   pool: Subject(Message(conn, err)),
   caller: Pid,
   timeout: Int,
   deadline: Int,
 ) -> Result(conn, PoolError(err)) {
-  process.call_forever(pool, CheckOut(_, caller:, timeout:, deadline:))
+  try_call(pool, timeout, CheckOut(_, caller:, timeout:, deadline:))
 }
 
 /// Returns a connection back to the pool.
@@ -273,6 +320,8 @@ pub fn checkin(
 /// Checks out a connection from the pool and passes it to the provided
 /// callback function. The connection is automatically checked back in
 /// after the callback function returns.
+///
+/// Returns `ConnectionUnavailable` if the pool actor is unreachable.
 pub fn with_connection(
   pool: Subject(Message(conn, err)),
   timeout: Int,
@@ -281,7 +330,7 @@ pub fn with_connection(
 ) -> Result(t, PoolError(err)) {
   let caller = process.self()
 
-  process.call_forever(pool, CheckOut(_, caller:, timeout:, deadline:))
+  try_call(pool, timeout, CheckOut(_, caller:, timeout:, deadline:))
   |> result.map(fn(conn) {
     let res = next(conn)
 
