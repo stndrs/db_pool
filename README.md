@@ -28,14 +28,12 @@ pub fn main() -> Nil {
     |> db_pool.on_active(database.active)
 
   let assert Ok(pool) = db_pool.start(db_pool, name, 1000)
+  let pool = pool.data
 
-  let self = process.self()
-
-  let assert Ok(conn) = db_pool.checkout(pool, self, 500, 30_000)
-
-  let assert Ok(users) = database.query("SELECT * FROM users", conn)
-
-  db_pool.checkin(pool, conn, self)
+  let assert Ok(users) =
+    db_pool.with_connection(pool, 500, 30_000, fn(conn) {
+      database.query("SELECT * FROM users", conn)
+    })
 
   let assert Ok(_) = db_pool.shutdown(pool, 1000)
 }

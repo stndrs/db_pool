@@ -465,8 +465,6 @@ fn do_checkout(
     _ -> {
       case state.idle {
         [conn, ..rest] -> {
-          actor.send(client, Ok(conn))
-
           let monitor = process.monitor(caller)
           let now = counter.next(state.counter)
 
@@ -483,6 +481,8 @@ fn do_checkout(
           let active = dict.insert(state.active, caller, activated)
 
           state.handle_active(conn)
+
+          actor.send(client, Ok(conn))
 
           Ok(State(..state, idle: rest, active:))
         }
@@ -790,8 +790,6 @@ fn serve_waiter(
       codel_dequeue(state, now, conn)
     }
     True -> {
-      process.send(waiting.client, Ok(conn))
-
       let now = counter.next(state.counter)
 
       let deadline_timer =
@@ -808,7 +806,10 @@ fn serve_waiter(
           deadline_timer:,
           checkout_time: now,
         )
+
       let active = dict.insert(state.active, waiting.caller, activated)
+
+      process.send(waiting.client, Ok(conn))
 
       state.handle_active(conn)
 
