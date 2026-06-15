@@ -685,6 +685,54 @@ pub fn codel_drops_slow_waiters_test() {
   let assert Ok(_) = db_pool.shutdown(pool, 200)
 }
 
+/// The CoDel poll loop alone (no checkin happening) drops slow waiters once
+/// the queue delay stays above target for a measurement interval. This
+/// exercises the poll path specifically: the connection is never returned,
+/// so the only mechanism that can drop waiters is the periodic Poll.
+pub fn codel_poll_drops_slow_waiters_test() {
+  let name = process.new_name("db_pool_test")
+
+  let pool =
+    db_pool.new()
+    |> db_pool.size(1)
+    |> db_pool.queue_target(1)
+    |> db_pool.queue_interval(50)
+    |> db_pool.on_open(fn() { Ok(Nil) })
+    |> db_pool.on_close(fn(_) { Ok(Nil) })
+    |> db_pool.on_idle(fn(_) { Nil })
+    |> db_pool.on_active(fn(_) { Nil })
+
+  let assert Ok(pool) = db_pool.start(pool, name, 200)
+  let pool = pool.data
+
+  // Exhaust the only connection and never return it.
+  let self = process.self()
+  let assert Ok(Nil) = db_pool.checkout(pool, self, 200, 30_000)
+
+  // Spawn 5 waiters that will queue and never be served (no checkin).
+  let collector = process.new_subject()
+  list.repeat(Nil, 5)
+  |> list.each(fn(_) {
+    process.spawn(fn() {
+      let waiter = process.self()
+      let result = db_pool.checkout(pool, waiter, 5000, 30_000)
+      process.send(collector, result)
+    })
+  })
+
+  // Let several poll intervals elapse so CoDel enters slow mode and the poll
+  // loop drops the stale waiters — all without any checkin occurring.
+  process.sleep(250)
+
+  let results = collect_results(collector, [])
+
+  let dropped =
+    list.filter(results, fn(r) { r == Error(db_pool.ConnectionUnavailable) })
+  assert list.length(dropped) >= 1
+
+  let assert Ok(_) = db_pool.shutdown(pool, 200)
+}
+
 /// In fast mode (delay < queue_target), waiters are served immediately
 /// without being dropped.
 pub fn codel_fast_mode_serves_immediately_test() {

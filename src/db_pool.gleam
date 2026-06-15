@@ -219,7 +219,7 @@ pub opaque type Message(conn, err) {
   CheckIn(caller: Pid, conn: conn)
   Timeout(time_sent: Int, timeout: Int)
   DeadlineExpired(caller: Pid, checkout_time: Int)
-  Poll(time: Int, last_sent: Int)
+  Poll(last_sent: Int)
   PoolExit(process.ExitMessage)
   CallerDown(process.Down)
   Reconnect(backoff: Int)
@@ -369,11 +369,7 @@ fn initialise_pool(
   let now = counter.next(counter)
 
   let _poll_timer =
-    process.send_after(
-      self,
-      pool.queue_interval,
-      Poll(time: now, last_sent: now),
-    )
+    process.send_after(self, pool.queue_interval, Poll(last_sent: now))
 
   let state =
     State(
@@ -434,9 +430,9 @@ fn handle_message(
       |> do_caller_down(pid)
       |> actor.continue
     }
-    Poll(time:, last_sent:) -> {
+    Poll(last_sent:) -> {
       state
-      |> do_poll(time, last_sent)
+      |> do_poll(last_sent)
       |> actor.continue
     }
     Reconnect(backoff:) -> {
@@ -872,21 +868,23 @@ fn serve_waiter(
 
 // --- CoDel polling ---
 
-fn do_poll(
-  state: State(conn, err),
-  time: Int,
-  last_sent: Int,
-) -> State(conn, err) {
+fn do_poll(state: State(conn, err), last_sent: Int) -> State(conn, err) {
+  // Read the clock now, when the message is handled, rather than trusting a
+  // predicted fire time. This keeps the logical clock aligned with real time
+  // and prevents actor mailbox delay from accumulating into queue-delay
+  // measurements (which matters most exactly when the pool is overloaded).
+  let time = counter.next(state.counter)
+
   case queue.first(state.queue) {
     Ok(#(sent, _)) if sent <= last_sent -> {
       let delay = time - sent
 
       state
       |> codel_timeout(delay, time)
-      |> start_poll(time, sent)
+      |> start_poll(sent)
     }
-    Ok(#(sent, _)) -> start_poll(state, time, sent)
-    _ -> start_poll(state, time, time)
+    Ok(#(sent, _)) -> start_poll(state, sent)
+    _ -> start_poll(state, time)
   }
 }
 
@@ -895,14 +893,18 @@ fn codel_timeout(
   delay: Int,
   time: Int,
 ) -> State(conn, err) {
-  case time >= state.next, state.delay > state.queue_target {
-    True, True -> {
-      State(..state, slow: True, delay:, next: time + state.queue_interval)
+  // Only evaluate at interval boundaries. Anchor the next boundary to the
+  // previous one (not to the handler time) so the measurement cadence stays
+  // fixed and doesn't drift later as polls are handled slightly late.
+  use <- bool.guard(when: time < state.next, return: state)
+
+  let next = state.next + state.queue_interval
+
+  case state.delay > state.queue_target {
+    True ->
+      State(..state, slow: True, delay:, next:)
       |> poll_drop_slow(time, state.queue_target * 2)
-    }
-    True, False ->
-      State(..state, slow: False, delay:, next: time + state.queue_interval)
-    _, _ -> state
+    False -> State(..state, slow: False, delay:, next:)
   }
 }
 
@@ -924,17 +926,12 @@ fn poll_drop_slow(
   }
 }
 
-fn start_poll(
-  state: State(conn, err),
-  now: Int,
-  last_sent: Int,
-) -> State(conn, err) {
-  let poll_time = now + state.queue_interval
+fn start_poll(state: State(conn, err), last_sent: Int) -> State(conn, err) {
   let _timer =
     process.send_after(
       state.self,
       state.queue_interval / ns_per_ms,
-      Poll(poll_time, last_sent),
+      Poll(last_sent:),
     )
 
   state
