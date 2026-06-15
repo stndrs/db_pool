@@ -1,5 +1,8 @@
 import gleam/bool
 import gleam/dict.{type Dict}
+import gleam/dynamic.{type Dynamic}
+import gleam/dynamic/decode
+import gleam/erlang/atom
 import gleam/erlang/process.{type Pid, type Subject}
 import gleam/int
 import gleam/io
@@ -463,8 +466,14 @@ fn handle_message(
       case exit.reason {
         process.Normal -> actor.stop()
         process.Killed -> actor.stop_abnormal("pool killed")
-        process.Abnormal(_reason) ->
-          actor.stop_abnormal("pool stopped abnormally")
+        process.Abnormal(reason) ->
+          // A supervisor terminating a child sends an exit with reason
+          // `shutdown`. Treat that as a clean stop so graceful application
+          // shutdowns don't produce spurious `shutdown_error` reports.
+          case is_shutdown_reason(reason) {
+            True -> actor.stop()
+            False -> actor.stop_abnormal("pool stopped abnormally")
+          }
       }
     }
     Shutdown(client:) -> {
@@ -951,6 +960,22 @@ fn start_poll(state: State(conn, err), last_sent: Int) -> State(conn, err) {
 }
 
 // --- Helpers ---
+
+// Returns True when an `Abnormal` exit reason is the `shutdown` atom (or a
+// `{shutdown, _}` tuple), which is how a supervisor signals a normal child
+// termination. These should not be reported as abnormal exits.
+fn is_shutdown_reason(reason: Dynamic) -> Bool {
+  let shutdown = atom.create("shutdown")
+
+  case decode.run(reason, atom.decoder()) {
+    Ok(a) -> a == shutdown
+    _ ->
+      case decode.run(reason, decode.at([0], atom.decoder())) {
+        Ok(a) -> a == shutdown
+        _ -> False
+      }
+  }
+}
 
 fn drop_waiter(waiting: Waiting(conn, PoolError(err))) -> Nil {
   actor.send(waiting.client, Error(ConnectionUnavailable))

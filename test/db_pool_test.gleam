@@ -1,4 +1,6 @@
 import db_pool
+import gleam/bool
+import gleam/erlang/atom
 import gleam/erlang/process
 import gleam/erlang/reference
 import gleam/int
@@ -296,6 +298,37 @@ pub fn clamp_size_and_interval_test() {
   db_pool.checkin(pool, Nil, self)
 
   let assert Ok(_) = db_pool.shutdown(pool, 200)
+}
+
+pub fn shutdown_reason_treated_as_normal_test() {
+  let name = process.new_name("db_pool_test")
+
+  let new_pool =
+    db_pool.new()
+    |> db_pool.size(1)
+    |> db_pool.on_open(fn() { Ok(Nil) })
+    |> db_pool.on_close(fn(_) { Ok(Nil) })
+    |> db_pool.on_idle(fn(_) { Nil })
+    |> db_pool.on_active(fn(_) { Nil })
+
+  let assert Ok(started) = db_pool.start(new_pool, name, 200)
+  let pid = started.pid
+
+  // A supervisor signals a normal child stop with the `shutdown` reason.
+  // The pool traps exits, handles it, runs cleanup, and stops. (Reason
+  // discrimination — clean vs abnormal — is enforced in `handle_message`'s
+  // PoolExit arm via `is_shutdown_reason`.)
+  process.send_abnormal_exit(pid, atom.create("shutdown"))
+
+  // The pool should terminate.
+  wait_for_exit(pid, 500)
+  assert !process.is_alive(pid)
+}
+
+fn wait_for_exit(pid: process.Pid, remaining: Int) -> Nil {
+  use <- bool.guard(when: !process.is_alive(pid) || remaining <= 0, return: Nil)
+  process.sleep(10)
+  wait_for_exit(pid, remaining - 10)
 }
 
 pub fn checkout_checkin_test() {
