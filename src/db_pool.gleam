@@ -146,6 +146,7 @@ type Active(conn) {
     monitor: process.Monitor,
     deadline_timer: process.Timer,
     checkout_time: Int,
+    depth: Int,
   )
 }
 
@@ -481,9 +482,14 @@ fn do_checkout(
       // Subsequent checkouts: return the same connection. The original
       // deadline is preserved as callers cannot extend their deadline
       // by checking out again. A single process is limited to one
-      // connection at a time.
+      // connection at a time. The checkout depth is tracked so the
+      // connection is only released once every nested checkout has
+      // checked in.
+      let active = Active(..active, depth: active.depth + 1)
+      let active_dict = dict.insert(state.active, caller, active)
+
       actor.send(client, Ok(active.conn))
-      Ok(state)
+      Ok(State(..state, active: active_dict))
     }
     _ -> {
       case state.idle {
@@ -499,7 +505,13 @@ fn do_checkout(
             )
 
           let activated =
-            Active(conn:, monitor:, deadline_timer:, checkout_time: now)
+            Active(
+              conn:,
+              monitor:,
+              deadline_timer:,
+              checkout_time: now,
+              depth: 1,
+            )
 
           let active = dict.insert(state.active, caller, activated)
 
@@ -533,13 +545,29 @@ fn do_checkin(
         }
       }
 
-      let _ = process.cancel_timer(prev.deadline_timer)
-      process.demonitor_process(prev.monitor)
-      let active = dict.delete(state.active, caller)
-      let state = State(..state, active:)
+      case prev.depth > 1 {
+        // Nested checkout still outstanding: decrement and keep the
+        // connection checked out. Don't touch the deadline timer or
+        // monitor.
+        True -> {
+          let active =
+            dict.insert(
+              state.active,
+              caller,
+              Active(..prev, depth: prev.depth - 1),
+            )
+          State(..state, active:)
+        }
+        False -> {
+          let _ = process.cancel_timer(prev.deadline_timer)
+          process.demonitor_process(prev.monitor)
+          let active = dict.delete(state.active, caller)
+          let state = State(..state, active:)
 
-      let now = counter.next(state.counter)
-      codel_dequeue(state, now, prev.conn)
+          let now = counter.next(state.counter)
+          codel_dequeue(state, now, prev.conn)
+        }
+      }
     }
     _ -> state
   }
@@ -828,6 +856,7 @@ fn serve_waiter(
           monitor: waiting.monitor,
           deadline_timer:,
           checkout_time: now,
+          depth: 1,
         )
 
       let active = dict.insert(state.active, waiting.caller, activated)

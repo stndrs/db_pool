@@ -197,6 +197,49 @@ pub fn checkout_current_connection_test() {
   assert conn1 != conn3
 }
 
+pub fn checkout_depth_test() {
+  let name = process.new_name("db_pool_test")
+
+  let new_pool =
+    db_pool.new()
+    |> db_pool.size(1)
+    |> db_pool.on_open(fn() { Ok(reference.new()) })
+    |> db_pool.on_close(fn(_) { Ok(Nil) })
+    |> db_pool.on_idle(fn(_) { Nil })
+    |> db_pool.on_active(fn(_) { Nil })
+
+  let assert Ok(pool) = db_pool.start(new_pool, name, 200)
+  let pool = pool.data
+
+  let self = process.self()
+
+  // Two nested checkouts of the only connection.
+  let assert Ok(conn) = db_pool.checkout(pool, self, 200, 30_000)
+  let assert Ok(_) = db_pool.checkout(pool, self, 200, 30_000)
+
+  // First checkin only decrements depth: the connection is still held,
+  // so another process cannot acquire it yet.
+  db_pool.checkin(pool, conn, self)
+
+  let blocked = process.new_subject()
+  process.spawn(fn() {
+    let other = process.self()
+    process.send(blocked, db_pool.checkout(pool, other, 50, 30_000))
+  })
+  let assert Ok(Error(db_pool.ConnectionTimeout)) =
+    process.receive(blocked, 500)
+
+  // Second checkin releases the connection for real.
+  db_pool.checkin(pool, conn, self)
+
+  let served = process.new_subject()
+  process.spawn(fn() {
+    let other = process.self()
+    process.send(served, db_pool.checkout(pool, other, 200, 30_000))
+  })
+  let assert Ok(Ok(_)) = process.receive(served, 500)
+}
+
 pub fn checkout_checkin_test() {
   let pool = db_pool()
 
