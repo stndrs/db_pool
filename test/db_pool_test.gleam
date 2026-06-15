@@ -240,6 +240,64 @@ pub fn checkout_depth_test() {
   let assert Ok(Ok(_)) = process.receive(served, 500)
 }
 
+pub fn clamp_negative_timeout_deadline_test() {
+  let name = process.new_name("db_pool_test")
+
+  let new_pool =
+    db_pool.new()
+    |> db_pool.size(1)
+    |> db_pool.on_open(fn() { Ok(Nil) })
+    |> db_pool.on_close(fn(_) { Ok(Nil) })
+    |> db_pool.on_idle(fn(_) { Nil })
+    |> db_pool.on_active(fn(_) { Nil })
+
+  let assert Ok(pool) = db_pool.start(new_pool, name, 200)
+  let pool = pool.data
+
+  let self = process.self()
+
+  // Negative timeout/deadline must not crash the pool actor.
+  let _ = db_pool.checkout(pool, self, -5, -5)
+  db_pool.checkin(pool, Nil, self)
+
+  // Pool is still alive and serving.
+  let assert Ok(Nil) = db_pool.checkout(pool, self, 200, 30_000)
+  db_pool.checkin(pool, Nil, self)
+
+  let assert Ok(_) = db_pool.shutdown(pool, 200)
+}
+
+pub fn clamp_size_and_interval_test() {
+  let name = process.new_name("db_pool_test")
+
+  // size(0) clamps to 1 and queue_interval(0) clamps to 1ms (no busy spin /
+  // init crash). The pool must still start and serve a checkout.
+  let new_pool =
+    db_pool.new()
+    |> db_pool.size(0)
+    |> db_pool.queue_interval(0)
+    |> db_pool.queue_target(-1)
+    |> db_pool.on_open(fn() { Ok(Nil) })
+    |> db_pool.on_close(fn(_) { Ok(Nil) })
+    |> db_pool.on_idle(fn(_) { Nil })
+    |> db_pool.on_active(fn(_) { Nil })
+
+  let assert Ok(pool) = db_pool.start(new_pool, name, 200)
+  let pool = pool.data
+
+  let self = process.self()
+
+  let assert Ok(Nil) = db_pool.checkout(pool, self, 200, 30_000)
+  db_pool.checkin(pool, Nil, self)
+
+  // Still responsive after letting the (now 1ms) poll loop run a while.
+  process.sleep(20)
+  let assert Ok(Nil) = db_pool.checkout(pool, self, 200, 30_000)
+  db_pool.checkin(pool, Nil, self)
+
+  let assert Ok(_) = db_pool.shutdown(pool, 200)
+}
+
 pub fn checkout_checkin_test() {
   let pool = db_pool()
 

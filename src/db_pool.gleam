@@ -66,7 +66,8 @@ pub fn new() -> Pool(conn, err) {
 /// Sets the size of the pool. At startup the pool will create `size`
 /// number of connections.
 pub fn size(pool: Pool(conn, err), size: Int) -> Pool(conn, err) {
-  Pool(..pool, size:)
+  // A pool must have at least one connection to be able to serve callers.
+  Pool(..pool, size: int.max(size, 1))
 }
 
 /// Sets the `Pool`'s `on_open` function. The provided function will be
@@ -119,14 +120,16 @@ pub fn on_active(
 /// acceptable queue delay before the pool considers itself overloaded.
 /// Defaults to 50ms.
 pub fn queue_target(pool: Pool(conn, err), target: Int) -> Pool(conn, err) {
-  Pool(..pool, queue_target: target)
+  Pool(..pool, queue_target: int.max(target, 0))
 }
 
 /// Sets the CoDel queue interval in milliseconds. This is the length
 /// of each CoDel measurement interval. The pool evaluates queue health
 /// at each interval boundary. Defaults to 1000ms.
 pub fn queue_interval(pool: Pool(conn, err), interval: Int) -> Pool(conn, err) {
-  Pool(..pool, queue_interval: interval)
+  // Clamp to a 1ms floor: a 0ms interval would busy-spin the poll loop and a
+  // negative interval would crash `send_after` during initialisation.
+  Pool(..pool, queue_interval: int.max(interval, 1))
 }
 
 // --- Internal types ---
@@ -258,6 +261,11 @@ pub fn checkout(
   timeout: Int,
   deadline: Int,
 ) -> Result(conn, PoolError(err)) {
+  // Clamp so negative values can't crash the shared pool actor's internal
+  // `send_after` calls (badarg) and take down every other caller.
+  let timeout = int.max(timeout, 0)
+  let deadline = int.max(deadline, 0)
+
   process.call(pool, timeout + client_timeout_buffer_ms, CheckOut(
     _,
     caller:,
@@ -296,6 +304,11 @@ pub fn with_connection(
   next: fn(conn) -> t,
 ) -> Result(t, PoolError(err)) {
   let caller = process.self()
+
+  // Clamp so negative values can't crash the shared pool actor's internal
+  // `send_after` calls (badarg) and take down every other caller.
+  let timeout = int.max(timeout, 0)
+  let deadline = int.max(deadline, 0)
 
   process.call(pool, timeout + client_timeout_buffer_ms, CheckOut(
     _,
