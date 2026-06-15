@@ -183,15 +183,8 @@ fn worker_loop(
   case now >= stop_time {
     True -> Nil
     False -> {
-      let self = process.self()
-
       let result =
-        db_pool.checkout(
-          pool,
-          self,
-          scenario.checkout_timeout,
-          scenario.deadline,
-        )
+        db_pool.checkout(pool, scenario.checkout_timeout, scenario.deadline)
 
       case result {
         Ok(conn) -> {
@@ -203,7 +196,7 @@ fn worker_loop(
             True -> process.sleep(scenario.hold_ms)
             False -> Nil
           }
-          db_pool.checkin(pool, conn, self)
+          db_pool.checkin(pool, conn)
 
           process.send(
             collector,

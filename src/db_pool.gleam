@@ -240,8 +240,8 @@ const client_timeout_buffer_ms = 5000
 
 /// Checks out a connection from the pool.
 ///
-/// The `caller` should be `process.self()` of the calling process. The
-/// pool monitors this process and reclaims the connection if it crashes.
+/// The connection is associated with the calling process (`process.self()`).
+/// The pool monitors this process and reclaims the connection if it crashes.
 ///
 /// If a connection is available it is returned immediately. If all
 /// connections are in use the caller is added to a FIFO queue and will
@@ -260,10 +260,14 @@ const client_timeout_buffer_ms = 5000
 /// Panics if the pool actor is unreachable.
 pub fn checkout(
   pool: Subject(Message(conn, err)),
-  caller: Pid,
   timeout: Int,
   deadline: Int,
 ) -> Result(conn, PoolError(err)) {
+  // The caller is always the calling process: `process.call` replies to it
+  // anyway, and deriving it here keeps the monitor, re-entrancy key, and
+  // reclaim logic attached to the right process.
+  let caller = process.self()
+
   // Clamp so negative values can't crash the shared pool actor's internal
   // `send_after` calls (badarg) and take down every other caller.
   let timeout = int.max(timeout, 0)
@@ -280,14 +284,10 @@ pub fn checkout(
 /// Returns a connection back to the pool.
 ///
 /// Expects the `conn` value to be the same connection that was originally
-/// checked out, and `caller` should be the `Pid` that checked it out.
-/// If the caller has no active connection the checkin is silently
-/// ignored.
-pub fn checkin(
-  pool: Subject(Message(conn, err)),
-  conn: conn,
-  caller: Pid,
-) -> Nil {
+/// checked out by the calling process. If the calling process has no active
+/// connection the checkin is silently ignored.
+pub fn checkin(pool: Subject(Message(conn, err)), conn: conn) -> Nil {
+  let caller = process.self()
   process.send(pool, CheckIn(caller:, conn:))
 }
 

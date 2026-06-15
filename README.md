@@ -58,16 +58,14 @@ All checkout and shutdown operations return `Result(value, PoolError(err))`. The
 `with_connection` (shown above) is the recommended API — it automatically checks the connection back in when the callback returns. For cases where you need manual control over the connection lifecycle, use `checkout` and `checkin` directly:
 
 ```gleam
-let caller = process.self()
-
 // timeout: 500ms queue wait, deadline: 30s max hold time
-let assert Ok(conn) = db_pool.checkout(pool, caller, 500, 30_000)
+let assert Ok(conn) = db_pool.checkout(pool, 500, 30_000)
 
 // Use the connection...
 let users = database.query("SELECT * FROM users", conn)
 
 // Return it to the pool when done.
-db_pool.checkin(pool, conn, caller)
+db_pool.checkin(pool, conn)
 ```
 
 The `deadline` parameter sets the maximum time in milliseconds that a connection may be held. If the caller has not checked in by then, the pool forcibly closes the connection and opens a replacement. The caller is left holding a now-closed connection.
