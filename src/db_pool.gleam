@@ -723,6 +723,11 @@ fn do_deadline_expired(
 /// a waiter or return to idle. On failure, another reconnect is scheduled
 /// with increased backoff (randomized exponential, capped at 30s).
 fn do_reconnect(state: State(conn, err), backoff: Int) -> State(conn, err) {
+  // Enforce the pool's capacity rather than relying on the invariant that
+  // exactly one reconnect chain exists per lost connection. If we are
+  // already at capacity, drop this replacement attempt.
+  use <- bool.guard(when: state.current_size >= state.max_size, return: state)
+
   case state.handle_open() {
     Ok(conn) -> {
       let state = State(..state, current_size: state.current_size + 1)

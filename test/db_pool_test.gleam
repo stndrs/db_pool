@@ -925,6 +925,52 @@ pub fn reconnect_after_failed_replacement_test() {
   let assert Ok(_) = db_pool.shutdown(pool, 200)
 }
 
+/// The pool never opens more connections than `max_size`, even across
+/// repeated reconnects from caller crashes. We track live connections
+/// (opens minus closes) and assert it stays within capacity.
+pub fn reconnect_respects_max_size_test() {
+  let opens = atomic.new()
+  let closes = atomic.new()
+
+  let name = process.new_name("db_pool_test")
+  let pool =
+    db_pool.new()
+    |> db_pool.size(2)
+    |> db_pool.on_open(fn() {
+      atomic.add(opens, 1)
+      Ok(Nil)
+    })
+    |> db_pool.on_close(fn(_) {
+      atomic.add(closes, 1)
+      Ok(Nil)
+    })
+    |> db_pool.on_idle(fn(_) { Nil })
+    |> db_pool.on_active(fn(_) { Nil })
+
+  let assert Ok(pool) = db_pool.start(pool, name, 200)
+  let pool = pool.data
+
+  // Repeatedly check out and crash the holder so the pool reconnects.
+  list.repeat(Nil, 6)
+  |> list.each(fn(_) {
+    let caller =
+      process.spawn_unlinked(fn() {
+        let self = process.self()
+        let assert Ok(Nil) = db_pool.checkout(pool, self, 500, 30_000)
+        process.sleep(30_000)
+      })
+    process.sleep(20)
+    process.kill(caller)
+    process.sleep(20)
+
+    // Live connections must never exceed the pool's max_size.
+    let live = atomic.get(opens) - atomic.get(closes)
+    assert live <= 2
+  })
+
+  let assert Ok(_) = db_pool.shutdown(pool, 200)
+}
+
 /// When the pool shuts down while callers are waiting in the queue,
 /// those callers receive ConnectionUnavailable instead of blocking forever.
 pub fn shutdown_drains_waiters_test() {
