@@ -5,11 +5,11 @@ import gleam/dynamic/decode
 import gleam/erlang/atom
 import gleam/erlang/process.{type Pid, type Subject}
 import gleam/int
-import gleam/io
 import gleam/list
 import gleam/otp/actor
 import gleam/otp/supervision
 import gleam/result
+import logging
 import rasa/counter
 import rasa/monotonic
 import rasa/queue.{type Queue}
@@ -559,7 +559,7 @@ fn do_checkin(
         True -> Nil
         False -> {
           "(db_pool) unexpected connection checked in for the current process"
-          |> io.println_error
+          |> logging.log(logging.Warning, _)
         }
       }
 
