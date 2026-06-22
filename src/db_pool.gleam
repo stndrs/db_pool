@@ -143,6 +143,10 @@ type Waiting(conn, err) {
     monitor: process.Monitor,
     client: Subject(Result(conn, err)),
     deadline: Int,
+    // The real monotonic nanosecond timestamp at which this caller was
+    // enqueued. CoDel delay math uses this value, not the queue key. The
+    // queue key is a strictly-unique integer with no time meaning.
+    sent_at: Int,
   )
 }
 
@@ -379,11 +383,21 @@ fn initialise_pool(
   let q =
     queue.new()
     |> queue.with_access(table.Private)
-    |> queue.with_counter(counter)
+    // Use a strictly-unique, monotonically increasing counter for queue
+    // keys. `monotonic_time` can return the same value on consecutive calls,
+    // which would make `queue.push` (backed by `insert_new`) fail on a key
+    // collision and crash the actor. Real elapsed-time measurements for CoDel
+    // use `state.counter` and the `sent_at` timestamp stored on each waiter,
+    // not the queue key.
+    |> queue.with_counter(counter.monotonic())
     |> queue.build
 
   let now = counter.next(counter)
 
+  // `last_sent` is a queue-key-space token, not a timestamp. The pool starts
+  // with an empty queue, so this first poll takes the empty branch and carries
+  // the token forward until a real waiter is enqueued, at which point it is
+  // reseeded from an actual queue key. The seed value is therefore inert.
   let _poll_timer =
     process.send_after(self, pool.queue_interval, Poll(last_sent: now))
 
@@ -599,41 +613,49 @@ fn do_enqueue(
   deadline: Int,
 ) -> State(conn, err) {
   let monitor = process.monitor(caller)
-  let waiting = Waiting(caller:, monitor:, client:, deadline:)
+  let sent_at = counter.next(state.counter)
+  let waiting = Waiting(caller:, monitor:, client:, deadline:, sent_at:)
 
-  // Shouldn't fail since enqueueing is done via the actor's message queue.
-  // It shouldn't be possible for two waiters to be pushed at the same time.
-  let assert Ok(sent_at) = queue.push(state.queue, waiting)
-
-  let _timer =
-    process.send_after(state.self, timeout, Timeout(sent_at, timeout))
-
-  state
+  // The queue counter is strictly unique, so `push` never fails on a key
+  // collision here. We still pattern-match defensively rather than crash the
+  // whole pool: on the impossible-Error path we drop this single caller with
+  // `ConnectionUnavailable` and tear down its monitor instead of taking down
+  // every connection and waiter.
+  case queue.push(state.queue, waiting) {
+    Ok(key) -> {
+      let _timer =
+        process.send_after(state.self, timeout, Timeout(key, timeout))
+      state
+    }
+    Error(Nil) -> {
+      actor.send(client, Error(ConnectionUnavailable))
+      process.demonitor_process(monitor)
+      state
+    }
+  }
 }
 
 fn do_expire(
   state: State(conn, err),
-  sent: Int,
+  key: Int,
   timeout: Int,
 ) -> State(conn, err) {
-  queue.at(state.queue, sent)
+  queue.at(state.queue, key)
   |> result.map(fn(waiting) {
     let now = counter.next(state.counter)
+    let expires_at = waiting.sent_at + timeout * ns_per_ms
 
-    use <- bool.lazy_guard(
-      when: { now < { sent + timeout * ns_per_ms } },
-      return: fn() {
-        let remaining_ns = sent + timeout * ns_per_ms - now
-        let remaining_ms = remaining_ns / ns_per_ms
+    use <- bool.lazy_guard(when: now < expires_at, return: fn() {
+      let remaining_ns = expires_at - now
+      let remaining_ms = remaining_ns / ns_per_ms
 
-        let _timer =
-          process.send_after(state.self, remaining_ms, Timeout(sent, timeout))
+      let _timer =
+        process.send_after(state.self, remaining_ms, Timeout(key, timeout))
 
-        state
-      },
-    )
+      state
+    })
 
-    let assert Ok(Nil) = queue.delete(state.queue, sent)
+    let assert Ok(Nil) = queue.delete(state.queue, key)
 
     actor.send(waiting.client, Error(ConnectionTimeout))
 
@@ -775,10 +797,10 @@ fn dequeue_first(
   let slow = state.delay > state.queue_target
 
   case queue.first(state.queue) {
-    Ok(#(sent, waiting)) -> {
-      let assert Ok(Nil) = queue.delete(state.queue, sent)
+    Ok(#(key, waiting)) -> {
+      let assert Ok(Nil) = queue.delete(state.queue, key)
 
-      let delay = now - sent
+      let delay = now - waiting.sent_at
       let state = State(..state, next:, delay:, slow:)
 
       serve_waiter(state, waiting, conn)
@@ -798,9 +820,9 @@ fn dequeue_fast(
   conn: conn,
 ) -> State(conn, err) {
   case queue.first(state.queue) {
-    Ok(#(sent, waiting)) -> {
-      let assert Ok(Nil) = queue.delete(state.queue, sent)
-      let delay = now - sent
+    Ok(#(key, waiting)) -> {
+      let assert Ok(Nil) = queue.delete(state.queue, key)
+      let delay = now - waiting.sent_at
       let state = case delay < state.delay {
         True -> State(..state, delay:)
         False -> state
@@ -824,18 +846,18 @@ fn dequeue_slow(
   conn: conn,
 ) -> State(conn, err) {
   case queue.first(state.queue) {
-    Ok(#(sent, waiting)) if now - sent > timeout -> {
-      let assert Ok(Nil) = queue.delete(state.queue, sent)
+    Ok(#(key, waiting)) if now - waiting.sent_at > timeout -> {
+      let assert Ok(Nil) = queue.delete(state.queue, key)
 
       drop_waiter(waiting)
 
       state
       |> dequeue_slow(now, timeout, conn)
     }
-    Ok(#(sent, waiting)) -> {
-      let assert Ok(Nil) = queue.delete(state.queue, sent)
+    Ok(#(key, waiting)) -> {
+      let assert Ok(Nil) = queue.delete(state.queue, key)
 
-      let delay = now - sent
+      let delay = now - waiting.sent_at
       let state = case delay < state.delay {
         True -> State(..state, delay:)
         False -> state
@@ -903,15 +925,15 @@ fn do_poll(state: State(conn, err), last_sent: Int) -> State(conn, err) {
   let time = counter.next(state.counter)
 
   case queue.first(state.queue) {
-    Ok(#(sent, _)) if sent <= last_sent -> {
-      let delay = time - sent
+    Ok(#(key, waiting)) if key <= last_sent -> {
+      let delay = time - waiting.sent_at
 
       state
       |> codel_timeout(delay, time)
-      |> start_poll(sent)
+      |> start_poll(key)
     }
-    Ok(#(sent, _)) -> start_poll(state, sent)
-    _ -> start_poll(state, time)
+    Ok(#(key, _)) -> start_poll(state, key)
+    _ -> start_poll(state, last_sent)
   }
 }
 
@@ -941,8 +963,8 @@ fn poll_drop_slow(
   timeout: Int,
 ) -> State(conn, err) {
   case queue.first(state.queue) {
-    Ok(#(sent, waiting)) if now - sent > timeout -> {
-      let assert Ok(Nil) = queue.delete(state.queue, sent)
+    Ok(#(key, waiting)) if now - waiting.sent_at > timeout -> {
+      let assert Ok(Nil) = queue.delete(state.queue, key)
 
       drop_waiter(waiting)
 

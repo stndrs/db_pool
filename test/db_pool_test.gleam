@@ -1099,6 +1099,81 @@ pub fn pool_exit_abnormal_test() {
   assert process.is_alive(pid) == False
 }
 
+// Regression test: many callers enqueued in rapid succession used to be able
+// to collide on the queue's nanosecond timestamp key, making `queue.push`
+// return Error and crashing the whole pool actor via a `let assert`. The queue
+// now uses a strictly-unique key, so the pool must survive a burst of waiters
+// and eventually serve every one of them.
+pub fn many_waiters_enqueued_without_collision_test() {
+  let name = process.new_name("db_pool_test")
+
+  let pool =
+    db_pool.new()
+    |> db_pool.size(1)
+    |> db_pool.on_open(fn() { Ok(Nil) })
+    |> db_pool.on_close(fn(_) { Ok(Nil) })
+    |> db_pool.on_idle(fn(_) { Nil })
+    |> db_pool.on_active(fn(_) { Nil })
+
+  let assert Ok(started) = db_pool.start(pool, name, 200)
+  let pool = started.data
+  let pool_pid = started.pid
+
+  // Hold the single connection so every other caller must enqueue, then
+  // release it after a short delay so the queued waiters can be served.
+  process.spawn(fn() {
+    let assert Ok(Nil) = db_pool.checkout(pool, 1000, 30_000)
+    process.sleep(150)
+    db_pool.checkin(pool, Nil)
+  })
+
+  process.sleep(50)
+
+  // Flood the pool with waiters with no sleeps between spawns, so their
+  // enqueue messages are processed back-to-back by the actor.
+  let results = process.new_subject()
+  let count = 50
+  list.repeat(Nil, count)
+  |> list.each(fn(_) {
+    process.spawn(fn() {
+      let res = db_pool.checkout(pool, 2000, 30_000)
+      case res {
+        Ok(Nil) -> db_pool.checkin(pool, Nil)
+        Error(_) -> Nil
+      }
+      process.send(results, res)
+    })
+  })
+
+  // Let all waiters enqueue while the holder still owns the connection.
+  process.sleep(50)
+  assert process.is_alive(pool_pid) == True
+
+  // Every waiter should eventually get served (the connection is recycled
+  // through the queue) without the pool crashing.
+  let collected = collect_all(results, [], count)
+  assert list.length(collected) == count
+  assert list.all(collected, fn(r) { r == Ok(Nil) })
+  assert process.is_alive(pool_pid) == True
+
+  let assert Ok(_) = db_pool.shutdown(pool, 200)
+}
+
+fn collect_all(
+  collector: process.Subject(Result(Nil, db_pool.PoolError(err))),
+  acc: List(Result(Nil, db_pool.PoolError(err))),
+  remaining: Int,
+) -> List(Result(Nil, db_pool.PoolError(err))) {
+  case remaining {
+    0 -> acc
+    _ ->
+      case process.receive(collector, 2000) {
+        Ok(result) -> collect_all(collector, [result, ..acc], remaining - 1)
+        Error(Nil) -> acc
+      }
+  }
+}
+
 fn collect_results(
   collector: process.Subject(Result(Nil, db_pool.PoolError(err))),
   acc: List(Result(Nil, db_pool.PoolError(err))),
