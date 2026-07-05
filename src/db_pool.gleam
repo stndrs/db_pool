@@ -1,8 +1,5 @@
 import gleam/bool
 import gleam/dict.{type Dict}
-import gleam/dynamic.{type Dynamic}
-import gleam/dynamic/decode
-import gleam/erlang/atom
 import gleam/erlang/process.{type Pid, type Subject}
 import gleam/int
 import gleam/list
@@ -145,8 +142,7 @@ type Waiting(conn, err) {
     client: Subject(Result(conn, err)),
     deadline: Int,
     // The real monotonic nanosecond timestamp at which this caller was
-    // enqueued. CoDel delay math uses this value, not the queue key. The
-    // queue key is a strictly-unique integer with no time meaning.
+    // enqueued.
     sent_at: Int,
   )
 }
@@ -214,7 +210,7 @@ pub fn start(
 ///
 /// The `timeout` parameter is used for both the actor initialisation
 /// timeout and the supervisor's shutdown timeout. The restart strategy
-/// is set to `Transient` — the pool is restarted only if it terminates
+/// is set to `Transient`, meaning the pool is restarted only if it terminates
 /// abnormally.
 pub fn supervised(
   pool: Pool(conn, err),
@@ -237,7 +233,7 @@ pub opaque type Message(conn, err) {
   CheckIn(caller: Pid, conn: conn)
   Timeout(time_sent: Int, timeout: Int)
   DeadlineExpired(caller: Pid, checkout_time: Int)
-  Poll(last_sent: Int)
+  Poll(last_queue_key: Int)
   PoolExit(process.ExitMessage)
   CallerDown(process.Down)
   Reconnect(backoff: Int)
@@ -410,11 +406,7 @@ fn initialise_pool(
     queue.new()
     |> queue.with_access(table.Private)
     // Use a strictly-unique, monotonically increasing counter for queue
-    // keys. `monotonic_time` can return the same value on consecutive calls,
-    // which would make `queue.push` fail on a key collision and crash the actor.
-    // Real elapsed-time measurements for CoDel
-    // use `state.counter` and the `sent_at` timestamp stored on each waiter,
-    // not the queue key.
+    // keys.
     |> queue.with_counter(counter.monotonic())
     |> queue.build
 
@@ -425,7 +417,7 @@ fn initialise_pool(
   // the token forward until a real waiter is enqueued, at which point it is
   // reseeded from an actual queue key. The seed value is therefore inert.
   let _poll_timer =
-    process.send_after(self, pool.queue_interval, Poll(last_sent: now))
+    process.send_after(self, pool.queue_interval, Poll(last_queue_key: now))
 
   let state =
     State(
@@ -486,9 +478,9 @@ fn handle_message(
       |> do_caller_down(pid)
       |> actor.continue
     }
-    Poll(last_sent:) -> {
+    Poll(last_queue_key:) -> {
       state
-      |> do_poll(last_sent)
+      |> do_poll(last_queue_key)
       |> actor.continue
     }
     Reconnect(backoff:) -> {
@@ -503,17 +495,12 @@ fn handle_message(
       drain_queue(state)
       let _ = close_active(state)
       close_idle(state)
+
       case exit.reason {
         process.Normal -> actor.stop()
         process.Killed -> actor.stop_abnormal("pool killed")
-        process.Abnormal(reason) ->
-          // A supervisor terminating a child sends an exit with reason
-          // `shutdown`. Treat that as a clean stop so graceful application
-          // shutdowns don't produce spurious `shutdown_error` reports.
-          case is_shutdown_reason(reason) {
-            True -> actor.stop()
-            False -> actor.stop_abnormal("pool stopped abnormally")
-          }
+        process.Abnormal(_reason) ->
+          actor.stop_abnormal("pool stopped abnormally")
       }
     }
     Shutdown(client:) -> {
@@ -943,15 +930,11 @@ fn serve_waiter(
 
 // --- CoDel polling ---
 
-fn do_poll(state: State(conn, err), last_sent: Int) -> State(conn, err) {
-  // Read the clock now, when the message is handled, rather than trusting a
-  // predicted fire time. This keeps the logical clock aligned with real time
-  // and prevents actor mailbox delay from accumulating into queue-delay
-  // measurements (which matters most exactly when the pool is overloaded).
+fn do_poll(state: State(conn, err), last_queue_key: Int) -> State(conn, err) {
   let time = counter.next(state.counter)
 
   case queue.first(state.queue) {
-    Ok(#(key, waiting)) if key <= last_sent -> {
+    Ok(#(key, waiting)) if key <= last_queue_key -> {
       let delay = time - waiting.sent_at
 
       state
@@ -959,7 +942,7 @@ fn do_poll(state: State(conn, err), last_sent: Int) -> State(conn, err) {
       |> start_poll(key)
     }
     Ok(#(key, _)) -> start_poll(state, key)
-    _ -> start_poll(state, last_sent)
+    _ -> start_poll(state, last_queue_key)
   }
 }
 
@@ -994,19 +977,18 @@ fn poll_drop_slow(
 
       drop_waiter(waiting)
 
-      state
-      |> poll_drop_slow(now, timeout)
+      poll_drop_slow(state, now, timeout)
     }
     _ -> state
   }
 }
 
-fn start_poll(state: State(conn, err), last_sent: Int) -> State(conn, err) {
+fn start_poll(state: State(conn, err), last_queue_key: Int) -> State(conn, err) {
   let _timer =
     process.send_after(
       state.self,
       state.queue_interval / ns_per_ms,
-      Poll(last_sent:),
+      Poll(last_queue_key:),
     )
 
   state
@@ -1014,42 +996,29 @@ fn start_poll(state: State(conn, err), last_sent: Int) -> State(conn, err) {
 
 // --- Helpers ---
 
-// Returns True when an `Abnormal` exit reason is the `shutdown` atom (or a
-// `{shutdown, _}` tuple), which is how a supervisor signals a normal child
-// termination. These should not be reported as abnormal exits.
-fn is_shutdown_reason(reason: Dynamic) -> Bool {
-  let shutdown = atom.create("shutdown")
-
-  case decode.run(reason, atom.decoder()) {
-    Ok(a) -> a == shutdown
-    _ ->
-      case decode.run(reason, decode.at([0], atom.decoder())) {
-        Ok(a) -> a == shutdown
-        _ -> False
-      }
-  }
-}
-
 fn drop_waiter(waiting: Waiting(conn, PoolError(err))) -> Nil {
   actor.send(waiting.client, Error(ConnectionUnavailable))
+
   process.demonitor_process(waiting.monitor)
 }
 
 fn drain_queue(state: State(conn, err)) -> Nil {
-  case queue.pop(state.queue) {
-    Ok(waiting) -> {
-      drop_waiter(waiting)
-      drain_queue(state)
-    }
-    _ -> Nil
-  }
+  queue.pop(state.queue)
+  |> result.map(fn(waiting) {
+    drop_waiter(waiting)
+    drain_queue(state)
+  })
+  |> result.unwrap(Nil)
 }
 
 fn close_active(state: State(conn, err)) -> Nil {
   dict.each(state.active, fn(_pid, active) {
     let _ = process.cancel_timer(active.deadline_timer)
+
     process.demonitor_process(active.monitor)
+
     let _ = state.handle_close(active.conn)
+
     Nil
   })
 }
@@ -1057,6 +1026,7 @@ fn close_active(state: State(conn, err)) -> Nil {
 fn close_idle(state: State(conn, err)) -> Nil {
   list.each(state.idle, fn(conn) {
     let _ = state.handle_close(conn)
+
     Nil
   })
 }
