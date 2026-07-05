@@ -6,6 +6,7 @@ import gleam/erlang/atom
 import gleam/erlang/process.{type Pid, type Subject}
 import gleam/int
 import gleam/list
+import gleam/option.{type Option, None, Some}
 import gleam/otp/actor
 import gleam/otp/supervision
 import gleam/result
@@ -193,10 +194,16 @@ pub fn start(
   pool: Pool(conn, err),
   name: process.Name(Message(conn, err)),
   timeout: Int,
+  error_to_string: Option(fn(err) -> String),
 ) -> Result(actor.Started(Subject(Message(conn, err))), actor.StartError) {
   let counter = counter.monotonic_time(monotonic.Nanosecond)
 
-  actor.new_with_initialiser(timeout, initialise_pool(_, pool, counter))
+  actor.new_with_initialiser(timeout, initialise_pool(
+    _,
+    pool,
+    counter,
+    error_to_string,
+  ))
   |> actor.on_message(handle_message)
   |> actor.named(name)
   |> actor.start
@@ -213,8 +220,9 @@ pub fn supervised(
   pool: Pool(conn, err),
   name: process.Name(Message(conn, err)),
   timeout: Int,
+  error_to_string: Option(fn(err) -> String),
 ) -> supervision.ChildSpecification(Subject(Message(conn, err))) {
-  supervision.worker(fn() { start(pool, name, timeout) })
+  supervision.worker(fn() { start(pool, name, timeout, error_to_string) })
   |> supervision.timeout(timeout)
   |> supervision.restart(supervision.Transient)
 }
@@ -355,6 +363,7 @@ fn initialise_pool(
   self: Subject(Message(conn, err)),
   pool: Pool(conn, err),
   counter: counter.Counter,
+  error_to_string: Option(fn(err) -> String),
 ) -> Result(
   actor.Initialised(
     State(conn, err),
@@ -374,7 +383,24 @@ fn initialise_pool(
   let connections =
     list.repeat("", pool.size)
     |> list.try_map(fn(_) { pool.handle_open() })
-    |> result.map_error(fn(_) { "(db_pool) Failed to open connections" })
+    |> result.map_error(fn(pool_error) {
+      let err_string = case pool_error {
+        ConnectionError(err) -> {
+          case error_to_string {
+            Some(to_string) -> "ConnectionError: " <> to_string(err)
+            None -> "ConnectionError"
+          }
+        }
+        ConnectionTimeout -> "ConnectionTimeout"
+        ConnectionUnavailable -> "ConnectionUnavailable"
+      }
+
+      let error_message = "(db_pool) " <> err_string
+
+      logging.log(logging.Error, error_message)
+
+      error_message
+    })
 
   use conns <- result.map(connections)
 
@@ -385,8 +411,8 @@ fn initialise_pool(
     |> queue.with_access(table.Private)
     // Use a strictly-unique, monotonically increasing counter for queue
     // keys. `monotonic_time` can return the same value on consecutive calls,
-    // which would make `queue.push` (backed by `insert_new`) fail on a key
-    // collision and crash the actor. Real elapsed-time measurements for CoDel
+    // which would make `queue.push` fail on a key collision and crash the actor.
+    // Real elapsed-time measurements for CoDel
     // use `state.counter` and the `sent_at` timestamp stored on each waiter,
     // not the queue key.
     |> queue.with_counter(counter.monotonic())
