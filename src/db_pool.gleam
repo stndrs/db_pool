@@ -412,10 +412,6 @@ fn initialise_pool(
 
   let now = counter.next(counter)
 
-  // `last_sent` is a queue-key-space token, not a timestamp. The pool starts
-  // with an empty queue, so this first poll takes the empty branch and carries
-  // the token forward until a real waiter is enqueued, at which point it is
-  // reseeded from an actual queue key. The seed value is therefore inert.
   let _poll_timer =
     process.send_after(self, pool.queue_interval, Poll(last_queue_key: now))
 
@@ -488,12 +484,9 @@ fn handle_message(
       |> do_reconnect(backoff)
       |> actor.continue
     }
-    // Note: Poll, Reconnect, and deadline timers are not explicitly
-    // cancelled on exit/shutdown. Their messages are silently dropped once the
-    // actor stops and the subject becomes unreachable.
     PoolExit(exit) -> {
       drain_queue(state)
-      let _ = close_active(state)
+      close_active(state)
       close_idle(state)
 
       case exit.reason {
@@ -505,8 +498,9 @@ fn handle_message(
     }
     Shutdown(client:) -> {
       drain_queue(state)
-      let _ = close_active(state)
+      close_active(state)
       close_idle(state)
+
       actor.send(client, Ok(Nil))
       actor.stop()
     }
@@ -524,7 +518,7 @@ fn do_checkout(
 ) -> Result(State(conn, err), Nil) {
   case dict.get(state.active, caller) {
     Ok(active) -> {
-      // Subsequent checkouts: return the same connection. The original
+      // Subsequent checkouts return the same connection. The original
       // deadline is preserved as callers cannot extend their deadline
       // by checking out again. A single process is limited to one
       // connection at a time. The checkout depth is tracked so the
@@ -591,16 +585,11 @@ fn do_checkin(
       }
 
       case prev.depth > 1 {
-        // Nested checkout still outstanding: decrement and keep the
-        // connection checked out. Don't touch the deadline timer or
-        // monitor.
         True -> {
           let active =
-            dict.insert(
-              state.active,
-              caller,
-              Active(..prev, depth: prev.depth - 1),
-            )
+            state.active
+            |> dict.insert(caller, Active(..prev, depth: prev.depth - 1))
+
           State(..state, active:)
         }
         False -> {
@@ -631,7 +620,7 @@ fn do_enqueue(
 
   // The queue counter is strictly unique, so `push` never fails on a key
   // collision here. We still pattern-match defensively rather than crash the
-  // whole pool: on the impossible-Error path we drop this single caller with
+  // whole pool. On the impossible-Error path we drop this single caller with
   // `ConnectionUnavailable` and tear down its monitor instead of taking down
   // every connection and waiter.
   case queue.push(state.queue, waiting) {
@@ -682,9 +671,8 @@ fn do_expire(
 /// Called when a caller process dies while holding a connection or waiting.
 /// If the caller held an active connection, the connection is closed and
 /// replaced. If the caller was waiting in the queue, the entry is cleaned
-/// up lazily: `serve_waiter` checks `process.is_alive` at dequeue time,
-/// and `do_expire` removes entries when their timeout fires. The queue is
-/// keyed by timestamp, so there is no efficient PID-based removal.
+/// up lazily. `serve_waiter` checks `process.is_alive` at dequeue time,
+/// and `do_expire` removes entries when their timeout fires.
 fn do_caller_down(state: State(conn, err), pid: Pid) -> State(conn, err) {
   case dict.get(state.active, pid) {
     Ok(prev) -> {
@@ -713,7 +701,7 @@ fn do_caller_down(state: State(conn, err), pid: Pid) -> State(conn, err) {
 }
 
 // Called when a deadline timer fires. The connection is closed and the
-// caller is removed from active, but the caller process is NOT killed
+// caller is removed from active, but the caller process is not killed
 // or notified. The caller still holds a reference to the now-closed connection
 // and will discover it is dead on their next operation. The deadline is
 // a hard cutoff and the pool must reclaim connections from overrunning
@@ -756,11 +744,8 @@ fn do_deadline_expired(
 /// Called when a reconnect timer fires. Attempts to open a replacement
 /// connection. On success, the connection is fed through CoDel to serve
 /// a waiter or return to idle. On failure, another reconnect is scheduled
-/// with increased backoff (randomized exponential, capped at 30s).
+/// with increased backoff.
 fn do_reconnect(state: State(conn, err), backoff: Int) -> State(conn, err) {
-  // Enforce the pool's capacity rather than relying on the invariant that
-  // exactly one reconnect chain exists per lost connection. If we are
-  // already at capacity, drop this replacement attempt.
   use <- bool.guard(when: state.current_size >= state.max_size, return: state)
 
   case state.handle_open() {
@@ -951,9 +936,6 @@ fn codel_timeout(
   delay: Int,
   time: Int,
 ) -> State(conn, err) {
-  // Only evaluate at interval boundaries. Anchor the next boundary to the
-  // previous one (not to the handler time) so the measurement cadence stays
-  // fixed and doesn't drift later as polls are handled slightly late.
   use <- bool.guard(when: time < state.next, return: state)
 
   let next = state.next + state.queue_interval
@@ -983,7 +965,10 @@ fn poll_drop_slow(
   }
 }
 
-fn start_poll(state: State(conn, err), last_queue_key: Int) -> State(conn, err) {
+fn start_poll(
+  state: State(conn, err),
+  last_queue_key: Int,
+) -> State(conn, err) {
   let _timer =
     process.send_after(
       state.self,

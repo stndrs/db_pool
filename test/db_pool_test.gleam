@@ -283,8 +283,6 @@ pub fn clamp_negative_timeout_deadline_test() {
 pub fn clamp_size_and_interval_test() {
   let name = process.new_name("db_pool_test")
 
-  // size(0) clamps to 1 and queue_interval(0) clamps to 1ms (no busy spin /
-  // init crash). The pool must still start and serve a checkout.
   let new_pool =
     db_pool.new()
     |> db_pool.size(0)
@@ -301,7 +299,6 @@ pub fn clamp_size_and_interval_test() {
   let assert Ok(Nil) = db_pool.checkout(pool, 200, 30_000)
   db_pool.checkin(pool, Nil)
 
-  // Still responsive after letting the (now 1ms) poll loop run a while.
   process.sleep(20)
   let assert Ok(Nil) = db_pool.checkout(pool, 200, 30_000)
   db_pool.checkin(pool, Nil)
@@ -323,14 +320,11 @@ pub fn shutdown_reason_treated_as_normal_test() {
   let assert Ok(started) = db_pool.start(new_pool, name, 200, None)
   let pid = started.pid
 
-  // A supervisor signals a normal child stop with the `shutdown` reason.
-  // The pool traps exits, handles it, runs cleanup, and stops. (Reason
-  // discrimination — clean vs abnormal — is enforced in `handle_message`'s
-  // PoolExit arm via `is_shutdown_reason`.)
   process.send_abnormal_exit(pid, atom.create("shutdown"))
 
   // The pool should terminate.
   wait_for_exit(pid, 500)
+
   assert !process.is_alive(pid)
 }
 
@@ -759,7 +753,7 @@ pub fn codel_drops_slow_waiters_test() {
 
 /// The CoDel poll loop alone (no checkin happening) drops slow waiters once
 /// the queue delay stays above target for a measurement interval. This
-/// exercises the poll path specifically: the connection is never returned,
+/// exercises the poll path specifically. The connection is never returned,
 /// so the only mechanism that can drop waiters is the periodic Poll.
 pub fn codel_poll_drops_slow_waiters_test() {
   let name = process.new_name("db_pool_test")
@@ -780,8 +774,9 @@ pub fn codel_poll_drops_slow_waiters_test() {
   // Exhaust the only connection and never return it.
   let assert Ok(Nil) = db_pool.checkout(pool, 200, 30_000)
 
-  // Spawn 5 waiters that will queue and never be served (no checkin).
+  // Spawn 5 waiters that will queue and never be checked in.
   let collector = process.new_subject()
+
   list.repeat(Nil, 5)
   |> list.each(fn(_) {
     process.spawn(fn() {
@@ -791,14 +786,15 @@ pub fn codel_poll_drops_slow_waiters_test() {
   })
 
   // Let several poll intervals elapse so CoDel enters slow mode and the poll
-  // loop drops the stale waiters — all without any checkin occurring.
+  // loop drops the stale waiters. All without any checkin occurring.
   process.sleep(250)
 
   let results = collect_results(collector, [])
 
   let dropped =
     list.filter(results, fn(r) { r == Error(db_pool.ConnectionUnavailable) })
-  assert list.length(dropped) >= 1
+
+  assert list.length(dropped) == 5
 
   let assert Ok(_) = db_pool.shutdown(pool, 200)
 }
@@ -902,7 +898,7 @@ pub fn reconnect_after_failed_replacement_test() {
 
 /// The pool never opens more connections than `max_size`, even across
 /// repeated reconnects from caller crashes. We track live connections
-/// (opens minus closes) and assert it stays within capacity.
+/// and assert it stays within capacity.
 pub fn reconnect_respects_max_size_test() {
   let opens = atomic.new()
   let closes = atomic.new()
@@ -974,7 +970,6 @@ pub fn shutdown_drains_waiters_test() {
   // Give time for the waiter to enqueue
   process.sleep(50)
 
-  // Shut down the pool -- the waiter should be drained
   let assert Ok(_) = db_pool.shutdown(pool, 200)
 
   // The waiting caller should have received ConnectionUnavailable
@@ -1120,11 +1115,11 @@ pub fn pool_exit_abnormal_test() {
   assert process.is_alive(pid) == False
 }
 
-// Regression test: many callers enqueued in rapid succession used to be able
-// to collide on the queue's nanosecond timestamp key, making `queue.push`
-// return Error and crashing the whole pool actor via a `let assert`. The queue
-// now uses a strictly-unique key, so the pool must survive a burst of waiters
-// and eventually serve every one of them.
+// Many callers enqueued in rapid succession used to be able to collide on the
+// queue's nanosecond timestamp key, making `queue.push` return Error and
+// crashing the whole pool actor via a `let assert`.
+// The queue now uses a strictly-unique key, so the pool must survive a burst
+// of waiters and eventually serve every one of them.
 pub fn many_waiters_enqueued_without_collision_test() {
   let name = process.new_name("db_pool_test")
 
@@ -1154,6 +1149,7 @@ pub fn many_waiters_enqueued_without_collision_test() {
   // enqueue messages are processed back-to-back by the actor.
   let results = process.new_subject()
   let count = 50
+
   list.repeat(Nil, count)
   |> list.each(fn(_) {
     process.spawn(fn() {
@@ -1170,9 +1166,9 @@ pub fn many_waiters_enqueued_without_collision_test() {
   process.sleep(50)
   assert process.is_alive(pool_pid) == True
 
-  // Every waiter should eventually get served (the connection is recycled
-  // through the queue) without the pool crashing.
+  // Every waiter should eventually get served without the pool crashing.
   let collected = collect_all(results, [], count)
+
   assert list.length(collected) == count
   assert list.all(collected, fn(r) { r == Ok(Nil) })
   assert process.is_alive(pool_pid) == True
