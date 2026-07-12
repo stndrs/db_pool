@@ -2,11 +2,12 @@ import gleam/bool
 import gleam/dict.{type Dict}
 import gleam/erlang/process.{type Pid, type Subject}
 import gleam/int
-import gleam/io
 import gleam/list
+import gleam/option.{type Option, None, Some}
 import gleam/otp/actor
 import gleam/otp/supervision
 import gleam/result
+import logging
 import rasa/counter
 import rasa/monotonic
 import rasa/queue.{type Queue}
@@ -66,7 +67,8 @@ pub fn new() -> Pool(conn, err) {
 /// Sets the size of the pool. At startup the pool will create `size`
 /// number of connections.
 pub fn size(pool: Pool(conn, err), size: Int) -> Pool(conn, err) {
-  Pool(..pool, size:)
+  // A pool must have at least one connection to be able to serve callers.
+  Pool(..pool, size: int.max(size, 1))
 }
 
 /// Sets the `Pool`'s `on_open` function. The provided function will be
@@ -119,14 +121,16 @@ pub fn on_active(
 /// acceptable queue delay before the pool considers itself overloaded.
 /// Defaults to 50ms.
 pub fn queue_target(pool: Pool(conn, err), target: Int) -> Pool(conn, err) {
-  Pool(..pool, queue_target: target)
+  Pool(..pool, queue_target: int.max(target, 0))
 }
 
 /// Sets the CoDel queue interval in milliseconds. This is the length
 /// of each CoDel measurement interval. The pool evaluates queue health
 /// at each interval boundary. Defaults to 1000ms.
 pub fn queue_interval(pool: Pool(conn, err), interval: Int) -> Pool(conn, err) {
-  Pool(..pool, queue_interval: interval)
+  // Clamp to a 1ms floor: a 0ms interval would busy-spin the poll loop and a
+  // negative interval would crash `send_after` during initialisation.
+  Pool(..pool, queue_interval: int.max(interval, 1))
 }
 
 // --- Internal types ---
@@ -137,6 +141,9 @@ type Waiting(conn, err) {
     monitor: process.Monitor,
     client: Subject(Result(conn, err)),
     deadline: Int,
+    // The real monotonic nanosecond timestamp at which this caller was
+    // enqueued.
+    sent_at: Int,
   )
 }
 
@@ -146,6 +153,7 @@ type Active(conn) {
     monitor: process.Monitor,
     deadline_timer: process.Timer,
     checkout_time: Int,
+    depth: Int,
   )
 }
 
@@ -182,10 +190,16 @@ pub fn start(
   pool: Pool(conn, err),
   name: process.Name(Message(conn, err)),
   timeout: Int,
+  error_to_string: Option(fn(err) -> String),
 ) -> Result(actor.Started(Subject(Message(conn, err))), actor.StartError) {
   let counter = counter.monotonic_time(monotonic.Nanosecond)
 
-  actor.new_with_initialiser(timeout, initialise_pool(_, pool, counter))
+  actor.new_with_initialiser(timeout, initialise_pool(
+    _,
+    pool,
+    counter,
+    error_to_string,
+  ))
   |> actor.on_message(handle_message)
   |> actor.named(name)
   |> actor.start
@@ -196,14 +210,15 @@ pub fn start(
 ///
 /// The `timeout` parameter is used for both the actor initialisation
 /// timeout and the supervisor's shutdown timeout. The restart strategy
-/// is set to `Transient` — the pool is restarted only if it terminates
+/// is set to `Transient`, meaning the pool is restarted only if it terminates
 /// abnormally.
 pub fn supervised(
   pool: Pool(conn, err),
   name: process.Name(Message(conn, err)),
   timeout: Int,
+  error_to_string: Option(fn(err) -> String),
 ) -> supervision.ChildSpecification(Subject(Message(conn, err))) {
-  supervision.worker(fn() { start(pool, name, timeout) })
+  supervision.worker(fn() { start(pool, name, timeout, error_to_string) })
   |> supervision.timeout(timeout)
   |> supervision.restart(supervision.Transient)
 }
@@ -218,7 +233,7 @@ pub opaque type Message(conn, err) {
   CheckIn(caller: Pid, conn: conn)
   Timeout(time_sent: Int, timeout: Int)
   DeadlineExpired(caller: Pid, checkout_time: Int)
-  Poll(time: Int, last_sent: Int)
+  Poll(last_queue_key: Int)
   PoolExit(process.ExitMessage)
   CallerDown(process.Down)
   Reconnect(backoff: Int)
@@ -233,8 +248,8 @@ const client_timeout_buffer_ms = 5000
 
 /// Checks out a connection from the pool.
 ///
-/// The `caller` should be `process.self()` of the calling process. The
-/// pool monitors this process and reclaims the connection if it crashes.
+/// The connection is associated with the calling process (`process.self()`).
+/// The pool monitors this process and reclaims the connection if it crashes.
 ///
 /// If a connection is available it is returned immediately. If all
 /// connections are in use the caller is added to a FIFO queue and will
@@ -253,10 +268,19 @@ const client_timeout_buffer_ms = 5000
 /// Panics if the pool actor is unreachable.
 pub fn checkout(
   pool: Subject(Message(conn, err)),
-  caller: Pid,
   timeout: Int,
   deadline: Int,
 ) -> Result(conn, PoolError(err)) {
+  // The caller is always the calling process: `process.call` replies to it
+  // anyway, and deriving it here keeps the monitor, re-entrancy key, and
+  // reclaim logic attached to the right process.
+  let caller = process.self()
+
+  // Clamp so negative values can't crash the shared pool actor's internal
+  // `send_after` calls (badarg) and take down every other caller.
+  let timeout = int.max(timeout, 0)
+  let deadline = int.max(deadline, 0)
+
   process.call(pool, timeout + client_timeout_buffer_ms, CheckOut(
     _,
     caller:,
@@ -268,14 +292,10 @@ pub fn checkout(
 /// Returns a connection back to the pool.
 ///
 /// Expects the `conn` value to be the same connection that was originally
-/// checked out, and `caller` should be the `Pid` that checked it out.
-/// If the caller has no active connection the checkin is silently
-/// ignored.
-pub fn checkin(
-  pool: Subject(Message(conn, err)),
-  conn: conn,
-  caller: Pid,
-) -> Nil {
+/// checked out by the calling process. If the calling process has no active
+/// connection the checkin is silently ignored.
+pub fn checkin(pool: Subject(Message(conn, err)), conn: conn) -> Nil {
+  let caller = process.self()
   process.send(pool, CheckIn(caller:, conn:))
 }
 
@@ -295,6 +315,11 @@ pub fn with_connection(
   next: fn(conn) -> t,
 ) -> Result(t, PoolError(err)) {
   let caller = process.self()
+
+  // Clamp so negative values can't crash the shared pool actor's internal
+  // `send_after` calls (badarg) and take down every other caller.
+  let timeout = int.max(timeout, 0)
+  let deadline = int.max(deadline, 0)
 
   process.call(pool, timeout + client_timeout_buffer_ms, CheckOut(
     _,
@@ -334,6 +359,7 @@ fn initialise_pool(
   self: Subject(Message(conn, err)),
   pool: Pool(conn, err),
   counter: counter.Counter,
+  error_to_string: Option(fn(err) -> String),
 ) -> Result(
   actor.Initialised(
     State(conn, err),
@@ -353,7 +379,24 @@ fn initialise_pool(
   let connections =
     list.repeat("", pool.size)
     |> list.try_map(fn(_) { pool.handle_open() })
-    |> result.map_error(fn(_) { "(db_pool) Failed to open connections" })
+    |> result.map_error(fn(pool_error) {
+      let err_string = case pool_error {
+        ConnectionError(err) -> {
+          case error_to_string {
+            Some(to_string) -> "ConnectionError: " <> to_string(err)
+            None -> "ConnectionError"
+          }
+        }
+        ConnectionTimeout -> "ConnectionTimeout"
+        ConnectionUnavailable -> "ConnectionUnavailable"
+      }
+
+      let error_message = "(db_pool) " <> err_string
+
+      logging.log(logging.Error, error_message)
+
+      error_message
+    })
 
   use conns <- result.map(connections)
 
@@ -362,17 +405,15 @@ fn initialise_pool(
   let q =
     queue.new()
     |> queue.with_access(table.Private)
-    |> queue.with_counter(counter)
+    // Use a strictly-unique, monotonically increasing counter for queue
+    // keys.
+    |> queue.with_counter(counter.monotonic())
     |> queue.build
 
   let now = counter.next(counter)
 
   let _poll_timer =
-    process.send_after(
-      self,
-      pool.queue_interval,
-      Poll(time: now, last_sent: now),
-    )
+    process.send_after(self, pool.queue_interval, Poll(last_queue_key: now))
 
   let state =
     State(
@@ -433,9 +474,9 @@ fn handle_message(
       |> do_caller_down(pid)
       |> actor.continue
     }
-    Poll(time:, last_sent:) -> {
+    Poll(last_queue_key:) -> {
       state
-      |> do_poll(time, last_sent)
+      |> do_poll(last_queue_key)
       |> actor.continue
     }
     Reconnect(backoff:) -> {
@@ -443,13 +484,11 @@ fn handle_message(
       |> do_reconnect(backoff)
       |> actor.continue
     }
-    // Note: Poll, Reconnect, and deadline timers are not explicitly
-    // cancelled on exit/shutdown. Their messages are silently dropped once the
-    // actor stops and the subject becomes unreachable.
     PoolExit(exit) -> {
       drain_queue(state)
-      let _ = close_active(state)
+      close_active(state)
       close_idle(state)
+
       case exit.reason {
         process.Normal -> actor.stop()
         process.Killed -> actor.stop_abnormal("pool killed")
@@ -459,8 +498,9 @@ fn handle_message(
     }
     Shutdown(client:) -> {
       drain_queue(state)
-      let _ = close_active(state)
+      close_active(state)
       close_idle(state)
+
       actor.send(client, Ok(Nil))
       actor.stop()
     }
@@ -478,12 +518,17 @@ fn do_checkout(
 ) -> Result(State(conn, err), Nil) {
   case dict.get(state.active, caller) {
     Ok(active) -> {
-      // Subsequent checkouts: return the same connection. The original
+      // Subsequent checkouts return the same connection. The original
       // deadline is preserved as callers cannot extend their deadline
       // by checking out again. A single process is limited to one
-      // connection at a time.
+      // connection at a time. The checkout depth is tracked so the
+      // connection is only released once every nested checkout has
+      // checked in.
+      let active = Active(..active, depth: active.depth + 1)
+      let active_dict = dict.insert(state.active, caller, active)
+
       actor.send(client, Ok(active.conn))
-      Ok(state)
+      Ok(State(..state, active: active_dict))
     }
     _ -> {
       case state.idle {
@@ -499,7 +544,13 @@ fn do_checkout(
             )
 
           let activated =
-            Active(conn:, monitor:, deadline_timer:, checkout_time: now)
+            Active(
+              conn:,
+              monitor:,
+              deadline_timer:,
+              checkout_time: now,
+              depth: 1,
+            )
 
           let active = dict.insert(state.active, caller, activated)
 
@@ -529,17 +580,28 @@ fn do_checkin(
         True -> Nil
         False -> {
           "(db_pool) unexpected connection checked in for the current process"
-          |> io.println_error
+          |> logging.log(logging.Warning, _)
         }
       }
 
-      let _ = process.cancel_timer(prev.deadline_timer)
-      process.demonitor_process(prev.monitor)
-      let active = dict.delete(state.active, caller)
-      let state = State(..state, active:)
+      case prev.depth > 1 {
+        True -> {
+          let active =
+            state.active
+            |> dict.insert(caller, Active(..prev, depth: prev.depth - 1))
 
-      let now = counter.next(state.counter)
-      codel_dequeue(state, now, prev.conn)
+          State(..state, active:)
+        }
+        False -> {
+          let _ = process.cancel_timer(prev.deadline_timer)
+          process.demonitor_process(prev.monitor)
+          let active = dict.delete(state.active, caller)
+          let state = State(..state, active:)
+
+          let now = counter.next(state.counter)
+          codel_dequeue(state, now, prev.conn)
+        }
+      }
     }
     _ -> state
   }
@@ -553,41 +615,49 @@ fn do_enqueue(
   deadline: Int,
 ) -> State(conn, err) {
   let monitor = process.monitor(caller)
-  let waiting = Waiting(caller:, monitor:, client:, deadline:)
+  let sent_at = counter.next(state.counter)
+  let waiting = Waiting(caller:, monitor:, client:, deadline:, sent_at:)
 
-  // Shouldn't fail since enqueueing is done via the actor's message queue.
-  // It shouldn't be possible for two waiters to be pushed at the same time.
-  let assert Ok(sent_at) = queue.push(state.queue, waiting)
-
-  let _timer =
-    process.send_after(state.self, timeout, Timeout(sent_at, timeout))
-
-  state
+  // The queue counter is strictly unique, so `push` never fails on a key
+  // collision here. We still pattern-match defensively rather than crash the
+  // whole pool. On the impossible-Error path we drop this single caller with
+  // `ConnectionUnavailable` and tear down its monitor instead of taking down
+  // every connection and waiter.
+  case queue.push(state.queue, waiting) {
+    Ok(key) -> {
+      let _timer =
+        process.send_after(state.self, timeout, Timeout(key, timeout))
+      state
+    }
+    Error(Nil) -> {
+      actor.send(client, Error(ConnectionUnavailable))
+      process.demonitor_process(monitor)
+      state
+    }
+  }
 }
 
 fn do_expire(
   state: State(conn, err),
-  sent: Int,
+  key: Int,
   timeout: Int,
 ) -> State(conn, err) {
-  queue.at(state.queue, sent)
+  queue.at(state.queue, key)
   |> result.map(fn(waiting) {
     let now = counter.next(state.counter)
+    let expires_at = waiting.sent_at + timeout * ns_per_ms
 
-    use <- bool.lazy_guard(
-      when: { now < { sent + timeout * ns_per_ms } },
-      return: fn() {
-        let remaining_ns = sent + timeout * ns_per_ms - now
-        let remaining_ms = remaining_ns / ns_per_ms
+    use <- bool.lazy_guard(when: now < expires_at, return: fn() {
+      let remaining_ns = expires_at - now
+      let remaining_ms = remaining_ns / ns_per_ms
 
-        let _timer =
-          process.send_after(state.self, remaining_ms, Timeout(sent, timeout))
+      let _timer =
+        process.send_after(state.self, remaining_ms, Timeout(key, timeout))
 
-        state
-      },
-    )
+      state
+    })
 
-    let assert Ok(Nil) = queue.delete(state.queue, sent)
+    let assert Ok(Nil) = queue.delete(state.queue, key)
 
     actor.send(waiting.client, Error(ConnectionTimeout))
 
@@ -601,9 +671,8 @@ fn do_expire(
 /// Called when a caller process dies while holding a connection or waiting.
 /// If the caller held an active connection, the connection is closed and
 /// replaced. If the caller was waiting in the queue, the entry is cleaned
-/// up lazily: `serve_waiter` checks `process.is_alive` at dequeue time,
-/// and `do_expire` removes entries when their timeout fires. The queue is
-/// keyed by timestamp, so there is no efficient PID-based removal.
+/// up lazily. `serve_waiter` checks `process.is_alive` at dequeue time,
+/// and `do_expire` removes entries when their timeout fires.
 fn do_caller_down(state: State(conn, err), pid: Pid) -> State(conn, err) {
   case dict.get(state.active, pid) {
     Ok(prev) -> {
@@ -632,7 +701,7 @@ fn do_caller_down(state: State(conn, err), pid: Pid) -> State(conn, err) {
 }
 
 // Called when a deadline timer fires. The connection is closed and the
-// caller is removed from active, but the caller process is NOT killed
+// caller is removed from active, but the caller process is not killed
 // or notified. The caller still holds a reference to the now-closed connection
 // and will discover it is dead on their next operation. The deadline is
 // a hard cutoff and the pool must reclaim connections from overrunning
@@ -675,8 +744,10 @@ fn do_deadline_expired(
 /// Called when a reconnect timer fires. Attempts to open a replacement
 /// connection. On success, the connection is fed through CoDel to serve
 /// a waiter or return to idle. On failure, another reconnect is scheduled
-/// with increased backoff (randomized exponential, capped at 30s).
+/// with increased backoff.
 fn do_reconnect(state: State(conn, err), backoff: Int) -> State(conn, err) {
+  use <- bool.guard(when: state.current_size >= state.max_size, return: state)
+
   case state.handle_open() {
     Ok(conn) -> {
       let state = State(..state, current_size: state.current_size + 1)
@@ -724,10 +795,10 @@ fn dequeue_first(
   let slow = state.delay > state.queue_target
 
   case queue.first(state.queue) {
-    Ok(#(sent, waiting)) -> {
-      let assert Ok(Nil) = queue.delete(state.queue, sent)
+    Ok(#(key, waiting)) -> {
+      let assert Ok(Nil) = queue.delete(state.queue, key)
 
-      let delay = now - sent
+      let delay = now - waiting.sent_at
       let state = State(..state, next:, delay:, slow:)
 
       serve_waiter(state, waiting, conn)
@@ -747,9 +818,9 @@ fn dequeue_fast(
   conn: conn,
 ) -> State(conn, err) {
   case queue.first(state.queue) {
-    Ok(#(sent, waiting)) -> {
-      let assert Ok(Nil) = queue.delete(state.queue, sent)
-      let delay = now - sent
+    Ok(#(key, waiting)) -> {
+      let assert Ok(Nil) = queue.delete(state.queue, key)
+      let delay = now - waiting.sent_at
       let state = case delay < state.delay {
         True -> State(..state, delay:)
         False -> state
@@ -773,18 +844,18 @@ fn dequeue_slow(
   conn: conn,
 ) -> State(conn, err) {
   case queue.first(state.queue) {
-    Ok(#(sent, waiting)) if now - sent > timeout -> {
-      let assert Ok(Nil) = queue.delete(state.queue, sent)
+    Ok(#(key, waiting)) if now - waiting.sent_at > timeout -> {
+      let assert Ok(Nil) = queue.delete(state.queue, key)
 
       drop_waiter(waiting)
 
       state
       |> dequeue_slow(now, timeout, conn)
     }
-    Ok(#(sent, waiting)) -> {
-      let assert Ok(Nil) = queue.delete(state.queue, sent)
+    Ok(#(key, waiting)) -> {
+      let assert Ok(Nil) = queue.delete(state.queue, key)
 
-      let delay = now - sent
+      let delay = now - waiting.sent_at
       let state = case delay < state.delay {
         True -> State(..state, delay:)
         False -> state
@@ -828,6 +899,7 @@ fn serve_waiter(
           monitor: waiting.monitor,
           deadline_timer:,
           checkout_time: now,
+          depth: 1,
         )
 
       let active = dict.insert(state.active, waiting.caller, activated)
@@ -843,21 +915,19 @@ fn serve_waiter(
 
 // --- CoDel polling ---
 
-fn do_poll(
-  state: State(conn, err),
-  time: Int,
-  last_sent: Int,
-) -> State(conn, err) {
+fn do_poll(state: State(conn, err), last_queue_key: Int) -> State(conn, err) {
+  let time = counter.next(state.counter)
+
   case queue.first(state.queue) {
-    Ok(#(sent, _)) if sent <= last_sent -> {
-      let delay = time - sent
+    Ok(#(key, waiting)) if key <= last_queue_key -> {
+      let delay = time - waiting.sent_at
 
       state
       |> codel_timeout(delay, time)
-      |> start_poll(time, sent)
+      |> start_poll(key)
     }
-    Ok(#(sent, _)) -> start_poll(state, time, sent)
-    _ -> start_poll(state, time, time)
+    Ok(#(key, _)) -> start_poll(state, key)
+    _ -> start_poll(state, last_queue_key)
   }
 }
 
@@ -866,14 +936,15 @@ fn codel_timeout(
   delay: Int,
   time: Int,
 ) -> State(conn, err) {
-  case time >= state.next, state.delay > state.queue_target {
-    True, True -> {
-      State(..state, slow: True, delay:, next: time + state.queue_interval)
+  use <- bool.guard(when: time < state.next, return: state)
+
+  let next = state.next + state.queue_interval
+
+  case state.delay > state.queue_target {
+    True ->
+      State(..state, slow: True, delay:, next:)
       |> poll_drop_slow(time, state.queue_target * 2)
-    }
-    True, False ->
-      State(..state, slow: False, delay:, next: time + state.queue_interval)
-    _, _ -> state
+    False -> State(..state, slow: False, delay:, next:)
   }
 }
 
@@ -883,13 +954,12 @@ fn poll_drop_slow(
   timeout: Int,
 ) -> State(conn, err) {
   case queue.first(state.queue) {
-    Ok(#(sent, waiting)) if now - sent > timeout -> {
-      let assert Ok(Nil) = queue.delete(state.queue, sent)
+    Ok(#(key, waiting)) if now - waiting.sent_at > timeout -> {
+      let assert Ok(Nil) = queue.delete(state.queue, key)
 
       drop_waiter(waiting)
 
-      state
-      |> poll_drop_slow(now, timeout)
+      poll_drop_slow(state, now, timeout)
     }
     _ -> state
   }
@@ -897,15 +967,13 @@ fn poll_drop_slow(
 
 fn start_poll(
   state: State(conn, err),
-  now: Int,
-  last_sent: Int,
+  last_queue_key: Int,
 ) -> State(conn, err) {
-  let poll_time = now + state.queue_interval
   let _timer =
     process.send_after(
       state.self,
       state.queue_interval / ns_per_ms,
-      Poll(poll_time, last_sent),
+      Poll(last_queue_key:),
     )
 
   state
@@ -915,24 +983,27 @@ fn start_poll(
 
 fn drop_waiter(waiting: Waiting(conn, PoolError(err))) -> Nil {
   actor.send(waiting.client, Error(ConnectionUnavailable))
+
   process.demonitor_process(waiting.monitor)
 }
 
 fn drain_queue(state: State(conn, err)) -> Nil {
-  case queue.pop(state.queue) {
-    Ok(waiting) -> {
-      drop_waiter(waiting)
-      drain_queue(state)
-    }
-    _ -> Nil
-  }
+  queue.pop(state.queue)
+  |> result.map(fn(waiting) {
+    drop_waiter(waiting)
+    drain_queue(state)
+  })
+  |> result.unwrap(Nil)
 }
 
 fn close_active(state: State(conn, err)) -> Nil {
   dict.each(state.active, fn(_pid, active) {
     let _ = process.cancel_timer(active.deadline_timer)
+
     process.demonitor_process(active.monitor)
+
     let _ = state.handle_close(active.conn)
+
     Nil
   })
 }
@@ -940,6 +1011,7 @@ fn close_active(state: State(conn, err)) -> Nil {
 fn close_idle(state: State(conn, err)) -> Nil {
   list.each(state.idle, fn(conn) {
     let _ = state.handle_close(conn)
+
     Nil
   })
 }

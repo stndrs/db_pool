@@ -4,6 +4,7 @@ import gleam/float
 import gleam/int
 import gleam/io
 import gleam/list
+import gleam/option.{None}
 import gleam/string
 import rasa/counter
 import rasa/monotonic
@@ -118,7 +119,7 @@ fn run_scenario(scenario: Scenario) -> Nil {
     |> db_pool.on_idle(fn(_) { Nil })
     |> db_pool.on_active(fn(_) { Nil })
 
-  let assert Ok(pool) = db_pool.start(pool, name, 5000)
+  let assert Ok(pool) = db_pool.start(pool, name, 5000, None)
 
   // Subject to collect samples from workers
   let collector = process.new_subject()
@@ -183,15 +184,8 @@ fn worker_loop(
   case now >= stop_time {
     True -> Nil
     False -> {
-      let self = process.self()
-
       let result =
-        db_pool.checkout(
-          pool,
-          self,
-          scenario.checkout_timeout,
-          scenario.deadline,
-        )
+        db_pool.checkout(pool, scenario.checkout_timeout, scenario.deadline)
 
       case result {
         Ok(conn) -> {
@@ -203,7 +197,7 @@ fn worker_loop(
             True -> process.sleep(scenario.hold_ms)
             False -> Nil
           }
-          db_pool.checkin(pool, conn, self)
+          db_pool.checkin(pool, conn)
 
           process.send(
             collector,
