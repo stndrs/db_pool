@@ -356,6 +356,7 @@ pub fn pool_grows_on_demand_test() {
   // report success then hold (without checking in) so all three are held
   // at once; shutdown reclaims the active connections.
   let collector = process.new_subject()
+
   list.repeat(Nil, 3)
   |> list.each(fn(_) {
     process.spawn(fn() {
@@ -554,11 +555,11 @@ pub fn opener_panic_does_not_leak_capacity_test() {
   })
   process.sleep(20)
 
-  // Make opens panic, then free A's connection: the replacement opener panics
-  // without delivering a result. If the pool leaked its in-flight slot it
-  // could never open again; instead it retries and, once opens recover,
-  // serves B.
+  // Make opens panic, then free A's connection. The replacement opener panics
+  // without delivering a result. The pool retries after the panic and after
+  // opening successfully, serves B.
   let assert Ok(Nil) = table.insert(flag, "mode", "panic")
+
   process.kill(caller_a)
   process.sleep(50)
 
@@ -567,7 +568,7 @@ pub fn opener_panic_does_not_leak_capacity_test() {
   let assert Ok(Ok(Nil)) = process.receive(result, 3000)
 
   let assert Ok(Nil) = table.drop(flag)
-  let assert Ok(_) = db_pool.shutdown(pool, 500)
+  let assert Ok(Nil) = db_pool.shutdown(pool, 500)
 }
 
 /// A burst of waiters never drives the live connection count above `size`,
@@ -575,11 +576,13 @@ pub fn opener_panic_does_not_leak_capacity_test() {
 pub fn capacity_invariant_under_burst_test() {
   let opens = atomic.new()
   let closes = atomic.new()
+  let size = 3
 
   let name = process.new_name("db_pool_test")
+
   let pool =
     db_pool.new()
-    |> db_pool.size(3)
+    |> db_pool.size(size)
     |> db_pool.max_idle_connections(1)
     |> db_pool.on_open(fn() {
       atomic.add(opens, 1)
@@ -595,7 +598,6 @@ pub fn capacity_invariant_under_burst_test() {
   let assert Ok(pool) = db_pool.start(pool, name, 200, None)
   let pool = pool.data
 
-  let collector = process.new_subject()
   let count = 20
 
   list.repeat(Nil, count)
@@ -608,20 +610,17 @@ pub fn capacity_invariant_under_burst_test() {
         }
         Error(_) -> Nil
       }
-      process.send(collector, Nil)
     })
   })
 
-  // Sample the live count (opened minus closed) repeatedly while the burst is
-  // in flight. It must never exceed `size`.
-  assert_live_within(opens, closes, 3, 40)
+  // Sample the live count repeatedly while the burst is in flight.
+  // It must never exceed `size`.
+  assert_expected_open_count(opens, closes, size, 40)
 
-  drain_dones(collector, count)
-
-  let assert Ok(_) = db_pool.shutdown(pool, 500)
+  let assert Ok(Nil) = db_pool.shutdown(pool, 500)
 }
 
-fn assert_live_within(
+fn assert_expected_open_count(
   opens: atomic.Atomic,
   closes: atomic.Atomic,
   max: Int,
@@ -631,20 +630,10 @@ fn assert_live_within(
     True -> Nil
     False -> {
       assert atomic.get(opens) - atomic.get(closes) <= max
-      process.sleep(5)
-      assert_live_within(opens, closes, max, samples - 1)
-    }
-  }
-}
 
-fn drain_dones(collector: process.Subject(Nil), remaining: Int) -> Nil {
-  case remaining <= 0 {
-    True -> Nil
-    False ->
-      case process.receive(collector, 3000) {
-        Ok(Nil) -> drain_dones(collector, remaining - 1)
-        Error(Nil) -> Nil
-      }
+      process.sleep(5)
+      assert_expected_open_count(opens, closes, max, samples - 1)
+    }
   }
 }
 
