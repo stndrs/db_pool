@@ -233,15 +233,8 @@ type DrainMode(err) {
 type State(conn, err) {
   State(
     self: Subject(Message(conn, err)),
-    max_size: Int,
-    max_idle: Int,
-    max_idle_time: Option(Int),
+    pool: Pool(conn, err),
     current_size: Int,
-    handle_open: fn() -> Result(conn, PoolError(err)),
-    handle_close: fn(conn) -> Result(Nil, PoolError(err)),
-    handle_idle: fn(conn) -> Nil,
-    handle_active: fn(conn) -> Nil,
-    error_to_string: Option(fn(err) -> String),
     idle: List(Idle(conn)),
     active: Dict(Pid, Active(conn)),
     // In-flight opens, keyed by opener pid. `dict.size` is the pool's
@@ -249,8 +242,6 @@ type State(conn, err) {
     openers: Dict(Pid, Opener),
     queue: Queue(Waiting(conn, PoolError(err))),
     counter: counter.Counter,
-    queue_target: Int,
-    queue_interval: Int,
     delay: Int,
     slow: Bool,
     next: Int,
@@ -259,6 +250,26 @@ type State(conn, err) {
     // finishes.
     draining: Option(DrainMode(err)),
   )
+}
+
+// The number of connections the pool keeps idle. Without an explicit
+// `max_idle_connections` the pool is fixed-size and holds all `size`
+// connections; with one it is capped by `size`.
+fn max_idle(pool: Pool(conn, err)) -> Int {
+  case pool.max_idle_connections {
+    None -> pool.size
+    Some(n) -> int.min(n, pool.size)
+  }
+}
+
+// The CoDel settings are configured in milliseconds but compared against
+// monotonic nanosecond timestamps.
+fn queue_target_ns(pool: Pool(conn, err)) -> Int {
+  pool.queue_target * ns_per_ms
+}
+
+fn queue_interval_ns(pool: Pool(conn, err)) -> Int {
+  pool.queue_interval * ns_per_ms
 }
 
 /// Starts a connection pool and registers it under `name`. All
@@ -460,13 +471,8 @@ fn initialise_pool(
     |> process.select_trapped_exits(PoolExit)
     |> process.select_monitors(CallerDown)
 
-  let max_idle = case pool.max_idle_connections {
-    None -> pool.size
-    Some(n) -> int.min(n, pool.size)
-  }
-
   let connections =
-    list.repeat("", max_idle)
+    list.repeat("", max_idle(pool))
     |> list.try_map(fn(_) { pool.handle_open() })
     |> result.map_error(log_error(pool.error_to_string, _))
 
@@ -501,25 +507,16 @@ fn initialise_pool(
   let state =
     State(
       self:,
-      max_size: pool.size,
-      max_idle:,
-      max_idle_time: pool.max_idle_time,
-      current_size: max_idle,
-      handle_open: pool.handle_open,
-      handle_close: pool.handle_close,
-      handle_idle: pool.handle_idle,
-      handle_active: pool.handle_active,
-      error_to_string: pool.error_to_string,
+      pool:,
+      current_size: max_idle(pool),
       idle:,
       active: dict.new(),
       openers: dict.new(),
       queue: q,
       counter:,
-      queue_target: pool.queue_target * ns_per_ms,
-      queue_interval: pool.queue_interval * ns_per_ms,
       delay: 0,
       slow: False,
-      next: now + pool.queue_interval * ns_per_ms,
+      next: now + queue_interval_ns(pool),
       draining: None,
     )
 
@@ -662,7 +659,7 @@ fn handle_draining(
   case msg {
     OpenResult(pid:, result:, ..) -> {
       result
-      |> result.try(state.handle_close)
+      |> result.try(state.pool.handle_close)
       |> result.unwrap(Nil)
 
       state
@@ -681,7 +678,7 @@ fn handle_draining(
       actor.continue(state)
     }
     CheckIn(conn:, ..) -> {
-      let _ = state.handle_close(conn)
+      let _ = state.pool.handle_close(conn)
       actor.continue(state)
     }
     Shutdown(client:) -> {
@@ -770,7 +767,7 @@ fn do_checkout(
 
         let active = dict.insert(state.active, caller, activated)
 
-        state.handle_active(conn)
+        state.pool.handle_active(conn)
 
         actor.send(client, Ok(conn))
 
@@ -943,7 +940,7 @@ fn close_active(
 
   let active_dict = dict.delete(state.active, pid)
 
-  let _ = state.handle_close(active.conn)
+  let _ = state.pool.handle_close(active.conn)
   let state =
     State(..state, active: active_dict, current_size: state.current_size - 1)
 
@@ -959,7 +956,7 @@ fn close_active(
 
 // True when opening another connection would breach the capacity ceiling.
 fn at_capacity(state: State(conn, err)) -> Bool {
-  state.current_size + dict.size(state.openers) >= state.max_size
+  state.current_size + dict.size(state.openers) >= state.pool.size
 }
 
 // True when at least one caller is waiting in the queue. Liveness of the
@@ -974,7 +971,7 @@ fn queue_has_waiter(state: State(conn, err)) -> Bool {
 // one until the result or the opener's down signal is handled.
 fn spawn_opener(state: State(conn, err), backoff: Int) -> State(conn, err) {
   let self = state.self
-  let handle_open = state.handle_open
+  let handle_open = state.pool.handle_open
 
   let pid =
     process.spawn_unlinked(fn() {
@@ -1027,14 +1024,14 @@ fn do_open_result(
       |> codel_dequeue(now, conn)
     })
     |> result.try_recover(fn(pool_error) {
-      let _ = log_error(state.error_to_string, pool_error)
+      let _ = log_error(state.pool.error_to_string, pool_error)
 
       Ok(retry_if_demand(state, backoff))
     })
   })
   |> result.lazy_unwrap(fn() {
     open_result
-    |> result.try(state.handle_close)
+    |> result.try(state.pool.handle_close)
     |> result.unwrap(Nil)
 
     state
@@ -1073,7 +1070,7 @@ fn close_interval_ms(max_idle_time: Int) -> Int {
 /// re-arms the timer. Closed connections are not replaced. The pool regrows
 /// on demand.
 fn do_close_idle(state: State(conn, err)) -> State(conn, err) {
-  case state.max_idle_time {
+  case state.pool.max_idle_time {
     None -> state
     Some(ms) -> {
       let now = counter.next(state.counter)
@@ -1083,7 +1080,7 @@ fn do_close_idle(state: State(conn, err)) -> State(conn, err) {
         list.partition(state.idle, fn(idle) { now - idle.since > threshold })
 
       list.each(expired, fn(idle) {
-        let _ = state.handle_close(idle.conn)
+        let _ = state.pool.handle_close(idle.conn)
         Nil
       })
 
@@ -1111,7 +1108,8 @@ fn codel_dequeue(
   case { now >= state.next }, state.slow {
     True, _ -> dequeue_first(state, now, conn)
     False, False -> dequeue_fast(state, now, conn)
-    False, True -> dequeue_slow(state, now, state.queue_target * 2, conn)
+    False, True ->
+      dequeue_slow(state, now, queue_target_ns(state.pool) * 2, conn)
   }
 }
 
@@ -1121,8 +1119,8 @@ fn dequeue_first(
   now: Int,
   conn: conn,
 ) -> State(conn, err) {
-  let next = now + state.queue_interval
-  let slow = state.delay > state.queue_target
+  let next = now + queue_interval_ns(state.pool)
+  let slow = state.delay > queue_target_ns(state.pool)
 
   queue.pop(state.queue)
   |> result.map(fn(waiting) {
@@ -1194,13 +1192,13 @@ fn push_idle(
   now: Int,
   conn: conn,
 ) -> State(conn, err) {
-  case list.length(state.idle) >= state.max_idle {
+  case list.length(state.idle) >= max_idle(state.pool) {
     True -> {
-      let _ = state.handle_close(conn)
+      let _ = state.pool.handle_close(conn)
       State(..state, current_size: state.current_size - 1)
     }
     False -> {
-      state.handle_idle(conn)
+      state.pool.handle_idle(conn)
       State(..state, idle: [Idle(conn:, since: now), ..state.idle])
     }
   }
@@ -1241,7 +1239,7 @@ fn serve_waiter(
 
       process.send(waiting.client, Ok(conn))
 
-      state.handle_active(conn)
+      state.pool.handle_active(conn)
 
       State(..state, active:)
     }
@@ -1273,12 +1271,12 @@ fn codel_timeout(
 ) -> State(conn, err) {
   use <- bool.guard(when: time < state.next, return: state)
 
-  let next = state.next + state.queue_interval
+  let next = state.next + queue_interval_ns(state.pool)
 
-  case state.delay > state.queue_target {
+  case state.delay > queue_target_ns(state.pool) {
     True ->
       State(..state, slow: True, delay:, next:)
-      |> poll_drop_slow(time, state.queue_target * 2)
+      |> poll_drop_slow(time, queue_target_ns(state.pool) * 2)
     False -> State(..state, slow: False, delay:, next:)
   }
 }
@@ -1310,7 +1308,7 @@ fn start_poll(
   let _timer =
     process.send_after(
       state.self,
-      state.queue_interval / ns_per_ms,
+      state.pool.queue_interval,
       Poll(last_queue_key:),
     )
 
@@ -1370,7 +1368,7 @@ fn close_each_active(state: State(conn, err)) -> State(conn, err) {
 
     process.demonitor_process(active.monitor)
 
-    let _ = state.handle_close(active.conn)
+    let _ = state.pool.handle_close(active.conn)
 
     Nil
   })
@@ -1380,7 +1378,7 @@ fn close_each_active(state: State(conn, err)) -> State(conn, err) {
 
 fn close_idle(state: State(conn, err)) -> State(conn, err) {
   list.each(state.idle, fn(idle) {
-    let _ = state.handle_close(idle.conn)
+    let _ = state.pool.handle_close(idle.conn)
 
     Nil
   })
