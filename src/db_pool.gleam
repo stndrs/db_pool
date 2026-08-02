@@ -53,6 +53,7 @@ pub opaque type Pool(conn, err) {
     handle_close: fn(conn) -> Result(Nil, PoolError(err)),
     handle_idle: fn(conn) -> Nil,
     handle_active: fn(conn) -> Nil,
+    error_to_string: Option(fn(err) -> String),
   )
 }
 
@@ -71,6 +72,7 @@ pub fn new() -> Pool(conn, err) {
     handle_close:,
     handle_idle: fn(_) { Nil },
     handle_active: fn(_) { Nil },
+    error_to_string: None,
   )
 }
 
@@ -170,6 +172,16 @@ pub fn queue_interval(pool: Pool(conn, err), interval: Int) -> Pool(conn, err) {
   Pool(..pool, queue_interval: int.max(interval, 1))
 }
 
+/// Sets a function used to convert the `Pool`'s `err` type into a `String`
+/// for logging. When set, `ConnectionError`s encountered internally by the
+/// pool (for example during startup) are logged using this function.
+pub fn error_to_string(
+  pool: Pool(conn, err),
+  to_string: fn(err) -> String,
+) -> Pool(conn, err) {
+  Pool(..pool, error_to_string: Some(to_string))
+}
+
 // --- Internal types ---
 
 type Waiting(conn, err) {
@@ -261,16 +273,10 @@ pub fn start(
   pool: Pool(conn, err),
   name: process.Name(Message(conn, err)),
   timeout: Int,
-  error_to_string: Option(fn(err) -> String),
 ) -> Result(actor.Started(Subject(Message(conn, err))), actor.StartError) {
   let counter = counter.monotonic_time(monotonic.Nanosecond)
 
-  actor.new_with_initialiser(timeout, initialise_pool(
-    _,
-    pool,
-    counter,
-    error_to_string,
-  ))
+  actor.new_with_initialiser(timeout, initialise_pool(_, pool, counter))
   |> actor.on_message(handle_message)
   |> actor.named(name)
   |> actor.start
@@ -287,9 +293,8 @@ pub fn supervised(
   pool: Pool(conn, err),
   name: process.Name(Message(conn, err)),
   timeout: Int,
-  error_to_string: Option(fn(err) -> String),
 ) -> supervision.ChildSpecification(Subject(Message(conn, err))) {
-  supervision.worker(fn() { start(pool, name, timeout, error_to_string) })
+  supervision.worker(fn() { start(pool, name, timeout) })
   |> supervision.timeout(timeout)
   |> supervision.restart(supervision.Transient)
 }
@@ -439,7 +444,6 @@ fn initialise_pool(
   self: Subject(Message(conn, err)),
   pool: Pool(conn, err),
   counter: counter.Counter,
-  error_to_string: Option(fn(err) -> String),
 ) -> Result(
   actor.Initialised(
     State(conn, err),
@@ -464,7 +468,7 @@ fn initialise_pool(
   let connections =
     list.repeat("", max_idle)
     |> list.try_map(fn(_) { pool.handle_open() })
-    |> result.map_error(log_error(error_to_string, _))
+    |> result.map_error(log_error(pool.error_to_string, _))
 
   use conns <- result.map(connections)
 
@@ -505,7 +509,7 @@ fn initialise_pool(
       handle_close: pool.handle_close,
       handle_idle: pool.handle_idle,
       handle_active: pool.handle_active,
-      error_to_string:,
+      error_to_string: pool.error_to_string,
       idle:,
       active: dict.new(),
       openers: dict.new(),

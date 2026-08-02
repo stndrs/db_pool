@@ -5,7 +5,6 @@ import gleam/erlang/process
 import gleam/erlang/reference
 import gleam/int
 import gleam/list
-import gleam/option.{None, Some}
 import gleam/otp/actor
 import gleam/otp/static_supervisor
 import gleeunit
@@ -22,8 +21,7 @@ pub fn new_error_test() {
 
   let name = process.new_name("db_pool_test")
 
-  let assert Error(actor.InitFailed(_)) =
-    db_pool.start(db_pool, name, 200, None)
+  let assert Error(actor.InitFailed(_)) = db_pool.start(db_pool, name, 200)
 }
 
 pub fn start_test() {
@@ -37,7 +35,7 @@ pub fn start_test() {
 
   let name = process.new_name("db_pool_test")
 
-  let assert Ok(pool) = db_pool.start(new_pool, name, 200, None)
+  let assert Ok(pool) = db_pool.start(new_pool, name, 200)
   let pool = pool.data
 
   let assert Ok(_) = db_pool.shutdown(pool, 200)
@@ -55,7 +53,7 @@ pub fn start_error_test() {
   let name = process.new_name("db_pool_test")
 
   let assert Error(actor.InitFailed("(db_pool) ConnectionError")) =
-    db_pool.start(new_pool, name, 200, None)
+    db_pool.start(new_pool, name, 200)
 }
 
 pub fn supervised_test() {
@@ -69,7 +67,7 @@ pub fn supervised_test() {
     |> db_pool.on_idle(fn(_) { Nil })
     |> db_pool.on_active(fn(_) { Nil })
 
-  let pool_spec = db_pool.supervised(new_pool, name, 200, None)
+  let pool_spec = db_pool.supervised(new_pool, name, 200)
 
   let assert Ok(_) =
     static_supervisor.new(static_supervisor.OneForOne)
@@ -95,11 +93,12 @@ pub fn error_to_string_test() {
     |> db_pool.on_close(fn(_) { Ok(Nil) })
     |> db_pool.on_idle(fn(_) { Nil })
     |> db_pool.on_active(fn(_) { Nil })
+    |> db_pool.error_to_string(fn(_err) { "Oops" })
 
   let name = process.new_name("db_pool_test")
 
   let assert Error(actor.InitFailed("(db_pool) ConnectionError: Oops")) =
-    db_pool.start(new_pool, name, 200, Some(fn(_err) { "Oops" }))
+    db_pool.start(new_pool, name, 200)
 }
 
 pub fn with_connection_test() {
@@ -113,7 +112,7 @@ pub fn with_connection_test() {
     |> db_pool.on_idle(fn(_) { Nil })
     |> db_pool.on_active(fn(_) { Nil })
 
-  let pool_spec = db_pool.supervised(new_pool, name, 200, None)
+  let pool_spec = db_pool.supervised(new_pool, name, 200)
 
   let assert Ok(_) =
     static_supervisor.new(static_supervisor.OneForOne)
@@ -137,7 +136,7 @@ pub fn with_connection_current_connection_test() {
     |> db_pool.on_idle(fn(_) { Nil })
     |> db_pool.on_active(fn(_) { Nil })
 
-  let pool_spec = db_pool.supervised(new_pool, name, 200, None)
+  let pool_spec = db_pool.supervised(new_pool, name, 200)
 
   let assert Ok(_) =
     static_supervisor.new(static_supervisor.OneForOne)
@@ -196,7 +195,7 @@ pub fn checkout_current_connection_test() {
     |> db_pool.on_idle(fn(_) { Nil })
     |> db_pool.on_active(fn(_) { Nil })
 
-  let assert Ok(pool) = db_pool.start(new_pool, name, 200, None)
+  let assert Ok(pool) = db_pool.start(new_pool, name, 200)
   let pool = pool.data
 
   let assert Ok(conn1) = db_pool.checkout(pool, 200, 30_000)
@@ -227,7 +226,7 @@ pub fn checkout_depth_test() {
     |> db_pool.on_idle(fn(_) { Nil })
     |> db_pool.on_active(fn(_) { Nil })
 
-  let assert Ok(pool) = db_pool.start(new_pool, name, 200, None)
+  let assert Ok(pool) = db_pool.start(new_pool, name, 200)
   let pool = pool.data
 
   // Two nested checkouts of the only connection.
@@ -266,7 +265,7 @@ pub fn clamp_negative_timeout_deadline_test() {
     |> db_pool.on_idle(fn(_) { Nil })
     |> db_pool.on_active(fn(_) { Nil })
 
-  let assert Ok(pool) = db_pool.start(new_pool, name, 200, None)
+  let assert Ok(pool) = db_pool.start(new_pool, name, 200)
   let pool = pool.data
 
   // Negative timeout/deadline must not crash the pool actor.
@@ -293,7 +292,7 @@ pub fn clamp_size_and_interval_test() {
     |> db_pool.on_idle(fn(_) { Nil })
     |> db_pool.on_active(fn(_) { Nil })
 
-  let assert Ok(pool) = db_pool.start(new_pool, name, 200, None)
+  let assert Ok(pool) = db_pool.start(new_pool, name, 200)
   let pool = pool.data
 
   let assert Ok(Nil) = db_pool.checkout(pool, 200, 30_000)
@@ -325,7 +324,7 @@ pub fn max_idle_connections_limits_startup_opens_test() {
     |> db_pool.on_idle(fn(_) { Nil })
     |> db_pool.on_active(fn(_) { Nil })
 
-  let assert Ok(pool) = db_pool.start(pool, name, 200, None)
+  let assert Ok(pool) = db_pool.start(pool, name, 200)
   let pool = pool.data
 
   assert atomic.get(opens) == 2
@@ -348,7 +347,7 @@ pub fn pool_grows_on_demand_test() {
     |> db_pool.on_idle(fn(_) { Nil })
     |> db_pool.on_active(fn(_) { Nil })
 
-  let assert Ok(pool) = db_pool.start(pool, name, 200, None)
+  let assert Ok(pool) = db_pool.start(pool, name, 200)
   let pool = pool.data
 
   // Three callers check out concurrently. Only one connection exists at
@@ -392,7 +391,7 @@ pub fn checkin_beyond_idle_cap_closes_connection_test() {
     |> db_pool.on_idle(fn(_) { Nil })
     |> db_pool.on_active(fn(_) { Nil })
 
-  let assert Ok(pool) = db_pool.start(pool, name, 200, None)
+  let assert Ok(pool) = db_pool.start(pool, name, 200)
   let pool = pool.data
 
   // Grow to 3 by holding all three connections concurrently, then check them
@@ -440,7 +439,7 @@ pub fn idle_connections_reaped_after_max_idle_time_test() {
     |> db_pool.on_idle(fn(_) { Nil })
     |> db_pool.on_active(fn(_) { Nil })
 
-  let assert Ok(pool) = db_pool.start(pool, name, 200, None)
+  let assert Ok(pool) = db_pool.start(pool, name, 200)
   let pool = pool.data
 
   // Both connections start idle. The reap interval is max(100/2, 1000) = 1000ms;
@@ -479,7 +478,7 @@ pub fn failed_open_retries_while_waiter_queued_test() {
     |> db_pool.on_idle(fn(_) { Nil })
     |> db_pool.on_active(fn(_) { Nil })
 
-  let assert Ok(pool) = db_pool.start(pool, name, 200, None)
+  let assert Ok(pool) = db_pool.start(pool, name, 200)
   let pool = pool.data
 
   // Caller A holds the only connection.
@@ -537,7 +536,7 @@ pub fn opener_panic_does_not_leak_capacity_test() {
     |> db_pool.on_idle(fn(_) { Nil })
     |> db_pool.on_active(fn(_) { Nil })
 
-  let assert Ok(pool) = db_pool.start(pool, name, 200, None)
+  let assert Ok(pool) = db_pool.start(pool, name, 200)
   let pool = pool.data
 
   // Caller A holds the only connection.
@@ -595,7 +594,7 @@ pub fn capacity_invariant_under_burst_test() {
     |> db_pool.on_idle(fn(_) { Nil })
     |> db_pool.on_active(fn(_) { Nil })
 
-  let assert Ok(pool) = db_pool.start(pool, name, 200, None)
+  let assert Ok(pool) = db_pool.start(pool, name, 200)
   let pool = pool.data
 
   let count = 20
@@ -671,7 +670,7 @@ pub fn shutdown_with_pending_open_drains_connection_test() {
     |> db_pool.on_idle(fn(_) { Nil })
     |> db_pool.on_active(fn(_) { Nil })
 
-  let assert Ok(pool) = db_pool.start(pool, name, 200, None)
+  let assert Ok(pool) = db_pool.start(pool, name, 200)
   let pool = pool.data
 
   // From now on new opens are slow.
@@ -716,7 +715,7 @@ pub fn shutdown_reason_treated_as_normal_test() {
     |> db_pool.on_idle(fn(_) { Nil })
     |> db_pool.on_active(fn(_) { Nil })
 
-  let assert Ok(started) = db_pool.start(new_pool, name, 200, None)
+  let assert Ok(started) = db_pool.start(new_pool, name, 200)
   let pid = started.pid
 
   process.send_abnormal_exit(pid, atom.create("shutdown"))
@@ -787,7 +786,7 @@ pub fn caller_down_test() {
     |> db_pool.on_idle(fn(_) { Nil })
     |> db_pool.on_active(fn(_) { Nil })
 
-  let assert Ok(pool) = db_pool.start(pool, name, 200, None)
+  let assert Ok(pool) = db_pool.start(pool, name, 200)
   let pool = pool.data
 
   let caller =
@@ -817,7 +816,7 @@ pub fn waiting_caller_test() {
     |> db_pool.on_idle(fn(_) { Nil })
     |> db_pool.on_active(fn(_) { Nil })
 
-  let assert Ok(pool) = db_pool.start(pool, name, 200, None)
+  let assert Ok(pool) = db_pool.start(pool, name, 200)
   let pool = pool.data
 
   // First caller holds the connection for 200ms
@@ -853,7 +852,7 @@ pub fn waiting_caller_timeout_test() {
     |> db_pool.on_idle(fn(_) { Nil })
     |> db_pool.on_active(fn(_) { Nil })
 
-  let assert Ok(pool) = db_pool.start(pool, name, 100, None)
+  let assert Ok(pool) = db_pool.start(pool, name, 100)
   let pool = pool.data
 
   // First caller holds the connection for 200ms
@@ -894,7 +893,7 @@ pub fn pool_exit_test() {
     |> db_pool.on_idle(fn(_) { Nil })
     |> db_pool.on_active(fn(_) { Nil })
 
-  let assert Ok(pool) = db_pool.start(db_pool, name, 200, None)
+  let assert Ok(pool) = db_pool.start(db_pool, name, 200)
   let pool = pool.data
 
   let assert Ok(pid) = process.subject_owner(pool)
@@ -916,7 +915,7 @@ pub fn deadline_expires_and_pool_recovers_test() {
     |> db_pool.on_idle(fn(_) { Nil })
     |> db_pool.on_active(fn(_) { Nil })
 
-  let assert Ok(pool) = db_pool.start(pool, name, 200, None)
+  let assert Ok(pool) = db_pool.start(pool, name, 200)
   let pool = pool.data
 
   // First caller checks out with a 50ms deadline, then holds it forever
@@ -949,7 +948,7 @@ pub fn deadline_cancelled_by_checkin_test() {
     |> db_pool.on_idle(fn(_) { Nil })
     |> db_pool.on_active(fn(_) { Nil })
 
-  let assert Ok(pool) = db_pool.start(pool, name, 200, None)
+  let assert Ok(pool) = db_pool.start(pool, name, 200)
   let pool = pool.data
 
   // Checkout with a 100ms deadline
@@ -980,7 +979,7 @@ pub fn deadline_expires_serves_waiting_caller_test() {
     |> db_pool.on_idle(fn(_) { Nil })
     |> db_pool.on_active(fn(_) { Nil })
 
-  let assert Ok(pool) = db_pool.start(pool, name, 200, None)
+  let assert Ok(pool) = db_pool.start(pool, name, 200)
   let pool = pool.data
 
   // First caller takes the only connection with a 100ms deadline, holds forever
@@ -1018,7 +1017,7 @@ pub fn dead_waiter_skipped_test() {
     |> db_pool.on_idle(fn(_) { Nil })
     |> db_pool.on_active(fn(_) { Nil })
 
-  let assert Ok(pool) = db_pool.start(pool, name, 200, None)
+  let assert Ok(pool) = db_pool.start(pool, name, 200)
   let pool = pool.data
 
   // Caller A takes the only connection
@@ -1067,7 +1066,7 @@ pub fn all_dead_waiters_connection_returns_to_idle_test() {
     |> db_pool.on_idle(fn(_) { Nil })
     |> db_pool.on_active(fn(_) { Nil })
 
-  let assert Ok(pool) = db_pool.start(pool, name, 200, None)
+  let assert Ok(pool) = db_pool.start(pool, name, 200)
   let pool = pool.data
 
   // Caller A takes the only connection
@@ -1112,7 +1111,7 @@ pub fn codel_drops_slow_waiters_test() {
     |> db_pool.on_idle(fn(_) { Nil })
     |> db_pool.on_active(fn(_) { Nil })
 
-  let assert Ok(pool) = db_pool.start(pool, name, 200, None)
+  let assert Ok(pool) = db_pool.start(pool, name, 200)
   let pool = pool.data
 
   // Exhaust the only connection
@@ -1167,7 +1166,7 @@ pub fn codel_poll_drops_slow_waiters_test() {
     |> db_pool.on_idle(fn(_) { Nil })
     |> db_pool.on_active(fn(_) { Nil })
 
-  let assert Ok(pool) = db_pool.start(pool, name, 200, None)
+  let assert Ok(pool) = db_pool.start(pool, name, 200)
   let pool = pool.data
 
   // Exhaust the only connection and never return it.
@@ -1213,7 +1212,7 @@ pub fn codel_fast_mode_serves_immediately_test() {
     |> db_pool.on_idle(fn(_) { Nil })
     |> db_pool.on_active(fn(_) { Nil })
 
-  let assert Ok(pool) = db_pool.start(pool, name, 200, None)
+  let assert Ok(pool) = db_pool.start(pool, name, 200)
   let pool = pool.data
 
   // Exhaust the connection briefly
@@ -1261,7 +1260,7 @@ pub fn reconnect_after_failed_replacement_test() {
     |> db_pool.on_idle(fn(_) { Nil })
     |> db_pool.on_active(fn(_) { Nil })
 
-  let assert Ok(pool) = db_pool.start(pool, name, 200, None)
+  let assert Ok(pool) = db_pool.start(pool, name, 200)
   let pool = pool.data
 
   // Check out the only connection
@@ -1317,7 +1316,7 @@ pub fn reconnect_respects_max_size_test() {
     |> db_pool.on_idle(fn(_) { Nil })
     |> db_pool.on_active(fn(_) { Nil })
 
-  let assert Ok(pool) = db_pool.start(pool, name, 200, None)
+  let assert Ok(pool) = db_pool.start(pool, name, 200)
   let pool = pool.data
 
   // Repeatedly check out and crash the holder so the pool reconnects.
@@ -1353,7 +1352,7 @@ pub fn shutdown_drains_waiters_test() {
     |> db_pool.on_idle(fn(_) { Nil })
     |> db_pool.on_active(fn(_) { Nil })
 
-  let assert Ok(pool) = db_pool.start(pool, name, 200, None)
+  let assert Ok(pool) = db_pool.start(pool, name, 200)
   let pool = pool.data
 
   // Take the only connection so subsequent checkouts must wait
@@ -1392,7 +1391,7 @@ pub fn on_close_called_on_shutdown_test() {
     |> db_pool.on_idle(fn(_) { Nil })
     |> db_pool.on_active(fn(_) { Nil })
 
-  let assert Ok(pool) = db_pool.start(pool, name, 200, None)
+  let assert Ok(pool) = db_pool.start(pool, name, 200)
   let pool = pool.data
 
   let assert Ok(_) = db_pool.shutdown(pool, 200)
@@ -1416,7 +1415,7 @@ pub fn shutdown_closes_active_connections_test() {
     |> db_pool.on_idle(fn(_) { Nil })
     |> db_pool.on_active(fn(_) { Nil })
 
-  let assert Ok(pool) = db_pool.start(pool, name, 200, None)
+  let assert Ok(pool) = db_pool.start(pool, name, 200)
   let pool = pool.data
 
   let assert Ok(Nil) = db_pool.checkout(pool, 200, 30_000)
@@ -1440,7 +1439,7 @@ pub fn on_idle_and_on_active_called_at_checkin_and_checkout_test() {
     |> db_pool.on_idle(fn(_) { atomic.add(idle_count, 1) })
     |> db_pool.on_active(fn(_) { atomic.add(active_count, 1) })
 
-  let assert Ok(pool) = db_pool.start(pool, name, 200, None)
+  let assert Ok(pool) = db_pool.start(pool, name, 200)
   let pool = pool.data
 
   let assert Ok(_conn) = db_pool.checkout(pool, 200, 30_000)
@@ -1470,7 +1469,7 @@ pub fn checkin_by_non_active_caller_ignored_test() {
     |> db_pool.on_idle(fn(_) { Nil })
     |> db_pool.on_active(fn(_) { Nil })
 
-  let assert Ok(pool) = db_pool.start(pool, name, 200, None)
+  let assert Ok(pool) = db_pool.start(pool, name, 200)
   let pool = pool.data
 
   let assert Ok(conn) = db_pool.checkout(pool, 200, 30_000)
@@ -1502,7 +1501,7 @@ pub fn pool_exit_abnormal_test() {
     |> db_pool.on_idle(fn(_) { Nil })
     |> db_pool.on_active(fn(_) { Nil })
 
-  let assert Ok(pool) = db_pool.start(pool, name, 200, None)
+  let assert Ok(pool) = db_pool.start(pool, name, 200)
   let pool = pool.data
 
   let assert Ok(pid) = process.subject_owner(pool)
@@ -1530,7 +1529,7 @@ pub fn many_waiters_enqueued_without_collision_test() {
     |> db_pool.on_idle(fn(_) { Nil })
     |> db_pool.on_active(fn(_) { Nil })
 
-  let assert Ok(started) = db_pool.start(pool, name, 200, None)
+  let assert Ok(started) = db_pool.start(pool, name, 200)
   let pool = started.data
   let pool_pid = started.pid
 
@@ -1612,7 +1611,7 @@ fn db_pool() -> process.Subject(db_pool.Message(Nil, err)) {
       |> db_pool.on_idle(fn(_) { Nil })
       |> db_pool.on_active(fn(_) { Nil })
 
-    let assert Ok(pool) = db_pool.start(db_pool, name, 200, None)
+    let assert Ok(pool) = db_pool.start(db_pool, name, 200)
 
     pool.data
   })
