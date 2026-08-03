@@ -1197,6 +1197,150 @@ pub fn codel_poll_drops_slow_waiters_test() {
   let assert Ok(_) = db_pool.shutdown(pool, 200)
 }
 
+/// The dequeue route sheds waiters too, and every waiter it sheds must be
+/// told. A check-in that lands in slow mode with stale waiters at the head of
+/// the queue serves the first fresh waiter and drops the ones ahead of it;
+/// those callers get `ConnectionUnavailable` rather than being left blocked
+/// until their own timeout fires.
+///
+/// This is the check-in path specifically, not the poll loop: the poll that
+/// enters slow mode sheds everything stale in the same call, so the waiters
+/// below are queued after it and the check-in lands well before the next one.
+pub fn codel_dequeue_drops_slow_waiters_test() {
+  let name = process.new_name("db_pool_test")
+
+  let pool =
+    db_pool.new()
+    |> db_pool.size(1)
+    // Slow mode sheds anything queued more than queue_target * 2 - 40ms - ago.
+    |> db_pool.queue_target(20)
+    |> db_pool.queue_interval(200)
+    |> db_pool.on_open(fn() { Ok(Nil) })
+    |> db_pool.on_close(fn(_) { Ok(Nil) })
+    |> db_pool.on_idle(fn(_) { Nil })
+    |> db_pool.on_active(fn(_) { Nil })
+
+  let assert Ok(pool) = db_pool.start(pool, name, 200)
+  let pool = pool.data
+
+  // Exhaust the only connection, and hold on to it.
+  let assert Ok(Nil) = db_pool.checkout(pool, 200, 30_000)
+
+  // One waiter to drive the standing queue delay above target. Entering slow
+  // mode takes two interval evaluations: the first records the delay, the
+  // second judges it and sheds. This waiter being dropped is therefore the
+  // signal that the pool has just entered slow mode, which anchors the
+  // window below without relying on how long that took.
+  let primer = process.new_subject()
+
+  process.spawn(fn() {
+    process.send(primer, db_pool.checkout(pool, 3000, 30_000))
+  })
+
+  let assert Ok(Error(db_pool.ConnectionUnavailable)) =
+    process.receive(primer, 5000)
+
+  // The poll that just shed the primer moved the interval on by a full
+  // 200ms, so nothing below can be shed by a poll: the check-in is the only
+  // thing left that can do it.
+  let collector = process.new_subject()
+
+  // Three waiters that will be roughly 70ms old at the check-in, and so
+  // stale.
+  list.repeat(Nil, 3)
+  |> list.each(fn(_) {
+    process.spawn(fn() {
+      process.send(collector, db_pool.checkout(pool, 3000, 30_000))
+    })
+  })
+
+  process.sleep(60)
+
+  // And one that will be roughly 10ms old, and so not.
+  process.spawn(fn() {
+    process.send(collector, db_pool.checkout(pool, 3000, 30_000))
+  })
+
+  process.sleep(10)
+
+  // Runs CoDel in slow mode: the three stale waiters are shed and the fresh
+  // one is served.
+  db_pool.checkin(pool, Nil)
+
+  process.sleep(100)
+
+  let results = collect_results(collector, [])
+
+  let dropped =
+    list.filter(results, fn(r) { r == Error(db_pool.ConnectionUnavailable) })
+
+  assert list.length(dropped) == 3
+  assert list.contains(results, Ok(Nil))
+
+  let assert Ok(_) = db_pool.shutdown(pool, 200)
+}
+
+/// The same, for a check-in that finds nobody left to serve: when every
+/// queued waiter is stale they are all shed and the connection goes back to
+/// the idle set. Each shed caller still has to be told.
+pub fn codel_dequeue_drops_every_slow_waiter_test() {
+  let name = process.new_name("db_pool_test")
+
+  let pool =
+    db_pool.new()
+    |> db_pool.size(1)
+    |> db_pool.queue_target(20)
+    |> db_pool.queue_interval(200)
+    |> db_pool.on_open(fn() { Ok(Nil) })
+    |> db_pool.on_close(fn(_) { Ok(Nil) })
+    |> db_pool.on_idle(fn(_) { Nil })
+    |> db_pool.on_active(fn(_) { Nil })
+
+  let assert Ok(pool) = db_pool.start(pool, name, 200)
+  let pool = pool.data
+
+  let assert Ok(Nil) = db_pool.checkout(pool, 200, 30_000)
+
+  // As above: the primer being shed marks the moment slow mode was entered,
+  // and leaves a full interval before the next poll.
+  let primer = process.new_subject()
+
+  process.spawn(fn() {
+    process.send(primer, db_pool.checkout(pool, 3000, 30_000))
+  })
+
+  let assert Ok(Error(db_pool.ConnectionUnavailable)) =
+    process.receive(primer, 5000)
+
+  let collector = process.new_subject()
+
+  list.repeat(Nil, 3)
+  |> list.each(fn(_) {
+    process.spawn(fn() {
+      process.send(collector, db_pool.checkout(pool, 3000, 30_000))
+    })
+  })
+
+  // Every one of them is now stale, and there is no fresh waiter behind them.
+  process.sleep(70)
+
+  db_pool.checkin(pool, Nil)
+
+  process.sleep(100)
+
+  let results = collect_results(collector, [])
+
+  let dropped =
+    list.filter(results, fn(r) { r == Error(db_pool.ConnectionUnavailable) })
+
+  assert list.length(dropped) == 3
+
+  // Nobody was served, so the connection went back to the idle set.
+  let assert Ok(Nil) = db_pool.checkout(pool, 200, 30_000)
+
+  let assert Ok(_) = db_pool.shutdown(pool, 200)
+}
+
 /// In fast mode (delay < queue_target), waiters are served immediately
 /// without being dropped.
 pub fn codel_fast_mode_serves_immediately_test() {

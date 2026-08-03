@@ -1,3 +1,4 @@
+import db_pool/internal/codel.{type Codel}
 import gleam/bool
 import gleam/dict.{type Dict}
 import gleam/dynamic/decode
@@ -13,8 +14,6 @@ import gleam/string
 import logging
 import rasa/counter
 import rasa/monotonic
-import rasa/queue.{type Queue}
-import rasa/table
 
 const ns_per_ms = 1_000_000
 
@@ -190,9 +189,6 @@ type Waiting(conn, err) {
     monitor: process.Monitor,
     client: Subject(Result(conn, err)),
     deadline: Int,
-    // The real monotonic nanosecond timestamp at which this caller was
-    // enqueued.
-    sent_at: Int,
   )
 }
 
@@ -240,11 +236,9 @@ type State(conn, err) {
     // In-flight opens, keyed by opener pid. `dict.size` is the pool's
     // `pending_opens`.
     openers: Dict(Pid, Opener),
-    queue: Queue(Waiting(conn, PoolError(err))),
+    // The queue of waiting callers and the overload state governing it.
+    codel: Codel(Waiting(conn, PoolError(err))),
     counter: counter.Counter,
-    delay: Int,
-    slow: Bool,
-    next: Int,
     // Set to `Some` mode when shutdown/exit has begun but in-flight opens
     // remain. The pool stays alive to close arriving connections, then
     // finishes.
@@ -260,16 +254,6 @@ fn max_idle(pool: Pool(conn, err)) -> Int {
     None -> pool.size
     Some(n) -> int.min(n, pool.size)
   }
-}
-
-// The CoDel settings are configured in milliseconds but compared against
-// monotonic nanosecond timestamps.
-fn queue_target_ns(pool: Pool(conn, err)) -> Int {
-  pool.queue_target * ns_per_ms
-}
-
-fn queue_interval_ns(pool: Pool(conn, err)) -> Int {
-  pool.queue_interval * ns_per_ms
 }
 
 /// Starts a connection pool and registers it under `name`. All
@@ -480,14 +464,9 @@ fn initialise_pool(
 
   list.each(conns, pool.handle_idle)
 
-  let q =
-    queue.new()
-    |> queue.with_access(table.Private)
-    // Use a strictly-unique, monotonically increasing counter for queue keys.
-    |> queue.with_counter(counter.monotonic())
-    |> queue.build
-
   let now = counter.next(counter)
+
+  let codel = codel.new(pool.queue_target, pool.queue_interval, now)
 
   let _poll_timer =
     process.send_after(self, pool.queue_interval, Poll(last_queue_key: now))
@@ -512,11 +491,8 @@ fn initialise_pool(
       idle:,
       active: dict.new(),
       openers: dict.new(),
-      queue: q,
+      codel:,
       counter:,
-      delay: 0,
-      slow: False,
-      next: now + queue_interval_ns(pool),
       draining: None,
     )
 
@@ -827,14 +803,14 @@ fn do_enqueue(
 ) -> State(conn, err) {
   let monitor = process.monitor(caller)
   let sent_at = counter.next(state.counter)
-  let waiting = Waiting(caller:, monitor:, client:, deadline:, sent_at:)
+  let waiting = Waiting(caller:, monitor:, client:, deadline:)
 
   // The queue counter is strictly unique, so `push` never fails on a key
   // collision here. We still pattern-match defensively rather than crash the
   // whole pool. On the impossible-Error path we drop this single caller with
   // `ConnectionUnavailable` and tear down its monitor instead of taking down
   // every connection and waiter.
-  queue.push(state.queue, waiting)
+  codel.push(state.codel, waiting, sent_at)
   |> result.map(fn(key) {
     let _timer = process.send_after(state.self, timeout, Timeout(key, timeout))
 
@@ -858,10 +834,12 @@ fn do_expire(
   key: Int,
   timeout: Int,
 ) -> State(conn, err) {
-  queue.at(state.queue, key)
-  |> result.map(fn(waiting) {
+  codel.at(state.codel, key)
+  |> result.map(fn(entry) {
+    let codel.Entry(sent_at:, item: waiting) = entry
+
     let now = counter.next(state.counter)
-    let expires_at = waiting.sent_at + timeout * ns_per_ms
+    let expires_at = sent_at + timeout * ns_per_ms
 
     use <- bool.lazy_guard(when: now < expires_at, return: fn() {
       let remaining_ns = expires_at - now
@@ -873,7 +851,7 @@ fn do_expire(
       state
     })
 
-    queue.delete(state.queue, key)
+    codel.delete(state.codel, key)
     |> result.map(fn(_) {
       actor.send(waiting.client, Error(ConnectionTimeout))
 
@@ -889,7 +867,7 @@ fn do_expire(
 // Called when a caller process dies while holding a connection or waiting.
 // If the caller held an active connection, the connection is closed and
 // replaced. If the caller was waiting in the queue, the entry is cleaned
-// up lazily. `serve_waiter` checks `process.is_alive` at dequeue time,
+// up lazily. `codel_dequeue` checks `process.is_alive` at dequeue time,
 // and `do_expire` removes entries when their timeout fires.
 fn do_caller_down(state: State(conn, err), pid: Pid) -> State(conn, err) {
   // DOWN can come from an opener we monitor as well as from a caller. An
@@ -963,7 +941,7 @@ fn at_capacity(state: State(conn, err)) -> Bool {
 // head waiter is not checked here; dead waiters are closeed when served or
 // when their timeout fires. This is only a demand heuristic.
 fn queue_has_waiter(state: State(conn, err)) -> Bool {
-  result.is_ok(queue.first(state.queue))
+  result.is_ok(codel.first(state.codel))
 }
 
 // Spawn a monitored opener process that runs `handle_open` off the actor
@@ -1096,92 +1074,38 @@ fn do_close_idle(state: State(conn, err)) -> State(conn, err) {
   }
 }
 
-// --- CoDel algorithm ---
+// --- Serving waiters ---
 
-// Dispatches to the appropriate strategy based on
-// whether we're at an interval boundary, in slow mode, or in fast mode.
+// Hands a connection to the next waiter CoDel selects, closing out any waiters
+// it sheds on the way. A waiter whose caller has died is skipped and the
+// algorithm is asked again.
 fn codel_dequeue(
   state: State(conn, err),
   now: Int,
   conn: conn,
 ) -> State(conn, err) {
-  case { now >= state.next }, state.slow {
-    True, _ -> dequeue_first(state, now, conn)
-    False, False -> dequeue_fast(state, now, conn)
-    False, True ->
-      dequeue_slow(state, now, queue_target_ns(state.pool) * 2, conn)
-  }
-}
+  let #(c, outcome) = codel.dequeue(state.codel, now)
+  let state = State(..state, codel: c)
 
-// Called at an interval boundary.
-fn dequeue_first(
-  state: State(conn, err),
-  now: Int,
-  conn: conn,
-) -> State(conn, err) {
-  let next = now + queue_interval_ns(state.pool)
-  let slow = state.delay > queue_target_ns(state.pool)
+  case outcome {
+    codel.Serve(item: waiting, dropped:) -> {
+      list.each(dropped, drop_waiter)
 
-  queue.pop(state.queue)
-  |> result.map(fn(waiting) {
-    let delay = now - waiting.sent_at
-    let state = State(..state, next:, delay:, slow:)
+      case process.is_alive(waiting.caller) {
+        True -> serve_waiter(state, waiting, conn)
+        False -> {
+          process.demonitor_process(waiting.monitor)
 
-    serve_waiter(state, waiting, conn)
-  })
-  |> result.lazy_unwrap(fn() {
-    State(..state, next:, delay: 0, slow:)
-    |> push_idle(now, conn)
-  })
-}
-
-// Serve the first waiter immediately, tracking minimum delay.
-fn dequeue_fast(
-  state: State(conn, err),
-  now: Int,
-  conn: conn,
-) -> State(conn, err) {
-  queue.pop(state.queue)
-  |> result.map(fn(waiting) {
-    let delay = now - waiting.sent_at
-    let state = case delay < state.delay {
-      True -> State(..state, delay:)
-      False -> state
-    }
-    serve_waiter(state, waiting, conn)
-  })
-  |> result.lazy_unwrap(fn() { push_idle(state, now, conn) })
-}
-
-// Drop waiters that have been waiting longer than the timeout
-// threshold (target * 2), then serve the first valid waiter.
-fn dequeue_slow(
-  state: State(conn, err),
-  now: Int,
-  timeout: Int,
-  conn: conn,
-) -> State(conn, err) {
-  queue.pop(state.queue)
-  |> result.map(fn(waiting) {
-    case now - waiting.sent_at > timeout {
-      True -> {
-        drop_waiter(waiting)
-
-        state
-        |> dequeue_slow(now, timeout, conn)
-      }
-      False -> {
-        let delay = now - waiting.sent_at
-        let state = case delay < state.delay {
-          True -> State(..state, delay:)
-          False -> state
+          codel_dequeue(state, counter.next(state.counter), conn)
         }
-
-        serve_waiter(state, waiting, conn)
       }
     }
-  })
-  |> result.lazy_unwrap(fn() { push_idle(state, now, conn) })
+    codel.Empty(dropped:) -> {
+      list.each(dropped, drop_waiter)
+
+      push_idle(state, now, conn)
+    }
+  }
 }
 
 // Return a connection to the idle set, stamping it with the current time,
@@ -1209,96 +1133,44 @@ fn serve_waiter(
   waiting: Waiting(conn, PoolError(err)),
   conn: conn,
 ) -> State(conn, err) {
-  case process.is_alive(waiting.caller) {
-    False -> {
-      process.demonitor_process(waiting.monitor)
+  let now = counter.next(state.counter)
 
-      let now = counter.next(state.counter)
-      codel_dequeue(state, now, conn)
-    }
-    True -> {
-      let now = counter.next(state.counter)
+  let deadline_timer =
+    process.send_after(
+      state.self,
+      waiting.deadline,
+      DeadlineExpired(waiting.caller, now),
+    )
 
-      let deadline_timer =
-        process.send_after(
-          state.self,
-          waiting.deadline,
-          DeadlineExpired(waiting.caller, now),
-        )
+  let activated =
+    Active(
+      conn:,
+      monitor: waiting.monitor,
+      deadline_timer:,
+      checkout_time: now,
+      depth: 1,
+    )
 
-      let activated =
-        Active(
-          conn:,
-          monitor: waiting.monitor,
-          deadline_timer:,
-          checkout_time: now,
-          depth: 1,
-        )
+  let active = dict.insert(state.active, waiting.caller, activated)
 
-      let active = dict.insert(state.active, waiting.caller, activated)
+  process.send(waiting.client, Ok(conn))
 
-      process.send(waiting.client, Ok(conn))
+  state.pool.handle_active(conn)
 
-      state.pool.handle_active(conn)
-
-      State(..state, active:)
-    }
-  }
+  State(..state, active:)
 }
 
 // --- CoDel polling ---
 
 fn do_poll(state: State(conn, err), last_queue_key: Int) -> State(conn, err) {
-  let time = counter.next(state.counter)
+  let now = counter.next(state.counter)
 
-  case queue.first(state.queue) {
-    Ok(#(key, waiting)) if key <= last_queue_key -> {
-      let delay = time - waiting.sent_at
+  let #(c, polled) = codel.poll(state.codel, now, last_queue_key)
+  let codel.Polled(dropped:, last_key:) = polled
 
-      state
-      |> codel_timeout(delay, time)
-      |> start_poll(key)
-    }
-    Ok(#(key, _)) -> start_poll(state, key)
-    _ -> start_poll(state, last_queue_key)
-  }
-}
+  list.each(dropped, drop_waiter)
 
-fn codel_timeout(
-  state: State(conn, err),
-  delay: Int,
-  time: Int,
-) -> State(conn, err) {
-  use <- bool.guard(when: time < state.next, return: state)
-
-  let next = state.next + queue_interval_ns(state.pool)
-
-  case state.delay > queue_target_ns(state.pool) {
-    True ->
-      State(..state, slow: True, delay:, next:)
-      |> poll_drop_slow(time, queue_target_ns(state.pool) * 2)
-    False -> State(..state, slow: False, delay:, next:)
-  }
-}
-
-fn poll_drop_slow(
-  state: State(conn, err),
-  now: Int,
-  timeout: Int,
-) -> State(conn, err) {
-  queue.first(state.queue)
-  |> result.try(fn(queued) {
-    let #(key, waiting) = queued
-
-    use <- bool.guard({ now - waiting.sent_at <= timeout }, Ok(state))
-
-    queue.delete(state.queue, key)
-    |> result.map(fn(_) {
-      drop_waiter(waiting)
-      poll_drop_slow(state, now, timeout)
-    })
-  })
-  |> result.unwrap(state)
+  start_poll(State(..state, codel: c), last_key)
 }
 
 fn start_poll(
@@ -1354,12 +1226,10 @@ fn drop_waiter(waiting: Waiting(conn, PoolError(err))) -> Nil {
 }
 
 fn drain_queue(state: State(conn, err)) -> State(conn, err) {
-  queue.pop(state.queue)
-  |> result.map(fn(waiting) {
-    drop_waiter(waiting)
-    drain_queue(state)
-  })
-  |> result.unwrap(state)
+  codel.pop_all(state.codel)
+  |> list.each(drop_waiter)
+
+  state
 }
 
 fn close_each_active(state: State(conn, err)) -> State(conn, err) {
