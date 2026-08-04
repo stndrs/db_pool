@@ -1,4 +1,5 @@
 import db_pool/internal/codel.{type Codel}
+import db_pool/internal/time.{type Clock, type Instant}
 import gleam/bool
 import gleam/dict.{type Dict}
 import gleam/dynamic/decode
@@ -7,22 +8,26 @@ import gleam/erlang/process.{type Pid, type Subject}
 import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
+import gleam/order
 import gleam/otp/actor
 import gleam/otp/supervision
 import gleam/result
 import gleam/string
+import gleam/time/duration.{type Duration}
 import logging
-import rasa/counter
-import rasa/monotonic
 
-const ns_per_ms = 1_000_000
+fn reconnect_min() -> Duration {
+  duration.milliseconds(1000)
+}
 
-const reconnect_min_ms = 1000
-
-const reconnect_max_ms = 30_000
+fn reconnect_max() -> Duration {
+  duration.milliseconds(30_000)
+}
 
 // Minimum interval for checking for idle connections.
-const close_min_interval_ms = 1000
+fn close_min_interval() -> Duration {
+  duration.milliseconds(1000)
+}
 
 /// Errors that can occur when interacting with the pool.
 ///
@@ -188,7 +193,7 @@ type Waiting(conn, err) {
     caller: Pid,
     monitor: process.Monitor,
     client: Subject(Result(conn, err)),
-    deadline: Int,
+    deadline: Duration,
   )
 }
 
@@ -197,7 +202,7 @@ type Active(conn) {
     conn: conn,
     monitor: process.Monitor,
     deadline_timer: process.Timer,
-    checkout_time: Int,
+    checkout_time: Instant,
     depth: Int,
   )
 }
@@ -206,14 +211,14 @@ type Active(conn) {
 // carries the `backoff` to use if this open fails so retries keep their
 // exponential schedule.
 type Opener {
-  Opener(monitor: process.Monitor, backoff: Int)
+  Opener(monitor: process.Monitor, backoff: Duration)
 }
 
-// An idle connection paired with the monotonic nanosecond timestamp at which
-// it went idle. The idle list stays LIFO so hot connections are reused from
-// the head and cold ones age at the tail.
+// An idle connection paired with the instant at which it went idle. The idle
+// list stays LIFO so hot connections are reused from the head and cold ones
+// age at the tail.
 type Idle(conn) {
-  Idle(conn: conn, since: Int)
+  Idle(conn: conn, since: Instant)
 }
 
 // How a draining pool should finish once its last in-flight open resolves.
@@ -238,7 +243,7 @@ type State(conn, err) {
     openers: Dict(Pid, Opener),
     // The queue of waiting callers and the overload state governing it.
     codel: Codel(Waiting(conn, PoolError(err))),
-    counter: counter.Counter,
+    clock: Clock,
     // Set to `Some` mode when shutdown/exit has begun but in-flight opens
     // remain. The pool stays alive to close arriving connections, then
     // finishes.
@@ -269,9 +274,9 @@ pub fn start(
   name: process.Name(Message(conn, err)),
   timeout: Int,
 ) -> Result(actor.Started(Subject(Message(conn, err))), actor.StartError) {
-  let counter = counter.monotonic_time(monotonic.Nanosecond)
+  let clock = time.clock()
 
-  actor.new_with_initialiser(timeout, initialise_pool(_, pool, counter))
+  actor.new_with_initialiser(timeout, initialise_pool(_, pool, clock))
   |> actor.on_message(handle_message)
   |> actor.named(name)
   |> actor.start
@@ -298,22 +303,22 @@ pub opaque type Message(conn, err) {
   CheckOut(
     client: Subject(Result(conn, PoolError(err))),
     caller: Pid,
-    timeout: Int,
-    deadline: Int,
+    timeout: Duration,
+    deadline: Duration,
   )
   CheckIn(caller: Pid, conn: conn)
-  Timeout(time_sent: Int, timeout: Int)
-  DeadlineExpired(caller: Pid, checkout_time: Int)
+  Timeout(key: Int, timeout: Duration)
+  DeadlineExpired(caller: Pid, checkout_time: Instant)
   Poll(last_queue_key: Int)
   PoolExit(process.ExitMessage)
   CallerDown(process.Down)
   // Delivered by an opener process with the outcome of a `handle_open`
   // call. `pid` identifies the opener so the pool can reconcile it against
   // its `openers` set. `backoff` is the retry delay to use on failure.
-  OpenResult(pid: Pid, result: Result(conn, PoolError(err)), backoff: Int)
+  OpenResult(pid: Pid, result: Result(conn, PoolError(err)), backoff: Duration)
   // Fired by a retry timer after a failed open. Re-checks demand before
   // spawning a fresh opener.
-  RetryOpen(backoff: Int)
+  RetryOpen(backoff: Duration)
   // Fired by the periodic close timer when `max_idle_time` is set; closes
   // connections that have been idle past the limit.
   CloseIdle
@@ -358,14 +363,14 @@ pub fn checkout(
 
   // Clamp so negative values can't crash the shared pool actor's internal
   // `send_after` calls (badarg) and take down every other caller.
-  let timeout = int.max(timeout, 0)
-  let deadline = int.max(deadline, 0)
+  let timeout_ms = int.max(timeout, 0)
+  let deadline_ms = int.max(deadline, 0)
 
-  process.call(pool, timeout + client_timeout_buffer_ms, CheckOut(
+  process.call(pool, timeout_ms + client_timeout_buffer_ms, CheckOut(
     _,
     caller:,
-    timeout:,
-    deadline:,
+    timeout: duration.milliseconds(timeout_ms),
+    deadline: duration.milliseconds(deadline_ms),
   ))
 }
 
@@ -398,14 +403,14 @@ pub fn with_connection(
 
   // Clamp so negative values can't crash the shared pool actor's internal
   // `send_after` calls (badarg) and take down every other caller.
-  let timeout = int.max(timeout, 0)
-  let deadline = int.max(deadline, 0)
+  let timeout_ms = int.max(timeout, 0)
+  let deadline_ms = int.max(deadline, 0)
 
-  process.call(pool, timeout + client_timeout_buffer_ms, CheckOut(
+  process.call(pool, timeout_ms + client_timeout_buffer_ms, CheckOut(
     _,
     caller:,
-    timeout:,
-    deadline:,
+    timeout: duration.milliseconds(timeout_ms),
+    deadline: duration.milliseconds(deadline_ms),
   ))
   |> result.map(fn(conn) {
     let res = next(conn)
@@ -438,7 +443,7 @@ pub fn shutdown(
 fn initialise_pool(
   self: Subject(Message(conn, err)),
   pool: Pool(conn, err),
-  counter: counter.Counter,
+  clock: Clock,
 ) -> Result(
   actor.Initialised(
     State(conn, err),
@@ -464,18 +469,32 @@ fn initialise_pool(
 
   list.each(conns, pool.handle_idle)
 
-  let now = counter.next(counter)
+  let now = time.now(clock)
 
-  let codel = codel.new(pool.queue_target, pool.queue_interval, now)
+  let codel =
+    codel.new(
+      duration.milliseconds(pool.queue_target),
+      duration.milliseconds(pool.queue_interval),
+      now,
+    )
 
+  // The poll is seeded with key 0 rather than a clock reading: queue keys come
+  // from `erlang:unique_integer([monotonic])`, which starts near
+  // -576460752303423488, so every key the VM issues is negative and the first
+  // poll's `key <= last_key` test holds - the same branch the old nanosecond
+  // seed produced. A key counter starting at 1 would flip that branch.
   let _poll_timer =
-    process.send_after(self, pool.queue_interval, Poll(last_queue_key: now))
+    process.send_after(self, pool.queue_interval, Poll(last_queue_key: 0))
 
   // Arm the idle-close sweep only when a limit is configured.
   pool.max_idle_time
   |> option.map(fn(ms) {
     let _close_timer =
-      process.send_after(self, close_interval_ms(ms), CloseIdle)
+      process.send_after(
+        self,
+        duration.to_milliseconds(close_interval(duration.milliseconds(ms))),
+        CloseIdle,
+      )
 
     Nil
   })
@@ -492,7 +511,7 @@ fn initialise_pool(
       active: dict.new(),
       openers: dict.new(),
       codel:,
-      counter:,
+      clock:,
       draining: None,
     )
 
@@ -529,8 +548,8 @@ fn handle_running(
       }
       actor.continue(state)
     }
-    Timeout(time_sent:, timeout:) -> {
-      let state = do_expire(state, time_sent, timeout)
+    Timeout(key:, timeout:) -> {
+      let state = do_expire(state, key, timeout)
       actor.continue(state)
     }
     DeadlineExpired(caller:, checkout_time:) -> {
@@ -712,7 +731,7 @@ fn do_checkout(
   state: State(conn, err),
   caller: Pid,
   client: Subject(Result(conn, PoolError(err))),
-  deadline: Int,
+  deadline: Duration,
 ) -> Result(State(conn, err), Nil) {
   dict.get(state.active, caller)
   |> result.map(fn(active) {
@@ -733,10 +752,14 @@ fn do_checkout(
     case state.idle {
       [Idle(conn:, ..), ..rest] -> {
         let monitor = process.monitor(caller)
-        let now = counter.next(state.counter)
+        let now = time.now(state.clock)
 
         let deadline_timer =
-          process.send_after(state.self, deadline, DeadlineExpired(caller, now))
+          process.send_after(
+            state.self,
+            duration.to_milliseconds(deadline),
+            DeadlineExpired(caller, now),
+          )
 
         let activated =
           Active(conn:, monitor:, deadline_timer:, checkout_time: now, depth: 1)
@@ -786,7 +809,7 @@ fn do_checkin(
         let active = dict.delete(state.active, caller)
         let state = State(..state, active:)
 
-        let now = counter.next(state.counter)
+        let now = time.now(state.clock)
         codel_dequeue(state, now, prev.conn)
       }
     }
@@ -798,11 +821,11 @@ fn do_enqueue(
   state: State(conn, err),
   caller: Pid,
   client: Subject(Result(conn, PoolError(err))),
-  timeout: Int,
-  deadline: Int,
+  timeout: Duration,
+  deadline: Duration,
 ) -> State(conn, err) {
   let monitor = process.monitor(caller)
-  let sent_at = counter.next(state.counter)
+  let sent_at = time.now(state.clock)
   let waiting = Waiting(caller:, monitor:, client:, deadline:)
 
   // The queue counter is strictly unique, so `push` never fails on a key
@@ -812,14 +835,19 @@ fn do_enqueue(
   // every connection and waiter.
   codel.push(state.codel, waiting, sent_at)
   |> result.map(fn(key) {
-    let _timer = process.send_after(state.self, timeout, Timeout(key, timeout))
+    let _timer =
+      process.send_after(
+        state.self,
+        duration.to_milliseconds(timeout),
+        Timeout(key, timeout),
+      )
 
     // Grow to meet demand: one open per enqueue, bounded by the capacity
     // invariant so a burst of N waiters spawns at most enough opens to
     // reach `max_size`.
     case at_capacity(state) {
       True -> state
-      False -> spawn_opener(state, reconnect_min_ms)
+      False -> spawn_opener(state, reconnect_min())
     }
   })
   |> result.lazy_unwrap(fn() {
@@ -832,24 +860,27 @@ fn do_enqueue(
 fn do_expire(
   state: State(conn, err),
   key: Int,
-  timeout: Int,
+  timeout: Duration,
 ) -> State(conn, err) {
   codel.at(state.codel, key)
   |> result.map(fn(entry) {
     let codel.Entry(sent_at:, item: waiting) = entry
 
-    let now = counter.next(state.counter)
-    let expires_at = sent_at + timeout * ns_per_ms
+    let now = time.now(state.clock)
+    let expires_at = time.advance(sent_at, by: timeout)
 
-    use <- bool.lazy_guard(when: now < expires_at, return: fn() {
-      let remaining_ns = expires_at - now
-      let remaining_ms = remaining_ns / ns_per_ms
+    use <- bool.lazy_guard(
+      when: time.compare(now, expires_at) == order.Lt,
+      return: fn() {
+        let remaining_ms =
+          duration.to_milliseconds(time.since(from: now, to: expires_at))
 
-      let _timer =
-        process.send_after(state.self, remaining_ms, Timeout(key, timeout))
+        let _timer =
+          process.send_after(state.self, remaining_ms, Timeout(key, timeout))
 
-      state
-    })
+        state
+      },
+    )
 
     codel.delete(state.codel, key)
     |> result.map(fn(_) {
@@ -898,7 +929,7 @@ fn do_caller_down(state: State(conn, err), pid: Pid) -> State(conn, err) {
 fn do_deadline_expired(
   state: State(conn, err),
   caller: Pid,
-  checkout_time: Int,
+  checkout_time: Instant,
 ) -> State(conn, err) {
   dict.get(state.active, caller)
   |> result.map(fn(active) {
@@ -925,7 +956,7 @@ fn close_active(
   // Open a replacement only when a waiter needs it and capacity allows. Used
   // by the demand-driven crash/deadline replacement paths.
   case queue_has_waiter(state) && !at_capacity(state) {
-    True -> spawn_opener(state, reconnect_min_ms)
+    True -> spawn_opener(state, reconnect_min())
     False -> state
   }
 }
@@ -947,7 +978,10 @@ fn queue_has_waiter(state: State(conn, err)) -> Bool {
 // Spawn a monitored opener process that runs `handle_open` off the actor
 // loop and reports the outcome via `OpenResult`. `pending_opens` grows by
 // one until the result or the opener's down signal is handled.
-fn spawn_opener(state: State(conn, err), backoff: Int) -> State(conn, err) {
+fn spawn_opener(
+  state: State(conn, err),
+  backoff: Duration,
+) -> State(conn, err) {
   let self = state.self
   let handle_open = state.pool.handle_open
 
@@ -968,7 +1002,10 @@ fn spawn_opener(state: State(conn, err), backoff: Int) -> State(conn, err) {
 // After a failed open, retry only if demand still exists (a waiter queued
 // and capacity available). Otherwise the failure is dropped; a later
 // checkout starts a fresh open.
-fn retry_if_demand(state: State(conn, err), backoff: Int) -> State(conn, err) {
+fn retry_if_demand(
+  state: State(conn, err),
+  backoff: Duration,
+) -> State(conn, err) {
   case queue_has_waiter(state) && !at_capacity(state) {
     True -> schedule_retry(state, backoff)
     False -> Nil
@@ -984,7 +1021,7 @@ fn do_open_result(
   state: State(conn, err),
   pid: Pid,
   open_result: Result(conn, PoolError(err)),
-  backoff: Int,
+  backoff: Duration,
 ) -> State(conn, err) {
   dict.get(state.openers, pid)
   |> result.try(fn(opener) {
@@ -996,7 +1033,7 @@ fn do_open_result(
 
     open_result
     |> result.map(fn(conn) {
-      let now = counter.next(state.counter)
+      let now = time.now(state.clock)
 
       State(..state, current_size: state.current_size + 1)
       |> codel_dequeue(now, conn)
@@ -1018,17 +1055,20 @@ fn do_open_result(
 
 // Fired by a retry timer. Re-checks demand and spawns a fresh opener if
 // it still exists.
-fn do_retry_open(state: State(conn, err), backoff: Int) -> State(conn, err) {
+fn do_retry_open(
+  state: State(conn, err),
+  backoff: Duration,
+) -> State(conn, err) {
   case queue_has_waiter(state) && !at_capacity(state) {
     True -> spawn_opener(state, backoff)
     False -> state
   }
 }
 
-fn schedule_retry(state: State(conn, err), backoff: Int) -> Nil {
-  let half = backoff / 2
-  let delay = half + int.random(half + 1)
-  let next_backoff = int.min(backoff * 2, reconnect_max_ms)
+fn schedule_retry(state: State(conn, err), backoff: Duration) -> Nil {
+  let half_ms = duration.to_milliseconds(time.halve(backoff))
+  let delay = half_ms + int.random(half_ms + 1)
+  let next_backoff = time.min(time.double(backoff), reconnect_max())
 
   let _timer = process.send_after(state.self, delay, RetryOpen(next_backoff))
 
@@ -1038,9 +1078,10 @@ fn schedule_retry(state: State(conn, err), backoff: Int) -> Nil {
 // --- Idle closeing ---
 
 // The close sweep interval for a given idle limit: half the limit, floored so
-// the timer can never fire too aggressively.
-fn close_interval_ms(max_idle_time: Int) -> Int {
-  int.max(max_idle_time / 2, close_min_interval_ms)
+// the timer can never fire too aggressively. `max_idle_time` is non-negative
+// here because the public `max_idle_time` setter clamps it to at least 1.
+fn close_interval(max_idle_time: Duration) -> Duration {
+  time.max(time.halve(max_idle_time), close_min_interval())
 }
 
 /// Fired by the close timer. Closes every idle connection that has been idle
@@ -1051,11 +1092,14 @@ fn do_close_idle(state: State(conn, err)) -> State(conn, err) {
   case state.pool.max_idle_time {
     None -> state
     Some(ms) -> {
-      let now = counter.next(state.counter)
-      let threshold = ms * ns_per_ms
+      let now = time.now(state.clock)
+      let max_idle = duration.milliseconds(ms)
 
       let #(expired, live) =
-        list.partition(state.idle, fn(idle) { now - idle.since > threshold })
+        list.partition(state.idle, fn(idle) {
+          duration.compare(time.since(from: idle.since, to: now), max_idle)
+          == order.Gt
+        })
 
       list.each(expired, fn(idle) {
         let _ = state.pool.handle_close(idle.conn)
@@ -1063,7 +1107,11 @@ fn do_close_idle(state: State(conn, err)) -> State(conn, err) {
       })
 
       let _close_timer =
-        process.send_after(state.self, close_interval_ms(ms), CloseIdle)
+        process.send_after(
+          state.self,
+          duration.to_milliseconds(close_interval(max_idle)),
+          CloseIdle,
+        )
 
       State(
         ..state,
@@ -1081,7 +1129,7 @@ fn do_close_idle(state: State(conn, err)) -> State(conn, err) {
 // algorithm is asked again.
 fn codel_dequeue(
   state: State(conn, err),
-  now: Int,
+  now: Instant,
   conn: conn,
 ) -> State(conn, err) {
   let #(c, outcome) = codel.dequeue(state.codel, now)
@@ -1096,7 +1144,7 @@ fn codel_dequeue(
         False -> {
           process.demonitor_process(waiting.monitor)
 
-          codel_dequeue(state, counter.next(state.counter), conn)
+          codel_dequeue(state, time.now(state.clock), conn)
         }
       }
     }
@@ -1113,7 +1161,7 @@ fn codel_dequeue(
 // shrinks `current_size`; the connection is not replaced.
 fn push_idle(
   state: State(conn, err),
-  now: Int,
+  now: Instant,
   conn: conn,
 ) -> State(conn, err) {
   case list.length(state.idle) >= max_idle(state.pool) {
@@ -1133,12 +1181,12 @@ fn serve_waiter(
   waiting: Waiting(conn, PoolError(err)),
   conn: conn,
 ) -> State(conn, err) {
-  let now = counter.next(state.counter)
+  let now = time.now(state.clock)
 
   let deadline_timer =
     process.send_after(
       state.self,
-      waiting.deadline,
+      duration.to_milliseconds(waiting.deadline),
       DeadlineExpired(waiting.caller, now),
     )
 
@@ -1163,7 +1211,7 @@ fn serve_waiter(
 // --- CoDel polling ---
 
 fn do_poll(state: State(conn, err), last_queue_key: Int) -> State(conn, err) {
-  let now = counter.next(state.counter)
+  let now = time.now(state.clock)
 
   let #(c, polled) = codel.poll(state.codel, now, last_queue_key)
   let codel.Polled(dropped:, last_key:) = polled

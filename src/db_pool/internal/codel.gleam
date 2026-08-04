@@ -8,33 +8,34 @@
 //// The queue is ETS backed, so a `Codel` is not a value. Every copy shares one
 //// queue, and a push or pop through any copy is visible to all of them.
 
+import db_pool/internal/time.{type Instant}
 import gleam/bool
 import gleam/list
+import gleam/order
 import gleam/result
+import gleam/time/duration.{type Duration}
 import rasa/counter
 import rasa/queue.{type Queue}
 import rasa/table
 
-const ns_per_ms = 1_000_000
-
 pub opaque type Codel(a) {
   Codel(
     queue: Queue(Entry(a)),
-    // The maximum acceptable queue delay, in nanoseconds.
-    target: Int,
-    // The length of a measurement interval, in nanoseconds.
-    interval: Int,
+    // The maximum acceptable queue delay.
+    target: Duration,
+    // The length of a measurement interval.
+    interval: Duration,
     // The minimum delay observed during the current interval.
-    delay: Int,
+    delay: Duration,
     slow: Bool,
-    // The timestamp at which the current interval ends.
-    next: Int,
+    // The instant at which the current interval ends.
+    next: Instant,
   )
 }
 
-/// A queued item paired with the timestamp at which it was pushed.
+/// A queued item paired with the instant at which it was pushed.
 pub type Entry(a) {
-  Entry(sent_at: Int, item: a)
+  Entry(sent_at: Instant, item: a)
 }
 
 /// The result of a `dequeue`. `dropped` holds the items dropped on the way
@@ -54,12 +55,7 @@ pub type Polled(a) {
 
 /// Returns a `Codel` with an empty queue, in fast mode, whose first
 /// measurement interval ends one interval after `now`.
-///
-/// `target_ms` and `interval_ms` are in milliseconds; every timestamp the
-/// module is subsequently passed is in nanoseconds.
-pub fn new(target_ms: Int, interval_ms: Int, now: Int) -> Codel(a) {
-  let interval = interval_ms * ns_per_ms
-
+pub fn new(target: Duration, interval: Duration, now: Instant) -> Codel(a) {
   let queue =
     queue.new()
     |> queue.with_access(table.Private)
@@ -69,17 +65,17 @@ pub fn new(target_ms: Int, interval_ms: Int, now: Int) -> Codel(a) {
 
   Codel(
     queue:,
-    target: target_ms * ns_per_ms,
+    target:,
     interval:,
-    delay: 0,
+    delay: time.zero(),
     slow: False,
-    next: now + interval,
+    next: time.advance(now, by: interval),
   )
 }
 
 /// Pushes an item onto the back of the queue, stamped with `now`, and returns
 /// its key. Errors only if the key counter hands back a key already in use.
-pub fn push(codel: Codel(a), item: a, now: Int) -> Result(Int, Nil) {
+pub fn push(codel: Codel(a), item: a, now: Instant) -> Result(Int, Nil) {
   queue.push(codel.queue, Entry(sent_at: now, item:))
 }
 
@@ -118,8 +114,8 @@ fn do_pop_all(codel: Codel(a), popped: List(a)) -> List(a) {
 /// recomputed. Otherwise fast mode serves the oldest item immediately, and
 /// slow mode sheds items that have waited longer than twice the target before
 /// serving the first one that has not.
-pub fn dequeue(codel: Codel(a), now: Int) -> #(Codel(a), Outcome(a)) {
-  case now >= codel.next, codel.slow {
+pub fn dequeue(codel: Codel(a), now: Instant) -> #(Codel(a), Outcome(a)) {
+  case time.compare(now, codel.next) != order.Lt, codel.slow {
     True, _ -> dequeue_boundary(codel, now)
     False, False -> dequeue_fast(codel, now)
     False, True -> dequeue_slow(codel, now, [])
@@ -129,41 +125,51 @@ pub fn dequeue(codel: Codel(a), now: Int) -> #(Codel(a), Outcome(a)) {
 // At an interval boundary the mode for the interval starting now is decided by
 // the delay recorded over the interval that just ended, and the recorded delay
 // is reset to whatever this dequeue observes. An empty queue resets it to zero.
-fn dequeue_boundary(codel: Codel(a), now: Int) -> #(Codel(a), Outcome(a)) {
-  let next = now + codel.interval
-  let slow = codel.delay > codel.target
+fn dequeue_boundary(codel: Codel(a), now: Instant) -> #(Codel(a), Outcome(a)) {
+  let next = time.advance(now, by: codel.interval)
+  let slow = duration.compare(codel.delay, codel.target) == order.Gt
 
   queue.pop(codel.queue)
   |> result.map(fn(entry) {
     #(
-      Codel(..codel, next:, slow:, delay: now - entry.sent_at),
+      Codel(
+        ..codel,
+        next:,
+        slow:,
+        delay: time.since(from: entry.sent_at, to: now),
+      ),
       Serve(item: entry.item, dropped: []),
     )
   })
   |> result.lazy_unwrap(fn() {
-    #(Codel(..codel, next:, slow:, delay: 0), Empty(dropped: []))
+    #(Codel(..codel, next:, slow:, delay: time.zero()), Empty(dropped: []))
   })
 }
 
-fn dequeue_fast(codel: Codel(a), now: Int) -> #(Codel(a), Outcome(a)) {
+fn dequeue_fast(codel: Codel(a), now: Instant) -> #(Codel(a), Outcome(a)) {
   queue.pop(codel.queue)
   |> result.map(fn(entry) {
-    #(observe(codel, now - entry.sent_at), Serve(item: entry.item, dropped: []))
+    #(
+      observe(codel, time.since(from: entry.sent_at, to: now)),
+      Serve(item: entry.item, dropped: []),
+    )
   })
   |> result.lazy_unwrap(fn() { #(codel, Empty(dropped: [])) })
 }
 
 fn dequeue_slow(
   codel: Codel(a),
-  now: Int,
+  now: Instant,
   dropped: List(a),
 ) -> #(Codel(a), Outcome(a)) {
   queue.pop(codel.queue)
   |> result.map(fn(entry) {
-    case now - entry.sent_at > codel.target * 2 {
+    let waited = time.since(from: entry.sent_at, to: now)
+
+    case duration.compare(waited, time.double(codel.target)) == order.Gt {
       True -> dequeue_slow(codel, now, [entry.item, ..dropped])
       False -> #(
-        observe(codel, now - entry.sent_at),
+        observe(codel, waited),
         Serve(item: entry.item, dropped: list.reverse(dropped)),
       )
     }
@@ -172,10 +178,13 @@ fn dequeue_slow(
 }
 
 // Records a delay observed away from an interval boundary. Only a smaller
-// delay is kept. The interval's figure is the minimum seen during it, and only
-// a boundary may raise or reset it.
-fn observe(codel: Codel(a), delay: Int) -> Codel(a) {
-  case delay < codel.delay {
+// delay is kept. The interval's figure is the minimum seen during it, and
+// only a boundary may raise or reset it.
+//
+// Every compared duration here is a `time.since` over readings from one
+// monotonic clock, so it is non-negative.
+fn observe(codel: Codel(a), delay: Duration) -> Codel(a) {
+  case duration.compare(delay, codel.delay) == order.Lt {
     True -> Codel(..codel, delay:)
     False -> codel
   }
@@ -190,12 +199,13 @@ fn observe(codel: Codel(a), delay: Int) -> Codel(a) {
 /// delay to judge.
 pub fn poll(
   codel: Codel(a),
-  now: Int,
+  now: Instant,
   last_key: Int,
 ) -> #(Codel(a), Polled(a)) {
   case queue.first(codel.queue) {
     Ok(#(key, entry)) if key <= last_key -> {
-      let #(codel, dropped) = interval_elapsed(codel, now, now - entry.sent_at)
+      let #(codel, dropped) =
+        interval_elapsed(codel, now, time.since(from: entry.sent_at, to: now))
 
       #(codel, Polled(dropped:, last_key: key))
     }
@@ -208,14 +218,17 @@ pub fn poll(
 // `next` by one interval rather than restarting it from `now`.
 fn interval_elapsed(
   codel: Codel(a),
-  now: Int,
-  delay: Int,
+  now: Instant,
+  delay: Duration,
 ) -> #(Codel(a), List(a)) {
-  use <- bool.guard(when: now < codel.next, return: #(codel, []))
+  use <- bool.guard(
+    when: time.compare(now, codel.next) == order.Lt,
+    return: #(codel, []),
+  )
 
-  let next = codel.next + codel.interval
+  let next = time.advance(codel.next, by: codel.interval)
 
-  case codel.delay > codel.target {
+  case duration.compare(codel.delay, codel.target) == order.Gt {
     True -> {
       let codel = Codel(..codel, slow: True, delay:, next:)
 
@@ -227,12 +240,13 @@ fn interval_elapsed(
 
 // Sheds entries from the head of the queue for as long as they have waited
 // longer than twice the target.
-fn drop_stale(codel: Codel(a), now: Int, dropped: List(a)) -> List(a) {
+fn drop_stale(codel: Codel(a), now: Instant, dropped: List(a)) -> List(a) {
   queue.first(codel.queue)
   |> result.map(fn(enqueued) {
     let #(key, entry) = enqueued
+    let waited = time.since(from: entry.sent_at, to: now)
 
-    case now - entry.sent_at > codel.target * 2 {
+    case duration.compare(waited, time.double(codel.target)) == order.Gt {
       False -> list.reverse(dropped)
       True -> {
         let _ = queue.delete(codel.queue, key)
