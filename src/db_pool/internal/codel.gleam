@@ -1,12 +1,8 @@
-//// The CoDel (Controlled Delay) algorithm used to manage the pool's queue of
-//// waiting callers.
+//// The [CoDel][1] algorithm manages the pool's queue of waiting callers.
+//// This module handles the queue and `Codel` state. The queue is backed
+//// by ETS.
 ////
-//// This module owns the queue and the algorithm's state. It returns
-//// decisions. Carrying out those decisions is left up to the caller.
-//// Time is always passed in, so the algorithm can be driven directly by tests.
-////
-//// The queue is ETS backed, so a `Codel` is not a value. Every copy shares one
-//// queue, and a push or pop through any copy is visible to all of them.
+//// [1]: https://en.wikipedia.org/wiki/CoDel
 
 import db_pool/internal/time.{type Instant}
 import gleam/bool
