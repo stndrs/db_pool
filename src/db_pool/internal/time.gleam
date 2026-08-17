@@ -1,21 +1,4 @@
 //// Types for the pool's time values.
-////
-//// Time in this package comes in two kinds. An `Instant` is a point on the
-//// monotonic clock; a `Duration` is a span. Subtracting one instant from
-//// another gives a duration, advancing an instant by a duration gives another
-//// instant, and adding two instants is meaningless and does not compile.
-////
-//// Durations are `gleam_time`'s. Instants are ours, because `gleam_time`'s
-//// `Timestamp` is wall-clock time, which can jump backwards - a pool measuring
-//// queue delay needs a reading that only ever increases.
-////
-//// Millisecond values are what OTP and this package's public API deal in;
-//// nanosecond values are what the monotonic clock deals in. Converting between
-//// them happens through `gleam/time/duration` and nowhere else.
-////
-//// Durations in this package are non-negative by construction, which is why
-//// the magnitude-ordering of `duration.compare`, `min` and `max` is safe; a
-//// duration that could go negative must not be passed through them.
 
 import gleam/int
 import gleam/order.{type Order}
@@ -25,15 +8,13 @@ import rasa/monotonic
 
 const ns_per_second = 1_000_000_000
 
-/// A source of monotonic time. Held by the pool actor; reading it is an
-/// effect, so modules that must stay pure take `Instant` values as arguments
-/// instead of holding a clock.
+/// A source of monotonic time. Reading it is an effect, so modules that must
+/// stay pure take `Instant` values as arguments instead of holding a clock.
 pub opaque type Clock {
   Clock(counter: counter.Counter)
 }
 
-/// A point on the monotonic clock, in nanoseconds. Only meaningful relative to
-/// another `Instant` from the same clock.
+/// A point on the monotonic clock, in nanoseconds.
 pub opaque type Instant {
   Instant(nanoseconds: Int)
 }
@@ -48,8 +29,7 @@ pub fn now(clock: Clock) -> Instant {
   Instant(counter.next(clock.counter))
 }
 
-/// Adopts a raw nanosecond reading as an `Instant`. A test-fixture
-/// constructor, for building `Instant` values without a real clock.
+/// Adopts a raw nanosecond reading as an `Instant`.
 pub fn from_nanoseconds(nanoseconds: Int) -> Instant {
   Instant(nanoseconds)
 }
