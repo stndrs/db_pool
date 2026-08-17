@@ -4,7 +4,7 @@
 ////
 //// [1]: https://en.wikipedia.org/wiki/CoDel
 
-import db_pool/internal/time.{type Instant}
+import db_pool/internal/time
 import gleam/bool
 import gleam/list
 import gleam/order
@@ -25,13 +25,13 @@ pub opaque type Codel(a) {
     delay: Duration,
     slow: Bool,
     // The instant at which the current interval ends.
-    next: Instant,
+    next: time.Instant,
   )
 }
 
 /// A queued item paired with the instant at which it was pushed.
 pub type Entry(a) {
-  Entry(sent_at: Instant, item: a)
+  Entry(sent_at: time.Instant, item: a)
 }
 
 /// The result of a `dequeue`. `dropped` holds the items dropped on the way
@@ -51,7 +51,11 @@ pub type Polled(a) {
 
 /// Returns a `Codel` with an empty queue, in fast mode, whose first
 /// measurement interval ends one interval after `now`.
-pub fn new(target: Duration, interval: Duration, now: Instant) -> Codel(a) {
+pub fn new(
+  target: Duration,
+  interval: Duration,
+  now: time.Instant,
+) -> Codel(a) {
   let queue =
     queue.new()
     |> queue.with_access(table.Private)
@@ -71,7 +75,7 @@ pub fn new(target: Duration, interval: Duration, now: Instant) -> Codel(a) {
 
 /// Pushes an item onto the back of the queue, stamped with `now`, and returns
 /// its key. Errors only if the key counter hands back a key already in use.
-pub fn push(codel: Codel(a), item: a, now: Instant) -> Result(Int, Nil) {
+pub fn push(codel: Codel(a), item: a, now: time.Instant) -> Result(Int, Nil) {
   queue.push(codel.queue, Entry(sent_at: now, item:))
 }
 
@@ -110,7 +114,7 @@ fn do_pop_all(codel: Codel(a), popped: List(a)) -> List(a) {
 /// recomputed. Otherwise fast mode serves the oldest item immediately, and
 /// slow mode sheds items that have waited longer than twice the target before
 /// serving the first one that has not.
-pub fn dequeue(codel: Codel(a), now: Instant) -> #(Codel(a), Outcome(a)) {
+pub fn dequeue(codel: Codel(a), now: time.Instant) -> #(Codel(a), Outcome(a)) {
   case time.compare(now, codel.next) != order.Lt, codel.slow {
     True, _ -> dequeue_boundary(codel, now)
     False, False -> dequeue_fast(codel, now)
@@ -121,7 +125,10 @@ pub fn dequeue(codel: Codel(a), now: Instant) -> #(Codel(a), Outcome(a)) {
 // At an interval boundary the mode for the interval starting now is decided by
 // the delay recorded over the interval that just ended, and the recorded delay
 // is reset to whatever this dequeue observes. An empty queue resets it to zero.
-fn dequeue_boundary(codel: Codel(a), now: Instant) -> #(Codel(a), Outcome(a)) {
+fn dequeue_boundary(
+  codel: Codel(a),
+  now: time.Instant,
+) -> #(Codel(a), Outcome(a)) {
   let next = time.advance(now, by: codel.interval)
   let slow = duration.compare(codel.delay, codel.target) == order.Gt
 
@@ -142,7 +149,7 @@ fn dequeue_boundary(codel: Codel(a), now: Instant) -> #(Codel(a), Outcome(a)) {
   })
 }
 
-fn dequeue_fast(codel: Codel(a), now: Instant) -> #(Codel(a), Outcome(a)) {
+fn dequeue_fast(codel: Codel(a), now: time.Instant) -> #(Codel(a), Outcome(a)) {
   queue.pop(codel.queue)
   |> result.map(fn(entry) {
     #(
@@ -155,7 +162,7 @@ fn dequeue_fast(codel: Codel(a), now: Instant) -> #(Codel(a), Outcome(a)) {
 
 fn dequeue_slow(
   codel: Codel(a),
-  now: Instant,
+  now: time.Instant,
   dropped: List(a),
 ) -> #(Codel(a), Outcome(a)) {
   queue.pop(codel.queue)
@@ -195,7 +202,7 @@ fn observe(codel: Codel(a), delay: Duration) -> Codel(a) {
 /// delay to judge.
 pub fn poll(
   codel: Codel(a),
-  now: Instant,
+  now: time.Instant,
   last_key: Int,
 ) -> #(Codel(a), Polled(a)) {
   case queue.first(codel.queue) {
@@ -214,7 +221,7 @@ pub fn poll(
 // `next` by one interval rather than restarting it from `now`.
 fn interval_elapsed(
   codel: Codel(a),
-  now: Instant,
+  now: time.Instant,
   delay: Duration,
 ) -> #(Codel(a), List(a)) {
   use <- bool.guard(
@@ -236,7 +243,7 @@ fn interval_elapsed(
 
 // Sheds entries from the head of the queue for as long as they have waited
 // longer than twice the target.
-fn drop_stale(codel: Codel(a), now: Instant, dropped: List(a)) -> List(a) {
+fn drop_stale(codel: Codel(a), now: time.Instant, dropped: List(a)) -> List(a) {
   queue.first(codel.queue)
   |> result.map(fn(enqueued) {
     let #(key, entry) = enqueued

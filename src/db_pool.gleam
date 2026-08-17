@@ -1,5 +1,5 @@
 import db_pool/internal/codel.{type Codel}
-import db_pool/internal/time.{type Clock, type Instant}
+import db_pool/internal/time
 import gleam/bool
 import gleam/dict.{type Dict}
 import gleam/dynamic/decode
@@ -202,7 +202,7 @@ type Active(conn) {
     conn: conn,
     monitor: process.Monitor,
     deadline_timer: process.Timer,
-    checkout_time: Instant,
+    checkout_time: time.Instant,
     depth: Int,
   )
 }
@@ -218,7 +218,7 @@ type Opener {
 // list stays LIFO so hot connections are reused from the head and cold ones
 // age at the tail.
 type Idle(conn) {
-  Idle(conn: conn, since: Instant)
+  Idle(conn: conn, since: time.Instant)
 }
 
 // How a draining pool should finish once its last in-flight open resolves.
@@ -243,7 +243,7 @@ type State(conn, err) {
     openers: Dict(Pid, Opener),
     // The queue of waiting callers and the overload state governing it.
     codel: Codel(Waiting(conn, PoolError(err))),
-    clock: Clock,
+    clock: time.Clock,
     // Set to `Some` mode when shutdown/exit has begun but in-flight opens
     // remain. The pool stays alive to close arriving connections, then
     // finishes.
@@ -308,7 +308,7 @@ pub opaque type Message(conn, err) {
   )
   CheckIn(caller: Pid, conn: conn)
   Timeout(key: Int, timeout: Duration)
-  DeadlineExpired(caller: Pid, checkout_time: Instant)
+  DeadlineExpired(caller: Pid, checkout_time: time.Instant)
   Poll(last_queue_key: Int)
   PoolExit(process.ExitMessage)
   CallerDown(process.Down)
@@ -443,7 +443,7 @@ pub fn shutdown(
 fn initialise_pool(
   self: Subject(Message(conn, err)),
   pool: Pool(conn, err),
-  clock: Clock,
+  clock: time.Clock,
 ) -> Result(
   actor.Initialised(
     State(conn, err),
@@ -929,7 +929,7 @@ fn do_caller_down(state: State(conn, err), pid: Pid) -> State(conn, err) {
 fn do_deadline_expired(
   state: State(conn, err),
   caller: Pid,
-  checkout_time: Instant,
+  checkout_time: time.Instant,
 ) -> State(conn, err) {
   dict.get(state.active, caller)
   |> result.map(fn(active) {
@@ -1129,7 +1129,7 @@ fn do_close_idle(state: State(conn, err)) -> State(conn, err) {
 // algorithm is asked again.
 fn codel_dequeue(
   state: State(conn, err),
-  now: Instant,
+  now: time.Instant,
   conn: conn,
 ) -> State(conn, err) {
   let #(c, outcome) = codel.dequeue(state.codel, now)
@@ -1161,7 +1161,7 @@ fn codel_dequeue(
 // shrinks `current_size`; the connection is not replaced.
 fn push_idle(
   state: State(conn, err),
-  now: Instant,
+  now: time.Instant,
   conn: conn,
 ) -> State(conn, err) {
   case list.length(state.idle) >= max_idle(state.pool) {
