@@ -16,9 +16,6 @@ pub fn since_and_advance_round_trip_test() {
   assert time.advance(start, by: span) == finish
 }
 
-/// `since` on a backwards pair yields a negative duration. Worth pinning
-/// because `duration.compare` orders by magnitude, so a negative duration does
-/// not compare as smaller than a positive one.
 pub fn since_backwards_is_negative_test() {
   let start = time.from_nanoseconds(250 * ms)
   let finish = time.from_nanoseconds(100 * ms)
@@ -38,8 +35,6 @@ pub fn compare_orders_instants_test() {
   assert time.compare(earlier, earlier) == order.Eq
 }
 
-/// Unlike `duration.compare`, instants order by position on the clock, so an
-/// instant before the clock's origin is less than one after it.
 pub fn compare_is_signed_test() {
   let before_origin = time.from_nanoseconds(-500 * ms)
   let after_origin = time.from_nanoseconds(500 * ms)
@@ -53,10 +48,6 @@ pub fn advance_by_zero_is_identity_test() {
   assert time.advance(instant, by: time.zero()) == instant
 }
 
-/// `advance` and `halve` both reconstruct a total nanosecond count from
-/// `gleam_time`'s normalised form, which stores a negative span as a negative
-/// seconds field plus a positive nanoseconds field. Pin both against a
-/// negative span, since that reconstruction is easy to get wrong.
 pub fn negative_spans_round_trip_test() {
   let later = time.from_nanoseconds(250 * ms)
   let earlier = time.from_nanoseconds(100 * ms)
@@ -92,8 +83,6 @@ pub fn halve_test() {
     == 500
 }
 
-/// `halve` truncates, matching the integer division it replaces. 1001ms
-/// halves to 500.5ms, which reports as 500 whole milliseconds.
 pub fn halve_truncates_test() {
   assert duration.to_milliseconds(time.halve(duration.milliseconds(1001)))
     == 500
@@ -121,9 +110,6 @@ pub fn min_and_max_of_equal_durations_test() {
   assert time.max(span, span) == span
 }
 
-/// `min` and `max` delegate to `duration.compare`, which orders by magnitude
-/// and ignores sign: a 30 second span backwards is "longer" than one second
-/// forwards. Pinned because a change to signed comparison would be silent.
 pub fn min_and_max_order_by_magnitude_test() {
   let backwards =
     time.since(
@@ -140,8 +126,6 @@ pub fn min_and_max_order_by_magnitude_test() {
 
 // --- gleam_time behaviour this package depends on ---
 
-/// `to_milliseconds` truncates sub-millisecond precision. `do_expire` re-arms
-/// its timer with the result, so the truncation direction matters.
 pub fn to_milliseconds_truncates_test() {
   assert duration.to_milliseconds(duration.nanoseconds(1_500_000)) == 1
   assert duration.to_milliseconds(duration.nanoseconds(999_999)) == 0

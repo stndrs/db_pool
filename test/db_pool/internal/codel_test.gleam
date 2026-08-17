@@ -2,12 +2,10 @@ import db_pool/internal/codel
 import db_pool/internal/time.{type Instant}
 import gleam/time/duration.{type Duration}
 
-// A 10ms target means slow mode sheds anything that has waited more than 20ms.
 const target_ms = 10
 
 const interval_ms = 100
 
-// An instant this many milliseconds into the fake clock.
 fn at(milliseconds: Int) -> Instant {
   time.from_nanoseconds(milliseconds * 1_000_000)
 }
@@ -47,8 +45,6 @@ pub fn fast_mode_serves_head_in_fifo_order_test() {
   assert third == codel.Empty(dropped: [])
 }
 
-/// The interval's recorded delay is the minimum seen during it, so an
-/// observation larger than the one on record must not replace it.
 pub fn fast_mode_does_not_raise_recorded_delay_test() {
   let c = new_codel()
 
@@ -132,8 +128,6 @@ pub fn boundary_leaves_slow_when_previous_delay_within_target_test() {
   assert outcome == codel.Serve(item: "old", dropped: [])
 }
 
-/// A boundary reached with nothing queued records a delay of zero, so a pool
-/// that has gone quiet returns to fast mode on the following boundary.
 pub fn boundary_with_empty_queue_resets_delay_test() {
   let c = new_codel()
 
@@ -152,8 +146,6 @@ pub fn boundary_with_empty_queue_resets_delay_test() {
   assert outcome == codel.Serve(item: "old", dropped: [])
 }
 
-/// A boundary reached late restarts the interval from now, rather than
-/// advancing it by one interval from where it was.
 pub fn boundary_advances_next_from_now_test() {
   let c = new_codel()
 
@@ -199,7 +191,6 @@ pub fn slow_mode_all_stale_returns_empty_with_drops_test() {
   assert outcome == codel.Empty(dropped: ["stale-1", "stale-2"])
 }
 
-/// Staleness is strict: an entry sitting at exactly twice the target survives.
 pub fn slow_mode_keeps_entry_at_exactly_two_targets_test() {
   let c = enter_slow_mode()
 
@@ -210,8 +201,6 @@ pub fn slow_mode_keeps_entry_at_exactly_two_targets_test() {
   assert outcome == codel.Serve(item: "edge", dropped: [])
 }
 
-// Returns a `Codel` in slow mode whose current interval ends at 300ms, with
-// an empty queue and a delay of zero on record.
 fn enter_slow_mode() -> codel.Codel(String) {
   let c = new_codel()
 
@@ -247,8 +236,6 @@ pub fn poll_before_next_is_noop_test() {
   assert outcome == codel.Serve(item: "stale", dropped: [])
 }
 
-/// When the head of the queue has not changed since the last poll, the poll
-/// judges the interval and sheds waiters that have waited too long.
 pub fn poll_with_unchanged_head_evaluates_interval_test() {
   let c = new_codel()
 
@@ -263,8 +250,6 @@ pub fn poll_with_unchanged_head_evaluates_interval_test() {
   assert polled == codel.Polled(dropped: ["stale"], last_key: key)
 }
 
-/// A poll advances the interval by exactly one interval, rather than
-/// restarting it from now.
 pub fn poll_advances_next_by_one_interval_test() {
   let c = new_codel()
 
@@ -286,8 +271,6 @@ pub fn poll_advances_next_by_one_interval_test() {
   assert outcome == codel.Serve(item: "next-one", dropped: [])
 }
 
-/// A head newer than the one the last poll saw means the queue turned over,
-/// so there is no standing delay to judge and nothing is shed.
 pub fn poll_with_new_head_only_rearms_test() {
   let c = new_codel()
 
@@ -301,10 +284,6 @@ pub fn poll_with_new_head_only_rearms_test() {
   assert polled == codel.Polled(dropped: [], last_key: second_key)
 }
 
-/// An interval whose recorded delay is within target returns the queue to
-/// fast mode, even though the entry standing at the head right now has waited
-/// far longer than target. The mode is decided by the interval that just
-/// ended, not by the delay this poll observes.
 pub fn poll_leaves_slow_mode_when_recorded_delay_within_target_test() {
   // Slow mode, a delay of zero on record, and an interval ending at 300ms.
   let c = enter_slow_mode()
@@ -323,8 +302,6 @@ pub fn poll_leaves_slow_mode_when_recorded_delay_within_target_test() {
   assert outcome == codel.Serve(item: "old", dropped: [])
 }
 
-/// A poll that leaves the queue in fast mode still advances the interval by
-/// one interval, so the next boundary lands where it would have anyway.
 pub fn poll_in_fast_mode_advances_next_test() {
   let c = new_codel()
 
@@ -355,9 +332,6 @@ pub fn poll_in_fast_mode_advances_next_test() {
   assert third == codel.Serve(item: "c", dropped: [])
 }
 
-/// A poll that enters slow mode records the delay it observed, replacing the
-/// one that put it there, so an interval that recovers is judged on the new
-/// figure.
 pub fn poll_records_observed_delay_when_entering_slow_mode_test() {
   let c = new_codel()
 
@@ -385,8 +359,6 @@ pub fn poll_records_observed_delay_when_entering_slow_mode_test() {
   assert outcome == codel.Serve(item: "old", dropped: [])
 }
 
-/// Poll-side staleness is strict, as it is on the dequeue side: an entry
-/// sitting at exactly twice the target is not shed.
 pub fn poll_keeps_entry_at_exactly_two_targets_test() {
   let c = new_codel()
 
@@ -402,8 +374,6 @@ pub fn poll_keeps_entry_at_exactly_two_targets_test() {
   assert codel.first(c) == Ok(codel.Entry(sent_at: at(230), item: "edge"))
 }
 
-/// A poll sheds from the head, and reports what it shed oldest first. It
-/// stops at the first entry that is not stale.
 pub fn poll_drops_stale_oldest_first_test() {
   let c = new_codel()
 
@@ -424,8 +394,6 @@ pub fn poll_drops_stale_oldest_first_test() {
   assert codel.first(c) == Ok(codel.Entry(sent_at: at(245), item: "fresh"))
 }
 
-/// The same order holds when shedding runs the queue empty rather than
-/// stopping at a fresh entry.
 pub fn poll_drops_whole_queue_oldest_first_test() {
   let c = new_codel()
 
@@ -451,9 +419,6 @@ pub fn poll_with_empty_queue_returns_last_key_test() {
 
 // --- Queue access ---
 
-/// `at` and `delete` are pinned to the key they are given, not to the head of
-/// the queue, so a later entry is reachable while an older one is still
-/// queued ahead of it.
 pub fn at_and_delete_roundtrip_and_missing_key_test() {
   let c = new_codel()
 
