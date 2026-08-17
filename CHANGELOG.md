@@ -19,9 +19,9 @@
   `checkout(pool, caller, timeout, deadline)` to
   `checkout(pool, timeout, deadline)`, and from `checkin(pool, conn, caller)`
   to `checkin(pool, conn)`.
-- `db_pool.start` and `db_pool.supervised` now accept an optional function to
-  map errors to strings. This allows `db_pool` to log and return clearer error
-  strings for the generic component of `PoolError` provided by callers.
+- Added `error_to_string`, a `Pool` builder function that maps errors to
+  strings. This allows `db_pool` to log and return clearer error strings for
+  the generic component of `PoolError` provided by callers.
 
 ### Internal
 
