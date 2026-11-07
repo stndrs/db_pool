@@ -1760,3 +1760,118 @@ fn db_pool() -> process.Subject(db_pool.Message(Nil, err)) {
     pool.data
   })
 }
+
+// --- discard ---
+
+type DiscardEvent {
+  Opened(reference.Reference)
+  Closed(reference.Reference)
+}
+
+fn discard_pool(events: process.Subject(DiscardEvent)) {
+  db_pool.new()
+  |> db_pool.size(1)
+  |> db_pool.on_open(fn() {
+    let conn = reference.new()
+    process.send(events, Opened(conn))
+    Ok(conn)
+  })
+  |> db_pool.on_close(fn(conn) {
+    process.send(events, Closed(conn))
+    Ok(Nil)
+  })
+  |> db_pool.on_idle(fn(_) { Nil })
+  |> db_pool.on_active(fn(_) { Nil })
+}
+
+fn start_discard_pool() {
+  let events = process.new_subject()
+  let name = process.new_name("db_pool_test")
+  let assert Ok(pool) = db_pool.start(discard_pool(events), name, 200)
+  let pool = pool.data
+  let assert Ok(Opened(_)) = process.receive(events, 500)
+  #(pool, events)
+}
+
+pub fn discard_closes_and_replaces_without_owner_exit_test() {
+  let #(pool, events) = start_discard_pool()
+  let assert Ok(old) = db_pool.checkout(pool, 200, 30_000)
+
+  db_pool.discard(pool, old)
+  let assert Ok(Closed(closed)) = process.receive(events, 500)
+  assert closed == old
+
+  // The caller stays alive and gets a replacement, never the discarded value.
+  let assert Ok(current) = db_pool.checkout(pool, 2000, 30_000)
+  assert current != old
+  let assert Ok(Opened(opened)) = process.receive(events, 500)
+  assert opened == current
+  assert process.receive(events, 0) == Error(Nil)
+
+  db_pool.checkin(pool, current)
+  let assert Ok(_) = db_pool.shutdown(pool, 200)
+}
+
+pub fn discard_without_a_checkout_is_ignored_test() {
+  let #(pool, events) = start_discard_pool()
+  let stray = reference.new()
+  db_pool.discard(pool, stray)
+
+  let assert Ok(conn) = db_pool.checkout(pool, 200, 30_000)
+  // A synchronous checkout is handled after the discard, so an unguarded
+  // discard would have closed this connection.
+  assert process.receive(events, 0) == Error(Nil)
+  db_pool.checkin(pool, conn)
+  assert process.receive(events, 0) == Error(Nil)
+  let assert Ok(_) = db_pool.shutdown(pool, 200)
+}
+
+pub fn stale_discard_does_not_close_a_newer_checkout_test() {
+  let #(pool, events) = start_discard_pool()
+  let assert Ok(old) = db_pool.checkout(pool, 200, 30_000)
+  db_pool.discard(pool, old)
+  let assert Ok(Closed(closed)) = process.receive(events, 500)
+  assert closed == old
+
+  let assert Ok(current) = db_pool.checkout(pool, 2000, 30_000)
+  let _ = process.receive(events, 500)
+
+  db_pool.discard(pool, old)
+  let assert Ok(same) = db_pool.checkout(pool, 200, 30_000)
+  assert same == current
+  assert process.receive(events, 0) == Error(Nil)
+
+  db_pool.checkin(pool, current)
+  let assert Ok(_) = db_pool.shutdown(pool, 200)
+}
+
+// A check-in for a connection the caller no longer holds used to release
+// whatever connection the caller held now, handing a connection still in use
+// to another caller.
+pub fn stale_checkin_does_not_release_a_newer_checkout_test() {
+  let activations = atomic.new()
+  let events = process.new_subject()
+  let name = process.new_name("db_pool_test")
+  let pool =
+    discard_pool(events)
+    |> db_pool.on_active(fn(_) { atomic.add(activations, 1) })
+
+  let assert Ok(pool) = db_pool.start(pool, name, 200)
+  let pool = pool.data
+  let assert Ok(Opened(_)) = process.receive(events, 500)
+
+  let assert Ok(old) = db_pool.checkout(pool, 200, 30_000)
+  db_pool.discard(pool, old)
+  let _ = process.receive(events, 500)
+  let assert Ok(current) = db_pool.checkout(pool, 2000, 30_000)
+  assert atomic.get(activations) == 2
+
+  db_pool.checkin(pool, old)
+  // Equality alone would miss a release/reacquire of the same value.
+  assert atomic.get(activations) == 2
+  let assert Ok(same) = db_pool.checkout(pool, 200, 30_000)
+  assert same == current
+
+  db_pool.checkin(pool, current)
+  let assert Ok(_) = db_pool.shutdown(pool, 200)
+}

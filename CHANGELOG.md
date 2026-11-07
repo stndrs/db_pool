@@ -1,5 +1,19 @@
 # Changelog
 
+## 3.1.0
+
+### Bug fixes
+
+- A check-in for a connection the caller no longer holds now logs and is
+  ignored. It previously released the caller's current connection, which could
+  return a connection still in use to another caller.
+
+### New features
+
+- Added `discard`, which releases a checked-out connection without returning it
+  for reuse. The pool closes it and opens a replacement if a caller is waiting,
+  while the calling process stays alive.
+
 ## 3.0.0
 
 ### Bug fixes

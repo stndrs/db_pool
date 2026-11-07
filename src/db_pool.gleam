@@ -126,7 +126,8 @@ pub fn on_open(
 }
 
 /// Sets the `Pool`'s `on_close` function. The provided function will be
-/// called on each connection when the pool is shut down or exits.
+/// called when a connection is discarded, its owner dies, its lease expires,
+/// or the pool shuts down or exits.
 pub fn on_close(
   pool: Pool(conn, err),
   handle_close: fn(conn) -> Result(Nil, err),
@@ -307,6 +308,7 @@ pub opaque type Message(conn, err) {
     deadline: Duration,
   )
   CheckIn(caller: Pid, conn: conn)
+  Discard(caller: Pid, conn: conn)
   Timeout(key: Int, timeout: Duration)
   DeadlineExpired(caller: Pid, checkout_time: time.Instant)
   Poll(last_queue_key: Int)
@@ -378,10 +380,16 @@ pub fn checkout(
 ///
 /// Expects the `conn` value to be the same connection that was originally
 /// checked out by the calling process. If the calling process has no active
-/// connection the checkin is silently ignored.
+/// connection, or holds a different connection, the checkin is ignored.
 pub fn checkin(pool: Subject(Message(conn, err)), conn: conn) -> Nil {
   let caller = process.self()
   process.send(pool, CheckIn(caller:, conn:))
+}
+
+/// Discards a checked-out connection instead of returning it for reuse.
+pub fn discard(pool: Subject(Message(conn, err)), conn: conn) -> Nil {
+  let caller = process.self()
+  process.send(pool, Discard(caller:, conn:))
 }
 
 /// Checks out a connection from the pool and passes it to the provided
@@ -538,6 +546,11 @@ fn handle_running(
     CheckIn(caller:, conn:) -> {
       let state = do_checkin(state, caller, conn)
       actor.continue(state)
+    }
+    Discard(caller:, conn:) -> {
+      state
+      |> do_discard(caller, conn)
+      |> actor.continue
     }
     CheckOut(client:, caller:, timeout:, deadline:) -> {
       let state = {
@@ -787,32 +800,52 @@ fn do_checkin(
 ) -> State(conn, err) {
   dict.get(state.active, caller)
   |> result.map(fn(prev) {
-    case prev.conn == conn {
-      True -> Nil
-      False -> {
-        "(db_pool) unexpected connection checked in for the current process"
-        |> logging.log(logging.Warning, _)
+    let return = fn() {
+      case prev.depth > 1 {
+        True -> {
+          let active =
+            state.active
+            |> dict.insert(caller, Active(..prev, depth: prev.depth - 1))
+
+          State(..state, active:)
+        }
+        False -> {
+          let _ = process.cancel_timer(prev.deadline_timer)
+          process.demonitor_process(prev.monitor)
+          let active = dict.delete(state.active, caller)
+          let state = State(..state, active:)
+
+          let now = time.now(state.clock)
+          codel_dequeue(state, now, prev.conn)
+        }
       }
     }
 
-    case prev.depth > 1 {
-      True -> {
-        let active =
-          state.active
-          |> dict.insert(caller, Active(..prev, depth: prev.depth - 1))
+    use <- bool.lazy_guard(when: prev.conn == conn, return:)
 
-        State(..state, active:)
-      }
-      False -> {
-        let _ = process.cancel_timer(prev.deadline_timer)
-        process.demonitor_process(prev.monitor)
-        let active = dict.delete(state.active, caller)
-        let state = State(..state, active:)
+    "(db_pool) unexpected connection checked in for the current process"
+    |> logging.log(logging.Warning, _)
 
-        let now = time.now(state.clock)
-        codel_dequeue(state, now, prev.conn)
-      }
-    }
+    state
+  })
+  |> result.unwrap(state)
+}
+
+/// Called when a caller gives up a connection without returning it for reuse.
+/// `close_active` closes it and only serves a waiter with its replacement, so
+/// the discarded connection never re-enters the pool. Mismatched and stale
+/// discards are ignored.
+fn do_discard(
+  state: State(conn, err),
+  caller: Pid,
+  conn: conn,
+) -> State(conn, err) {
+  dict.get(state.active, caller)
+  |> result.map(fn(active) {
+    use <- bool.guard(when: active.conn != conn, return: state)
+
+    let _ = process.cancel_timer(active.deadline_timer)
+    close_active(state, active, caller)
   })
   |> result.unwrap(state)
 }
