@@ -685,7 +685,7 @@ fn handle_draining(
   case msg {
     OpenResult(pid:, result:, ..) -> {
       result
-      |> result.try(state.pool.handle_close)
+      |> result.map(close_conn(state, _))
       |> result.unwrap(Nil)
 
       state
@@ -996,7 +996,7 @@ fn close_active(
 
   let active_dict = dict.delete(state.active, pid)
 
-  let _ = state.pool.handle_close(active.conn)
+  close_conn(state, active.conn)
   let state =
     State(..state, active: active_dict, current_size: state.current_size - 1)
 
@@ -1061,6 +1061,19 @@ fn retry_if_demand(
   state
 }
 
+// Run `on_close` for a connection. A failed close is logged rather than
+// discarded: the connection is already gone from the pool's bookkeeping, so
+// the error is the only signal that a real connection may have leaked.
+fn close_conn(state: State(conn, err), conn: conn) -> Nil {
+  case state.pool.handle_close(conn) {
+    Ok(_) -> Nil
+    Error(err) -> {
+      let _ = log_error(state.pool.error_to_string, err)
+      Nil
+    }
+  }
+}
+
 /// Handles the outcome of an in-flight open. The opener is reconciled by
 /// pid: if it is unknown (already handled via its down signal) an `Ok`
 /// connection is closed to avoid a leak and an `Error` is ignored.
@@ -1093,7 +1106,7 @@ fn do_open_result(
   })
   |> result.lazy_unwrap(fn() {
     open_result
-    |> result.try(state.pool.handle_close)
+    |> result.map(close_conn(state, _))
     |> result.unwrap(Nil)
 
     state
@@ -1148,10 +1161,7 @@ fn do_close_idle(state: State(conn, err)) -> State(conn, err) {
           == order.Gt
         })
 
-      list.each(expired, fn(idle) {
-        let _ = state.pool.handle_close(idle.conn)
-        Nil
-      })
+      list.each(expired, fn(idle) { close_conn(state, idle.conn) })
 
       let _close_timer =
         process.send_after(
@@ -1213,7 +1223,7 @@ fn push_idle(
 ) -> State(conn, err) {
   case list.length(state.idle) >= max_idle(state.pool) {
     True -> {
-      let _ = state.pool.handle_close(conn)
+      close_conn(state, conn)
       State(..state, current_size: state.current_size - 1)
     }
     False -> {
@@ -1333,7 +1343,7 @@ fn close_each_active(state: State(conn, err)) -> State(conn, err) {
 
     process.demonitor_process(active.monitor)
 
-    let _ = state.pool.handle_close(active.conn)
+    close_conn(state, active.conn)
 
     Nil
   })
@@ -1342,11 +1352,7 @@ fn close_each_active(state: State(conn, err)) -> State(conn, err) {
 }
 
 fn close_idle(state: State(conn, err)) -> State(conn, err) {
-  list.each(state.idle, fn(idle) {
-    let _ = state.pool.handle_close(idle.conn)
-
-    Nil
-  })
+  list.each(state.idle, fn(idle) { close_conn(state, idle.conn) })
 
   state
 }
