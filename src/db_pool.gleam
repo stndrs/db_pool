@@ -144,6 +144,7 @@ pub fn on_close(
 /// the connection is immediately passed to a waiting caller, the callback
 /// will not be called. The callback is also called on every connection
 /// at startup.
+@deprecated("Run this work in the caller.")
 pub fn on_idle(
   pool: Pool(conn, err),
   handle_idle: fn(conn) -> Nil,
@@ -154,6 +155,7 @@ pub fn on_idle(
 /// Sets the `Pool`'s `on_active` function. The provided function will be
 /// called on connections as they're removed from the pool's list of
 /// idle connections and become active.
+@deprecated("Run this work in the caller.")
 pub fn on_active(
   pool: Pool(conn, err),
   handle_active: fn(conn) -> Nil,
@@ -180,6 +182,7 @@ pub fn queue_interval(pool: Pool(conn, err), interval: Int) -> Pool(conn, err) {
 /// Sets a function used to convert the `Pool`'s `err` type into a `String`
 /// for logging. When set, `ConnectionError`s encountered internally by the
 /// pool (for example during startup) are logged using this function.
+@deprecated("Handle logging in the caller.")
 pub fn error_to_string(
   pool: Pool(conn, err),
   to_string: fn(err) -> String,

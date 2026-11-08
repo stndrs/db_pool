@@ -17,9 +17,13 @@
   milliseconds.
 - Added `discard`. Releases a checked-out connection without returning it for
   reuse.
-- Added `error_to_string` to render the wrapped `ConnectionError` payload.
 - Shutdown and pool exit wait for in-flight opens and close the connections that
   arrive.
+
+### Deprecations
+
+- `on_idle` and `on_active`, and `error_to_string` need to be handled by callers
+  in the next major version.
 
 ## 3.0.0
 
@@ -40,6 +44,9 @@
   `checkout(pool, caller, timeout, deadline)` to
   `checkout(pool, timeout, deadline)`, and from `checkin(pool, conn, caller)`
   to `checkin(pool, conn)`.
+- Added `error_to_string`, a `Pool` builder function that maps errors to
+  strings. This allows `db_pool` to log and return clearer error strings for
+  the generic component of `PoolError` provided by callers.
 
 ### Internal
 
