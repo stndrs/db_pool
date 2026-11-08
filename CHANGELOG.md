@@ -4,16 +4,27 @@
 
 ### Bug fixes
 
-- Opening connections at startup closes all open connections if one fails to open.
-- A check-in for a connection the caller no longer holds now logs and is
-  ignored.
-- Checkin no-ops while the pool is draining
+- Connections opened at startup are closed if a later open fails.
+- A check-in that arrives while draining no longer closes the connection again.
+- Failed `on_close` results are reported through `on_event`.
+- The checkout timeout timer has a minimum remaining delay of 1 ms.
+- A check-in for a connection the caller no longer holds is logged and ignored.
 
 ### New features
 
-- Added `discard`, which releases a checked-out connection without returning it
-  for reuse. The pool closes it and opens a replacement if a caller is waiting,
-  while the calling process stays alive.
+- Added `max_idle_connections`. `size` becomes the ceiling for open connections.
+- Added `max_idle_time`. Closes connections idle longer than the given
+  milliseconds.
+- Added `discard`. Releases a checked-out connection without returning it for
+  reuse.
+- Added `on_event`, `Event` and `LogLevel` for the pool's internal events.
+- Added `error_to_string` to render the wrapped `ConnectionError` payload.
+- Shutdown and pool exit wait for in-flight opens and close the connections that
+  arrive.
+
+### Breaking changes
+
+- Removed the `logging` dependency. Events are delivered to `on_event`.
 
 ## 3.0.0
 
@@ -34,9 +45,6 @@
   `checkout(pool, caller, timeout, deadline)` to
   `checkout(pool, timeout, deadline)`, and from `checkin(pool, conn, caller)`
   to `checkin(pool, conn)`.
-- Added `error_to_string`, a `Pool` builder function that maps errors to
-  strings. This allows `db_pool` to log and return clearer error strings for
-  the generic component of `PoolError` provided by callers.
 
 ### Internal
 
