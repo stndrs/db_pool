@@ -17,16 +17,21 @@ pub fn main() -> Nil {
 }
 
 pub fn new_error_test() {
-  let db_pool = db_pool.new()
+  let logs = process.new_subject()
+  let db_pool = db_pool.new() |> db_pool.on_event(logger(logs))
 
   let name = process.new_name("db_pool_test")
 
-  let assert Error(actor.InitFailed(_)) = db_pool.start(db_pool, name, 200)
+  let assert Error(actor.InitFailed("(db_pool) ConnectionTimeout")) =
+    db_pool.start(db_pool, name, 200)
+
+  assert_logged(logs, db_pool.Err, "(db_pool) ConnectionTimeout")
 }
 
 pub fn partial_startup_failure_closes_opened_connections_test() {
   let opened = atomic.new()
   let closed = atomic.new()
+  let logs = process.new_subject()
 
   let pool =
     db_pool.new()
@@ -41,12 +46,15 @@ pub fn partial_startup_failure_closes_opened_connections_test() {
       atomic.add(closed, 1)
       Ok(Nil)
     })
+    |> db_pool.on_event(logger(logs))
 
   let name = process.new_name("db_pool_test")
   let assert Error(actor.InitFailed(_)) = db_pool.start(pool, name, 200)
 
   // The connection opened before the failure is closed, not leaked.
   assert atomic.get(closed) == 1
+
+  assert_logged(logs, db_pool.Err, "(db_pool) ConnectionError")
 }
 
 pub fn start_test() {
@@ -67,6 +75,8 @@ pub fn start_test() {
 }
 
 pub fn start_error_test() {
+  let logs = process.new_subject()
+
   let new_pool =
     db_pool.new()
     |> db_pool.size(2)
@@ -74,11 +84,14 @@ pub fn start_error_test() {
     |> db_pool.on_close(fn(_) { Ok(Nil) })
     |> db_pool.on_idle(fn(_) { Nil })
     |> db_pool.on_active(fn(_) { Nil })
+    |> db_pool.on_event(logger(logs))
 
   let name = process.new_name("db_pool_test")
 
   let assert Error(actor.InitFailed("(db_pool) ConnectionError")) =
     db_pool.start(new_pool, name, 200)
+
+  assert_logged(logs, db_pool.Err, "(db_pool) ConnectionError")
 }
 
 pub fn supervised_test() {
@@ -111,6 +124,8 @@ pub opaque type Err {
 }
 
 pub fn error_to_string_test() {
+  let logs = process.new_subject()
+
   let new_pool =
     db_pool.new()
     |> db_pool.size(2)
@@ -119,11 +134,14 @@ pub fn error_to_string_test() {
     |> db_pool.on_idle(fn(_) { Nil })
     |> db_pool.on_active(fn(_) { Nil })
     |> db_pool.error_to_string(fn(_err) { "Oops" })
+    |> db_pool.on_event(logger(logs))
 
   let name = process.new_name("db_pool_test")
 
   let assert Error(actor.InitFailed("(db_pool) ConnectionError: Oops")) =
     db_pool.start(new_pool, name, 200)
+
+  assert_logged(logs, db_pool.Err, "(db_pool) ConnectionError: Oops")
 }
 
 pub fn with_connection_test() {
@@ -489,6 +507,7 @@ pub fn failed_open_retries_while_waiter_queued_test() {
 
   let assert Ok(Nil) = table.insert(flag, "open", True)
 
+  let logs = process.new_subject()
   let name = process.new_name("db_pool_test")
   let pool =
     db_pool.new()
@@ -502,6 +521,7 @@ pub fn failed_open_retries_while_waiter_queued_test() {
     |> db_pool.on_close(fn(_) { Ok(Nil) })
     |> db_pool.on_idle(fn(_) { Nil })
     |> db_pool.on_active(fn(_) { Nil })
+    |> db_pool.on_event(logger(logs))
 
   let assert Ok(pool) = db_pool.start(pool, name, 200)
   let pool = pool.data
@@ -531,6 +551,8 @@ pub fn failed_open_retries_while_waiter_queued_test() {
   let assert Ok(Nil) = table.insert(flag, "open", True)
 
   let assert Ok(Ok(Nil)) = process.receive(result, 3000)
+
+  assert_logged(logs, db_pool.Err, "(db_pool) ConnectionError")
 
   let assert Ok(Nil) = table.drop(flag)
   let assert Ok(_) = db_pool.shutdown(pool, 500)
@@ -735,6 +757,7 @@ pub fn shutdown_with_pending_open_drains_connection_test() {
 }
 
 pub fn shutdown_reason_treated_as_normal_test() {
+  let logs = process.new_subject()
   let name = process.new_name("db_pool_test")
 
   let new_pool =
@@ -744,6 +767,7 @@ pub fn shutdown_reason_treated_as_normal_test() {
     |> db_pool.on_close(fn(_) { Ok(Nil) })
     |> db_pool.on_idle(fn(_) { Nil })
     |> db_pool.on_active(fn(_) { Nil })
+    |> db_pool.on_event(logger(logs))
 
   let assert Ok(started) = db_pool.start(new_pool, name, 200)
   let pid = started.pid
@@ -754,6 +778,7 @@ pub fn shutdown_reason_treated_as_normal_test() {
   wait_for_exit(pid, 500)
 
   assert !process.is_alive(pid)
+  assert_logged(logs, db_pool.Warning, "Abnormal Pool Exit: shutdown")
 }
 
 fn wait_for_exit(pid: process.Pid, remaining: Int) -> Nil {
@@ -913,6 +938,7 @@ pub fn waiting_caller_timeout_test() {
 }
 
 pub fn pool_exit_test() {
+  let logs = process.new_subject()
   let name = process.new_name("db_pool_test")
 
   let db_pool =
@@ -922,6 +948,7 @@ pub fn pool_exit_test() {
     |> db_pool.on_close(fn(_) { Ok(Nil) })
     |> db_pool.on_idle(fn(_) { Nil })
     |> db_pool.on_active(fn(_) { Nil })
+    |> db_pool.on_event(logger(logs))
 
   let assert Ok(pool) = db_pool.start(db_pool, name, 200)
   let pool = pool.data
@@ -930,6 +957,8 @@ pub fn pool_exit_test() {
 
   // Doesn't crash
   process.send_exit(pid)
+
+  assert_logged(logs, db_pool.Info, "Normal Pool Exit")
 }
 
 /// When a caller holds a connection past its deadline, the pool forcefully
@@ -1573,6 +1602,30 @@ pub fn on_close_called_on_shutdown_test() {
   assert atomic.get(close_count) == 3
 }
 
+pub fn close_error_is_logged_test() {
+  let logs = process.new_subject()
+  let name = process.new_name("db_pool_test")
+
+  let pool =
+    db_pool.new()
+    |> db_pool.size(1)
+    |> db_pool.on_open(fn() { Ok(reference.new()) })
+    |> db_pool.on_close(fn(_) { Error(Nil) })
+    |> db_pool.on_event(logger(logs))
+
+  let assert Ok(pool) = db_pool.start(pool, name, 200)
+  let pool = pool.data
+
+  let assert Ok(conn) = db_pool.checkout(pool, 200, 30_000)
+  db_pool.discard(pool, conn)
+
+  assert_logged(logs, db_pool.Err, "(db_pool) ConnectionError")
+
+  let assert Ok(next) = db_pool.checkout(pool, 2000, 30_000)
+  db_pool.checkin(pool, next)
+  let assert Ok(_) = db_pool.shutdown(pool, 200)
+}
+
 pub fn shutdown_closes_active_connections_test() {
   let close_count = atomic.new()
 
@@ -1665,6 +1718,7 @@ pub fn checkin_by_non_active_caller_ignored_test() {
 }
 
 pub fn pool_exit_abnormal_test() {
+  let logs = process.new_subject()
   let name = process.new_name("db_pool_test")
 
   let pool =
@@ -1674,6 +1728,7 @@ pub fn pool_exit_abnormal_test() {
     |> db_pool.on_close(fn(_) { Ok(Nil) })
     |> db_pool.on_idle(fn(_) { Nil })
     |> db_pool.on_active(fn(_) { Nil })
+    |> db_pool.on_event(logger(logs))
 
   let assert Ok(pool) = db_pool.start(pool, name, 200)
   let pool = pool.data
@@ -1681,6 +1736,8 @@ pub fn pool_exit_abnormal_test() {
   let assert Ok(pid) = process.subject_owner(pool)
 
   process.send_abnormal_exit(pid, "test crash")
+
+  assert_logged(logs, db_pool.Warning, "Abnormal Pool Exit: test crash")
 
   process.sleep(50)
 
@@ -1881,10 +1938,12 @@ pub fn stale_discard_does_not_close_a_newer_checkout_test() {
 pub fn stale_checkin_does_not_release_a_newer_checkout_test() {
   let activations = atomic.new()
   let events = process.new_subject()
+  let logs = process.new_subject()
   let name = process.new_name("db_pool_test")
   let pool =
     discard_pool(events)
     |> db_pool.on_active(fn(_) { atomic.add(activations, 1) })
+    |> db_pool.on_event(logger(logs))
 
   let assert Ok(pool) = db_pool.start(pool, name, 200)
   let pool = pool.data
@@ -1897,6 +1956,11 @@ pub fn stale_checkin_does_not_release_a_newer_checkout_test() {
   assert atomic.get(activations) == 2
 
   db_pool.checkin(pool, old)
+  assert_logged(
+    logs,
+    db_pool.Warning,
+    "(db_pool) unexpected connection checked in for the current process",
+  )
   // Equality alone would miss a release/reacquire of the same value.
   assert atomic.get(activations) == 2
   let assert Ok(same) = db_pool.checkout(pool, 200, 30_000)
@@ -1904,6 +1968,22 @@ pub fn stale_checkin_does_not_release_a_newer_checkout_test() {
 
   db_pool.checkin(pool, current)
   let assert Ok(_) = db_pool.shutdown(pool, 200)
+}
+
+fn logger(events: process.Subject(db_pool.Event)) -> fn(db_pool.Event) -> Nil {
+  fn(event) { process.send(events, event) }
+}
+
+fn assert_logged(
+  events: process.Subject(db_pool.Event),
+  level: db_pool.LogLevel,
+  message: String,
+) -> Nil {
+  let assert Ok(db_pool.Log(level: logged, message: logged_message)) =
+    process.receive(events, 500)
+
+  assert logged == level
+  assert logged_message == message
 }
 
 fn assert_panics(f: fn() -> a) -> process.ExitReason {

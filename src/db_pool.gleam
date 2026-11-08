@@ -177,6 +177,15 @@ pub fn on_active(
   Pool(..pool, handle_active:)
 }
 
+/// Sets the `Pool`'s `on_event` function. The provided function is called
+/// with every event the pool logs.
+pub fn on_event(
+  pool: Pool(conn, err),
+  handle_event: fn(Event) -> Nil,
+) -> Pool(conn, err) {
+  Pool(..pool, handle_event:)
+}
+
 /// Sets the CoDel queue target in milliseconds. This is the maximum
 /// acceptable queue delay before the pool considers itself overloaded.
 /// Defaults to 50ms.
