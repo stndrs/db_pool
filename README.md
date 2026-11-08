@@ -24,8 +24,6 @@ pub fn main() -> Nil {
     |> db_pool.size(5)
     |> db_pool.on_open(database.open)
     |> db_pool.on_close(database.close)
-    |> db_pool.on_idle(database.idle)
-    |> db_pool.on_active(database.active)
 
   let assert Ok(pool) = db_pool.start(db_pool, name, 1000)
   let pool = pool.data
@@ -52,6 +50,24 @@ All checkout and shutdown operations return `Result(value, PoolError(err))`. The
 - **`ConnectionError(err)`** — wraps an error returned by the `on_open` or `on_close` callback. The inner `err` type is determined by your callback.
 - **`ConnectionTimeout`** — the checkout request timed out while waiting in the queue. No connection was available within the specified `timeout`.
 - **`ConnectionUnavailable`** — the request was dropped by the CoDel algorithm due to sustained overload, the pool shut down while the caller was waiting, or the pool actor is unreachable.
+
+## Events
+
+Pool failures are reported through `on_event`. Callers can provide an `on_event` handler to report failures as needed.
+
+```gleam
+let db_pool =
+  db_pool.new()
+  |> db_pool.on_open(database.open)
+  |> db_pool.on_close(database.close)
+  |> db_pool.on_event(fn(event) {
+    case event {
+      db_pool.ErrorEvent(error) -> report_error(error)
+      db_pool.ExitEvent(reason) -> report_exit(reason)
+      db_pool.WarningEvent(message) -> report_warning(message)
+    }
+  })
+```
 
 ## Checkout and checkin
 

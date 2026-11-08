@@ -2,8 +2,6 @@ import db_pool/internal/codel.{type Codel}
 import db_pool/internal/time
 import gleam/bool
 import gleam/dict.{type Dict}
-import gleam/dynamic/decode
-import gleam/erlang/atom
 import gleam/erlang/process.{type Pid, type Subject}
 import gleam/int
 import gleam/list
@@ -12,9 +10,7 @@ import gleam/order
 import gleam/otp/actor
 import gleam/otp/supervision
 import gleam/result
-import gleam/string
 import gleam/time/duration.{type Duration}
-import logging
 
 fn reconnect_min() -> Duration {
   duration.milliseconds(1000)
@@ -44,6 +40,12 @@ pub type PoolError(err) {
   ConnectionUnavailable
 }
 
+pub type Event(err) {
+  ErrorEvent(PoolError(err))
+  ExitEvent(process.ExitReason)
+  WarningEvent(String)
+}
+
 /// A `Pool` configuration. Holds the size of the pool and functions
 /// for opening and closing connections.
 pub opaque type Pool(conn, err) {
@@ -55,9 +57,7 @@ pub opaque type Pool(conn, err) {
     queue_interval: Int,
     handle_open: fn() -> Result(conn, PoolError(err)),
     handle_close: fn(conn) -> Result(Nil, PoolError(err)),
-    handle_idle: fn(conn) -> Nil,
-    handle_active: fn(conn) -> Nil,
-    error_to_string: Option(fn(err) -> String),
+    handle_event: fn(Event(err)) -> Nil,
   )
 }
 
@@ -65,6 +65,7 @@ pub opaque type Pool(conn, err) {
 pub fn new() -> Pool(conn, err) {
   let handle_open = fn() { Error(ConnectionTimeout) }
   let handle_close = fn(_) { Ok(Nil) }
+  let handle_event = fn(_) { Nil }
 
   Pool(
     size: 5,
@@ -74,9 +75,7 @@ pub fn new() -> Pool(conn, err) {
     queue_interval: 1000,
     handle_open:,
     handle_close:,
-    handle_idle: fn(_) { Nil },
-    handle_active: fn(_) { Nil },
-    error_to_string: None,
+    handle_event:,
   )
 }
 
@@ -139,28 +138,11 @@ pub fn on_close(
   Pool(..pool, handle_close:)
 }
 
-/// Sets the `Pool`'s `on_idle` function. The provided function will be
-/// called on connections when they're checked back in to the pool. If
-/// the connection is immediately passed to a waiting caller, the callback
-/// will not be called. The callback is also called on every connection
-/// at startup.
-@deprecated("Run this work in the caller.")
-pub fn on_idle(
+pub fn on_event(
   pool: Pool(conn, err),
-  handle_idle: fn(conn) -> Nil,
+  handle_event: fn(Event(err)) -> Nil,
 ) -> Pool(conn, err) {
-  Pool(..pool, handle_idle:)
-}
-
-/// Sets the `Pool`'s `on_active` function. The provided function will be
-/// called on connections as they're removed from the pool's list of
-/// idle connections and become active.
-@deprecated("Run this work in the caller.")
-pub fn on_active(
-  pool: Pool(conn, err),
-  handle_active: fn(conn) -> Nil,
-) -> Pool(conn, err) {
-  Pool(..pool, handle_active:)
+  Pool(..pool, handle_event:)
 }
 
 /// Sets the CoDel queue target in milliseconds. This is the maximum
@@ -177,17 +159,6 @@ pub fn queue_interval(pool: Pool(conn, err), interval: Int) -> Pool(conn, err) {
   // Clamp to a 1ms floor: a 0ms interval would busy-spin the poll loop and a
   // negative interval would crash `send_after` during initialisation.
   Pool(..pool, queue_interval: int.max(interval, 1))
-}
-
-/// Sets a function used to convert the `Pool`'s `err` type into a `String`
-/// for logging. When set, `ConnectionError`s encountered internally by the
-/// pool (for example during startup) are logged using this function.
-@deprecated("Handle logging in the caller.")
-pub fn error_to_string(
-  pool: Pool(conn, err),
-  to_string: fn(err) -> String,
-) -> Pool(conn, err) {
-  Pool(..pool, error_to_string: Some(to_string))
 }
 
 // --- Internal types ---
@@ -473,11 +444,13 @@ fn initialise_pool(
 
   let connections =
     connect(pool, max_idle(pool), [])
-    |> result.map_error(log_error(pool.error_to_string, _))
+    |> result.map_error(fn(pool_error) {
+      pool.handle_event(ErrorEvent(pool_error))
+
+      "(db_pool) Failed to open pool connections"
+    })
 
   use conns <- result.map(connections)
-
-  list.each(conns, pool.handle_idle)
 
   let now = time.now(clock)
 
@@ -619,41 +592,17 @@ fn handle_running(
       |> actor.continue
     }
     PoolExit(exit) -> {
-      let mode = exit_reason_to_drain_mode(exit.reason)
+      state.pool.handle_event(ExitEvent(exit.reason))
+
+      let mode = case exit.reason {
+        process.Normal -> DrainExitNormal
+        process.Killed -> DrainExitKilled
+        process.Abnormal(_reason) -> DrainExitAbnormal
+      }
 
       begin_shutdown(state, mode)
     }
     Shutdown(client:) -> begin_shutdown(state, DrainShutdown(client))
-  }
-}
-
-fn exit_reason_to_drain_mode(reason: process.ExitReason) -> DrainMode(err) {
-  case reason {
-    process.Normal -> {
-      logging.log(logging.Info, "Normal Pool Exit")
-
-      DrainExitNormal
-    }
-    process.Killed -> {
-      logging.log(logging.Warning, "Pool Killed")
-
-      DrainExitKilled
-    }
-    process.Abnormal(reason) -> {
-      let decoder = {
-        atom.decoder()
-        |> decode.map(atom.to_string)
-        |> decode.one_of(or: [decode.string])
-      }
-
-      reason
-      |> decode.run(decoder)
-      |> result.map(string.append("Abnormal Pool Exit: ", _))
-      |> result.unwrap(or: "Abnormal Pool Exit")
-      |> logging.log(logging.Warning, _)
-
-      DrainExitAbnormal
-    }
   }
 }
 
@@ -796,8 +745,6 @@ fn do_checkout(
 
         let active = dict.insert(state.active, caller, activated)
 
-        state.pool.handle_active(conn)
-
         actor.send(client, Ok(conn))
 
         Ok(State(..state, idle: rest, active:))
@@ -841,7 +788,8 @@ fn do_checkin(
     use <- bool.lazy_guard(when: prev.conn == conn, return:)
 
     "(db_pool) unexpected connection checked in for the current process"
-    |> logging.log(logging.Warning, _)
+    |> WarningEvent
+    |> state.pool.handle_event
 
     state
   })
@@ -1071,13 +1019,9 @@ fn retry_if_demand(
 // discarded: the connection is already gone from the pool's bookkeeping, so
 // the error is the only signal that a real connection may have leaked.
 fn close_conn(state: State(conn, err), conn: conn) -> Nil {
-  case state.pool.handle_close(conn) {
-    Ok(_) -> Nil
-    Error(err) -> {
-      let _ = log_error(state.pool.error_to_string, err)
-      Nil
-    }
-  }
+  state.pool.handle_close(conn)
+  |> result.map_error(fn(err) { state.pool.handle_event(ErrorEvent(err)) })
+  |> result.unwrap(Nil)
 }
 
 /// Handles the outcome of an in-flight open. The opener is reconciled by
@@ -1105,7 +1049,7 @@ fn do_open_result(
       |> codel_dequeue(now, conn)
     })
     |> result.try_recover(fn(pool_error) {
-      let _ = log_error(state.pool.error_to_string, pool_error)
+      state.pool.handle_event(ErrorEvent(pool_error))
 
       Ok(retry_if_demand(state, backoff))
     })
@@ -1233,7 +1177,6 @@ fn push_idle(
       State(..state, current_size: state.current_size - 1)
     }
     False -> {
-      state.pool.handle_idle(conn)
       State(..state, idle: [Idle(conn:, since: now), ..state.idle])
     }
   }
@@ -1266,8 +1209,6 @@ fn serve_waiter(
 
   process.send(waiting.client, Ok(conn))
 
-  state.pool.handle_active(conn)
-
   State(..state, active:)
 }
 
@@ -1299,37 +1240,6 @@ fn start_poll(
 }
 
 // --- Helpers ---
-
-// Renders a `PoolError` into the log/InitFailed string, using the optional
-// `error_to_string` to describe the wrapped `ConnectionError` payload.
-fn describe_error(
-  error_to_string: Option(fn(err) -> String),
-  pool_error: PoolError(err),
-) -> String {
-  let err_string = case pool_error {
-    ConnectionError(err) ->
-      case error_to_string {
-        Some(to_string) -> "ConnectionError: " <> to_string(err)
-        None -> "ConnectionError"
-      }
-    ConnectionTimeout -> "ConnectionTimeout"
-    ConnectionUnavailable -> "ConnectionUnavailable"
-  }
-
-  "(db_pool) " <> err_string
-}
-
-// Logs a `PoolError` and returns the rendered message (used as the
-// `InitFailed` reason at startup).
-fn log_error(
-  error_to_string: Option(fn(err) -> String),
-  pool_error: PoolError(err),
-) -> String {
-  let message = describe_error(error_to_string, pool_error)
-  logging.log(logging.Error, message)
-
-  message
-}
 
 fn drop_waiter(waiting: Waiting(conn, PoolError(err))) -> Nil {
   actor.send(waiting.client, Error(ConnectionUnavailable))

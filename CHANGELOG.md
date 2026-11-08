@@ -1,5 +1,20 @@
 # Changelog
 
+## 4.0.0
+
+### New features
+
+- Added `on_event` and `Event`, reporting `ErrorEvent`, `ExitEvent` and
+  `WarningEvent`.
+
+### Breaking changes
+
+- Removed `on_idle` and `on_active`.
+- Removed `error_to_string`.
+- Removed the `logging` dependency. Failed opens, failed closes, exit reasons and
+  ignored check-ins arrive at `on_event`; nothing is reported unless it is set.
+- `start` reports `InitFailed("Failed to open pool connections")`.
+
 ## 3.1.0
 
 ### Bug fixes
