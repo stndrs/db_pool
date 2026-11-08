@@ -1,5 +1,12 @@
 # Changelog
 
+## 4.0.0
+
+### Breaking changes
+
+- Removed `on_idle` and `on_active`.
+- Removed `error_to_string`.
+
 ## 3.1.0
 
 ### Bug fixes

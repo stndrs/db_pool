@@ -55,9 +55,6 @@ pub opaque type Pool(conn, err) {
     queue_interval: Int,
     handle_open: fn() -> Result(conn, PoolError(err)),
     handle_close: fn(conn) -> Result(Nil, PoolError(err)),
-    handle_idle: fn(conn) -> Nil,
-    handle_active: fn(conn) -> Nil,
-    error_to_string: Option(fn(err) -> String),
   )
 }
 
@@ -74,9 +71,6 @@ pub fn new() -> Pool(conn, err) {
     queue_interval: 1000,
     handle_open:,
     handle_close:,
-    handle_idle: fn(_) { Nil },
-    handle_active: fn(_) { Nil },
-    error_to_string: None,
   )
 }
 
@@ -139,30 +133,6 @@ pub fn on_close(
   Pool(..pool, handle_close:)
 }
 
-/// Sets the `Pool`'s `on_idle` function. The provided function will be
-/// called on connections when they're checked back in to the pool. If
-/// the connection is immediately passed to a waiting caller, the callback
-/// will not be called. The callback is also called on every connection
-/// at startup.
-@deprecated("Run this work in the caller.")
-pub fn on_idle(
-  pool: Pool(conn, err),
-  handle_idle: fn(conn) -> Nil,
-) -> Pool(conn, err) {
-  Pool(..pool, handle_idle:)
-}
-
-/// Sets the `Pool`'s `on_active` function. The provided function will be
-/// called on connections as they're removed from the pool's list of
-/// idle connections and become active.
-@deprecated("Run this work in the caller.")
-pub fn on_active(
-  pool: Pool(conn, err),
-  handle_active: fn(conn) -> Nil,
-) -> Pool(conn, err) {
-  Pool(..pool, handle_active:)
-}
-
 /// Sets the CoDel queue target in milliseconds. This is the maximum
 /// acceptable queue delay before the pool considers itself overloaded.
 /// Defaults to 50ms.
@@ -177,17 +147,6 @@ pub fn queue_interval(pool: Pool(conn, err), interval: Int) -> Pool(conn, err) {
   // Clamp to a 1ms floor: a 0ms interval would busy-spin the poll loop and a
   // negative interval would crash `send_after` during initialisation.
   Pool(..pool, queue_interval: int.max(interval, 1))
-}
-
-/// Sets a function used to convert the `Pool`'s `err` type into a `String`
-/// for logging. When set, `ConnectionError`s encountered internally by the
-/// pool (for example during startup) are logged using this function.
-@deprecated("Handle logging in the caller.")
-pub fn error_to_string(
-  pool: Pool(conn, err),
-  to_string: fn(err) -> String,
-) -> Pool(conn, err) {
-  Pool(..pool, error_to_string: Some(to_string))
 }
 
 // --- Internal types ---
@@ -473,11 +432,9 @@ fn initialise_pool(
 
   let connections =
     connect(pool, max_idle(pool), [])
-    |> result.map_error(log_error(pool.error_to_string, _))
+    |> result.map_error(log_error)
 
   use conns <- result.map(connections)
-
-  list.each(conns, pool.handle_idle)
 
   let now = time.now(clock)
 
@@ -796,8 +753,6 @@ fn do_checkout(
 
         let active = dict.insert(state.active, caller, activated)
 
-        state.pool.handle_active(conn)
-
         actor.send(client, Ok(conn))
 
         Ok(State(..state, idle: rest, active:))
@@ -1074,7 +1029,7 @@ fn close_conn(state: State(conn, err), conn: conn) -> Nil {
   case state.pool.handle_close(conn) {
     Ok(_) -> Nil
     Error(err) -> {
-      let _ = log_error(state.pool.error_to_string, err)
+      let _ = log_error(err)
       Nil
     }
   }
@@ -1105,7 +1060,7 @@ fn do_open_result(
       |> codel_dequeue(now, conn)
     })
     |> result.try_recover(fn(pool_error) {
-      let _ = log_error(state.pool.error_to_string, pool_error)
+      let _ = log_error(pool_error)
 
       Ok(retry_if_demand(state, backoff))
     })
@@ -1233,7 +1188,6 @@ fn push_idle(
       State(..state, current_size: state.current_size - 1)
     }
     False -> {
-      state.pool.handle_idle(conn)
       State(..state, idle: [Idle(conn:, since: now), ..state.idle])
     }
   }
@@ -1265,8 +1219,6 @@ fn serve_waiter(
   let active = dict.insert(state.active, waiting.caller, activated)
 
   process.send(waiting.client, Ok(conn))
-
-  state.pool.handle_active(conn)
 
   State(..state, active:)
 }
@@ -1300,18 +1252,10 @@ fn start_poll(
 
 // --- Helpers ---
 
-// Renders a `PoolError` into the log/InitFailed string, using the optional
-// `error_to_string` to describe the wrapped `ConnectionError` payload.
-fn describe_error(
-  error_to_string: Option(fn(err) -> String),
-  pool_error: PoolError(err),
-) -> String {
+// Renders a `PoolError` into the log/InitFailed string.
+fn describe_error(pool_error: PoolError(err)) -> String {
   let err_string = case pool_error {
-    ConnectionError(err) ->
-      case error_to_string {
-        Some(to_string) -> "ConnectionError: " <> to_string(err)
-        None -> "ConnectionError"
-      }
+    ConnectionError(_) -> "ConnectionError"
     ConnectionTimeout -> "ConnectionTimeout"
     ConnectionUnavailable -> "ConnectionUnavailable"
   }
@@ -1321,11 +1265,8 @@ fn describe_error(
 
 // Logs a `PoolError` and returns the rendered message (used as the
 // `InitFailed` reason at startup).
-fn log_error(
-  error_to_string: Option(fn(err) -> String),
-  pool_error: PoolError(err),
-) -> String {
-  let message = describe_error(error_to_string, pool_error)
+fn log_error(pool_error: PoolError(err)) -> String {
+  let message = describe_error(pool_error)
   logging.log(logging.Error, message)
 
   message

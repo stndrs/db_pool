@@ -115,8 +115,6 @@ fn run_scenario(scenario: Scenario) -> Nil {
     |> db_pool.size(scenario.pool_size)
     |> db_pool.on_open(fn() { Ok(Nil) })
     |> db_pool.on_close(fn(_) { Ok(Nil) })
-    |> db_pool.on_idle(fn(_) { Nil })
-    |> db_pool.on_active(fn(_) { Nil })
 
   let assert Ok(pool) = db_pool.start(pool, name, 5000)
 
