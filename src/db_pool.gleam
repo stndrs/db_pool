@@ -703,16 +703,12 @@ fn handle_draining(
       actor.send(client, Error(ConnectionUnavailable))
       actor.continue(state)
     }
-    CheckIn(conn:, ..) -> {
-      let _ = state.pool.handle_close(conn)
-      actor.continue(state)
-    }
     Shutdown(client:) -> {
       actor.send(client, Error(ConnectionUnavailable))
       actor.continue(state)
     }
-    // Poll, Timeout, DeadlineExpired, RetryOpen, CloseIdle, PoolExit do
-    // nothing while draining.
+    // Checkin, Poll, Timeout, DeadlineExpired, RetryOpen, CloseIdle, PoolExit
+    // do nothing while draining.
     _ -> actor.continue(state)
   }
 }

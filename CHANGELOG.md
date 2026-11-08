@@ -6,8 +6,8 @@
 
 - Opening connections at startup closes all open connections if one fails to open.
 - A check-in for a connection the caller no longer holds now logs and is
-  ignored. It previously released the caller's current connection, which could
-  return a connection still in use to another caller.
+  ignored.
+- Checkin no-ops while the pool is draining
 
 ### New features
 
