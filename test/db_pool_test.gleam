@@ -24,6 +24,31 @@ pub fn new_error_test() {
   let assert Error(actor.InitFailed(_)) = db_pool.start(db_pool, name, 200)
 }
 
+pub fn partial_startup_failure_closes_opened_connections_test() {
+  let opened = atomic.new()
+  let closed = atomic.new()
+
+  let pool =
+    db_pool.new()
+    |> db_pool.size(3)
+    |> db_pool.on_open(fn() {
+      case atomic.add_get(opened, 1) {
+        1 -> Ok(reference.new())
+        _ -> Error(Nil)
+      }
+    })
+    |> db_pool.on_close(fn(_) {
+      atomic.add(closed, 1)
+      Ok(Nil)
+    })
+
+  let name = process.new_name("db_pool_test")
+  let assert Error(actor.InitFailed(_)) = db_pool.start(pool, name, 200)
+
+  // The connection opened before the failure is closed, not leaked.
+  assert atomic.get(closed) == 1
+}
+
 pub fn start_test() {
   let new_pool =
     db_pool.new()

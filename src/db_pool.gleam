@@ -469,8 +469,7 @@ fn initialise_pool(
     |> process.select_monitors(CallerDown)
 
   let connections =
-    list.repeat("", max_idle(pool))
-    |> list.try_map(fn(_) { pool.handle_open() })
+    connect(pool, max_idle(pool), [])
     |> result.map_error(log_error(pool.error_to_string, _))
 
   use conns <- result.map(connections)
@@ -526,6 +525,25 @@ fn initialise_pool(
   actor.initialised(state)
   |> actor.selecting(selector)
   |> actor.returning(self)
+}
+
+fn connect(
+  pool: Pool(conn, err),
+  count: Int,
+  opened: List(conn),
+) -> Result(List(conn), PoolError(err)) {
+  case count {
+    0 -> Ok(opened)
+    _ -> {
+      pool.handle_open()
+      |> result.try(fn(conn) { connect(pool, count - 1, [conn, ..opened]) })
+      |> result.map_error(fn(err) {
+        list.each(opened, pool.handle_close)
+
+        err
+      })
+    }
+  }
 }
 
 fn handle_message(
