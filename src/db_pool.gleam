@@ -2,8 +2,6 @@ import db_pool/internal/codel.{type Codel}
 import db_pool/internal/time
 import gleam/bool
 import gleam/dict.{type Dict}
-import gleam/dynamic/decode
-import gleam/erlang/atom
 import gleam/erlang/process.{type Pid, type Subject}
 import gleam/int
 import gleam/list
@@ -12,9 +10,7 @@ import gleam/order
 import gleam/otp/actor
 import gleam/otp/supervision
 import gleam/result
-import gleam/string
 import gleam/time/duration.{type Duration}
-import logging
 
 fn reconnect_min() -> Duration {
   duration.milliseconds(1000)
@@ -44,6 +40,12 @@ pub type PoolError(err) {
   ConnectionUnavailable
 }
 
+pub type Event(err) {
+  ErrorEvent(PoolError(err))
+  ExitEvent(process.ExitReason)
+  WarningEvent(String)
+}
+
 /// A `Pool` configuration. Holds the size of the pool and functions
 /// for opening and closing connections.
 pub opaque type Pool(conn, err) {
@@ -55,6 +57,7 @@ pub opaque type Pool(conn, err) {
     queue_interval: Int,
     handle_open: fn() -> Result(conn, PoolError(err)),
     handle_close: fn(conn) -> Result(Nil, PoolError(err)),
+    handle_event: fn(Event(err)) -> Nil,
   )
 }
 
@@ -62,6 +65,7 @@ pub opaque type Pool(conn, err) {
 pub fn new() -> Pool(conn, err) {
   let handle_open = fn() { Error(ConnectionTimeout) }
   let handle_close = fn(_) { Ok(Nil) }
+  let handle_event = fn(_) { Nil }
 
   Pool(
     size: 5,
@@ -71,6 +75,7 @@ pub fn new() -> Pool(conn, err) {
     queue_interval: 1000,
     handle_open:,
     handle_close:,
+    handle_event:,
   )
 }
 
@@ -131,6 +136,13 @@ pub fn on_close(
   }
 
   Pool(..pool, handle_close:)
+}
+
+pub fn on_event(
+  pool: Pool(conn, err),
+  handle_event: fn(Event(err)) -> Nil,
+) -> Pool(conn, err) {
+  Pool(..pool, handle_event:)
 }
 
 /// Sets the CoDel queue target in milliseconds. This is the maximum
@@ -432,7 +444,11 @@ fn initialise_pool(
 
   let connections =
     connect(pool, max_idle(pool), [])
-    |> result.map_error(log_error)
+    |> result.map_error(fn(pool_error) {
+      pool.handle_event(ErrorEvent(pool_error))
+
+      "(db_pool) Failed to open pool connections"
+    })
 
   use conns <- result.map(connections)
 
@@ -576,41 +592,17 @@ fn handle_running(
       |> actor.continue
     }
     PoolExit(exit) -> {
-      let mode = exit_reason_to_drain_mode(exit.reason)
+      state.pool.handle_event(ExitEvent(exit.reason))
+
+      let mode = case exit.reason {
+        process.Normal -> DrainExitNormal
+        process.Killed -> DrainExitKilled
+        process.Abnormal(_reason) -> DrainExitAbnormal
+      }
 
       begin_shutdown(state, mode)
     }
     Shutdown(client:) -> begin_shutdown(state, DrainShutdown(client))
-  }
-}
-
-fn exit_reason_to_drain_mode(reason: process.ExitReason) -> DrainMode(err) {
-  case reason {
-    process.Normal -> {
-      logging.log(logging.Info, "Normal Pool Exit")
-
-      DrainExitNormal
-    }
-    process.Killed -> {
-      logging.log(logging.Warning, "Pool Killed")
-
-      DrainExitKilled
-    }
-    process.Abnormal(reason) -> {
-      let decoder = {
-        atom.decoder()
-        |> decode.map(atom.to_string)
-        |> decode.one_of(or: [decode.string])
-      }
-
-      reason
-      |> decode.run(decoder)
-      |> result.map(string.append("Abnormal Pool Exit: ", _))
-      |> result.unwrap(or: "Abnormal Pool Exit")
-      |> logging.log(logging.Warning, _)
-
-      DrainExitAbnormal
-    }
   }
 }
 
@@ -796,7 +788,8 @@ fn do_checkin(
     use <- bool.lazy_guard(when: prev.conn == conn, return:)
 
     "(db_pool) unexpected connection checked in for the current process"
-    |> logging.log(logging.Warning, _)
+    |> WarningEvent
+    |> state.pool.handle_event
 
     state
   })
@@ -1026,13 +1019,9 @@ fn retry_if_demand(
 // discarded: the connection is already gone from the pool's bookkeeping, so
 // the error is the only signal that a real connection may have leaked.
 fn close_conn(state: State(conn, err), conn: conn) -> Nil {
-  case state.pool.handle_close(conn) {
-    Ok(_) -> Nil
-    Error(err) -> {
-      let _ = log_error(err)
-      Nil
-    }
-  }
+  state.pool.handle_close(conn)
+  |> result.map_error(fn(err) { state.pool.handle_event(ErrorEvent(err)) })
+  |> result.unwrap(Nil)
 }
 
 /// Handles the outcome of an in-flight open. The opener is reconciled by
@@ -1060,7 +1049,7 @@ fn do_open_result(
       |> codel_dequeue(now, conn)
     })
     |> result.try_recover(fn(pool_error) {
-      let _ = log_error(pool_error)
+      state.pool.handle_event(ErrorEvent(pool_error))
 
       Ok(retry_if_demand(state, backoff))
     })
@@ -1251,26 +1240,6 @@ fn start_poll(
 }
 
 // --- Helpers ---
-
-// Renders a `PoolError` into the log/InitFailed string.
-fn describe_error(pool_error: PoolError(err)) -> String {
-  let err_string = case pool_error {
-    ConnectionError(_) -> "ConnectionError"
-    ConnectionTimeout -> "ConnectionTimeout"
-    ConnectionUnavailable -> "ConnectionUnavailable"
-  }
-
-  "(db_pool) " <> err_string
-}
-
-// Logs a `PoolError` and returns the rendered message (used as the
-// `InitFailed` reason at startup).
-fn log_error(pool_error: PoolError(err)) -> String {
-  let message = describe_error(pool_error)
-  logging.log(logging.Error, message)
-
-  message
-}
 
 fn drop_waiter(waiting: Waiting(conn, PoolError(err))) -> Nil {
   actor.send(waiting.client, Error(ConnectionUnavailable))

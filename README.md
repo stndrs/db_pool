@@ -51,6 +51,24 @@ All checkout and shutdown operations return `Result(value, PoolError(err))`. The
 - **`ConnectionTimeout`** — the checkout request timed out while waiting in the queue. No connection was available within the specified `timeout`.
 - **`ConnectionUnavailable`** — the request was dropped by the CoDel algorithm due to sustained overload, the pool shut down while the caller was waiting, or the pool actor is unreachable.
 
+## Events
+
+Pool failures are reported through `on_event`. Callers can provide an `on_event` handler to report failures as needed.
+
+```gleam
+let db_pool =
+  db_pool.new()
+  |> db_pool.on_open(database.open)
+  |> db_pool.on_close(database.close)
+  |> db_pool.on_event(fn(event) {
+    case event {
+      db_pool.ErrorEvent(error) -> report_error(error)
+      db_pool.ExitEvent(reason) -> report_exit(reason)
+      db_pool.WarningEvent(message) -> report_warning(message)
+    }
+  })
+```
+
 ## Checkout and checkin
 
 `with_connection` (shown above) is the recommended API — it automatically checks the connection back in when the callback returns. For cases where you need manual control over the connection lifecycle, use `checkout` and `checkin` directly:
