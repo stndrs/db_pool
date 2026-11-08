@@ -916,18 +916,21 @@ fn do_expire(
     let now = time.now(state.clock)
     let expires_at = time.advance(sent_at, by: timeout)
 
-    use <- bool.lazy_guard(
-      when: time.compare(now, expires_at) == order.Lt,
-      return: fn() {
-        let remaining_ms =
-          duration.to_milliseconds(time.since(from: now, to: expires_at))
+    let return = fn() {
+      let remaining_ms =
+        time.since(from: now, to: expires_at)
+        |> duration.to_milliseconds
+        |> int.max(1)
 
-        let _timer =
-          process.send_after(state.self, remaining_ms, Timeout(key, timeout))
+      let _timer =
+        process.send_after(state.self, remaining_ms, Timeout(key, timeout))
 
-        state
-      },
-    )
+      state
+    }
+
+    let not_expired = time.compare(now, expires_at) == order.Lt
+
+    use <- bool.lazy_guard(when: not_expired, return:)
 
     codel.delete(state.codel, key)
     |> result.map(fn(_) {
