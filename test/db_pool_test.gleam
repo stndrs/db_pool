@@ -554,7 +554,12 @@ pub fn opener_panic_does_not_leak_capacity_test() {
     |> db_pool.on_open(fn() {
       case table.lookup(flag, "mode") {
         Ok("ok") -> Ok(Nil)
-        _ -> panic as "boom"
+        _ -> {
+          let assert process.Abnormal(_reason) =
+            assert_panics(fn() { panic as "boom" })
+
+          Error(Nil)
+        }
       }
     })
     |> db_pool.on_close(fn(_) { Ok(Nil) })
@@ -1899,4 +1904,21 @@ pub fn stale_checkin_does_not_release_a_newer_checkout_test() {
 
   db_pool.checkin(pool, current)
   let assert Ok(_) = db_pool.shutdown(pool, 200)
+}
+
+fn assert_panics(f: fn() -> a) -> process.ExitReason {
+  process.trap_exits(True)
+  let pid = process.spawn(f)
+
+  let assert Ok(process.ExitMessage(pid: crashed, reason:)) =
+    process.new_selector()
+    |> process.select_trapped_exits(fn(message) { message })
+    |> process.selector_receive(1000)
+
+  assert crashed == pid
+
+  let assert process.Abnormal(reason) = reason
+
+  process.trap_exits(False)
+  process.Abnormal(reason)
 }

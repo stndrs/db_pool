@@ -14,7 +14,6 @@ import gleam/otp/supervision
 import gleam/result
 import gleam/string
 import gleam/time/duration.{type Duration}
-import logging
 
 fn reconnect_min() -> Duration {
   duration.milliseconds(1000)
@@ -44,6 +43,21 @@ pub type PoolError(err) {
   ConnectionUnavailable
 }
 
+pub type LogLevel {
+  Emergency
+  Alert
+  Critical
+  Err
+  Warning
+  Notice
+  Info
+  Debug
+}
+
+pub type Event {
+  Log(level: LogLevel, message: String)
+}
+
 /// A `Pool` configuration. Holds the size of the pool and functions
 /// for opening and closing connections.
 pub opaque type Pool(conn, err) {
@@ -57,6 +71,7 @@ pub opaque type Pool(conn, err) {
     handle_close: fn(conn) -> Result(Nil, PoolError(err)),
     handle_idle: fn(conn) -> Nil,
     handle_active: fn(conn) -> Nil,
+    handle_event: fn(Event) -> Nil,
     error_to_string: Option(fn(err) -> String),
   )
 }
@@ -76,6 +91,7 @@ pub fn new() -> Pool(conn, err) {
     handle_close:,
     handle_idle: fn(_) { Nil },
     handle_active: fn(_) { Nil },
+    handle_event: fn(_) { Nil },
     error_to_string: None,
   )
 }
@@ -470,7 +486,7 @@ fn initialise_pool(
 
   let connections =
     connect(pool, max_idle(pool), [])
-    |> result.map_error(log_error(pool.error_to_string, _))
+    |> result.map_error(log_error(pool, _))
 
   use conns <- result.map(connections)
 
@@ -616,7 +632,7 @@ fn handle_running(
       |> actor.continue
     }
     PoolExit(exit) -> {
-      let mode = exit_reason_to_drain_mode(exit.reason)
+      let mode = exit_reason_to_drain_mode(exit.reason, state.pool.handle_event)
 
       begin_shutdown(state, mode)
     }
@@ -624,15 +640,18 @@ fn handle_running(
   }
 }
 
-fn exit_reason_to_drain_mode(reason: process.ExitReason) -> DrainMode(err) {
+fn exit_reason_to_drain_mode(
+  reason: process.ExitReason,
+  handle_event: fn(Event) -> Nil,
+) -> DrainMode(err) {
   case reason {
     process.Normal -> {
-      logging.log(logging.Info, "Normal Pool Exit")
+      Log(Info, "Normal Pool Exit") |> handle_event
 
       DrainExitNormal
     }
     process.Killed -> {
-      logging.log(logging.Warning, "Pool Killed")
+      Log(Warning, "Pool Killed") |> handle_event
 
       DrainExitKilled
     }
@@ -647,7 +666,8 @@ fn exit_reason_to_drain_mode(reason: process.ExitReason) -> DrainMode(err) {
       |> decode.run(decoder)
       |> result.map(string.append("Abnormal Pool Exit: ", _))
       |> result.unwrap(or: "Abnormal Pool Exit")
-      |> logging.log(logging.Warning, _)
+      |> Log(Warning, _)
+      |> handle_event
 
       DrainExitAbnormal
     }
@@ -838,7 +858,8 @@ fn do_checkin(
     use <- bool.lazy_guard(when: prev.conn == conn, return:)
 
     "(db_pool) unexpected connection checked in for the current process"
-    |> logging.log(logging.Warning, _)
+    |> Log(Warning, _)
+    |> state.pool.handle_event
 
     state
   })
@@ -1071,7 +1092,7 @@ fn close_conn(state: State(conn, err), conn: conn) -> Nil {
   case state.pool.handle_close(conn) {
     Ok(_) -> Nil
     Error(err) -> {
-      let _ = log_error(state.pool.error_to_string, err)
+      let _ = log_error(state.pool, err)
       Nil
     }
   }
@@ -1102,7 +1123,7 @@ fn do_open_result(
       |> codel_dequeue(now, conn)
     })
     |> result.try_recover(fn(pool_error) {
-      let _ = log_error(state.pool.error_to_string, pool_error)
+      let _ = log_error(state.pool, pool_error)
 
       Ok(retry_if_demand(state, backoff))
     })
@@ -1318,12 +1339,10 @@ fn describe_error(
 
 // Logs a `PoolError` and returns the rendered message (used as the
 // `InitFailed` reason at startup).
-fn log_error(
-  error_to_string: Option(fn(err) -> String),
-  pool_error: PoolError(err),
-) -> String {
-  let message = describe_error(error_to_string, pool_error)
-  logging.log(logging.Error, message)
+fn log_error(pool: Pool(conn, err), pool_error: PoolError(err)) -> String {
+  let message = describe_error(pool.error_to_string, pool_error)
+  Log(Err, message) |> pool.handle_event
+
   message
 }
 
