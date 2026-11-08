@@ -126,7 +126,8 @@ pub fn on_open(
 }
 
 /// Sets the `Pool`'s `on_close` function. The provided function will be
-/// called on each connection when the pool is shut down or exits.
+/// called when a connection is discarded, its owner dies, its lease expires,
+/// or the pool shuts down or exits.
 pub fn on_close(
   pool: Pool(conn, err),
   handle_close: fn(conn) -> Result(Nil, err),
@@ -143,6 +144,7 @@ pub fn on_close(
 /// the connection is immediately passed to a waiting caller, the callback
 /// will not be called. The callback is also called on every connection
 /// at startup.
+@deprecated("Run this work in the caller.")
 pub fn on_idle(
   pool: Pool(conn, err),
   handle_idle: fn(conn) -> Nil,
@@ -153,6 +155,7 @@ pub fn on_idle(
 /// Sets the `Pool`'s `on_active` function. The provided function will be
 /// called on connections as they're removed from the pool's list of
 /// idle connections and become active.
+@deprecated("Run this work in the caller.")
 pub fn on_active(
   pool: Pool(conn, err),
   handle_active: fn(conn) -> Nil,
@@ -179,6 +182,7 @@ pub fn queue_interval(pool: Pool(conn, err), interval: Int) -> Pool(conn, err) {
 /// Sets a function used to convert the `Pool`'s `err` type into a `String`
 /// for logging. When set, `ConnectionError`s encountered internally by the
 /// pool (for example during startup) are logged using this function.
+@deprecated("Handle logging in the caller.")
 pub fn error_to_string(
   pool: Pool(conn, err),
   to_string: fn(err) -> String,
@@ -307,6 +311,7 @@ pub opaque type Message(conn, err) {
     deadline: Duration,
   )
   CheckIn(caller: Pid, conn: conn)
+  Discard(caller: Pid, conn: conn)
   Timeout(key: Int, timeout: Duration)
   DeadlineExpired(caller: Pid, checkout_time: time.Instant)
   Poll(last_queue_key: Int)
@@ -378,10 +383,16 @@ pub fn checkout(
 ///
 /// Expects the `conn` value to be the same connection that was originally
 /// checked out by the calling process. If the calling process has no active
-/// connection the checkin is silently ignored.
+/// connection, or holds a different connection, the checkin is ignored.
 pub fn checkin(pool: Subject(Message(conn, err)), conn: conn) -> Nil {
   let caller = process.self()
   process.send(pool, CheckIn(caller:, conn:))
+}
+
+/// Discards a checked-out connection instead of returning it for reuse.
+pub fn discard(pool: Subject(Message(conn, err)), conn: conn) -> Nil {
+  let caller = process.self()
+  process.send(pool, Discard(caller:, conn:))
 }
 
 /// Checks out a connection from the pool and passes it to the provided
@@ -461,8 +472,7 @@ fn initialise_pool(
     |> process.select_monitors(CallerDown)
 
   let connections =
-    list.repeat("", max_idle(pool))
-    |> list.try_map(fn(_) { pool.handle_open() })
+    connect(pool, max_idle(pool), [])
     |> result.map_error(log_error(pool.error_to_string, _))
 
   use conns <- result.map(connections)
@@ -520,6 +530,25 @@ fn initialise_pool(
   |> actor.returning(self)
 }
 
+fn connect(
+  pool: Pool(conn, err),
+  count: Int,
+  opened: List(conn),
+) -> Result(List(conn), PoolError(err)) {
+  case count {
+    0 -> Ok(opened)
+    _ -> {
+      pool.handle_open()
+      |> result.try(fn(conn) { connect(pool, count - 1, [conn, ..opened]) })
+      |> result.map_error(fn(err) {
+        list.each(opened, pool.handle_close)
+
+        err
+      })
+    }
+  }
+}
+
 fn handle_message(
   state: State(conn, err),
   msg: Message(conn, err),
@@ -538,6 +567,11 @@ fn handle_running(
     CheckIn(caller:, conn:) -> {
       let state = do_checkin(state, caller, conn)
       actor.continue(state)
+    }
+    Discard(caller:, conn:) -> {
+      state
+      |> do_discard(caller, conn)
+      |> actor.continue
     }
     CheckOut(client:, caller:, timeout:, deadline:) -> {
       let state = {
@@ -654,7 +688,7 @@ fn handle_draining(
   case msg {
     OpenResult(pid:, result:, ..) -> {
       result
-      |> result.try(state.pool.handle_close)
+      |> result.map(close_conn(state, _))
       |> result.unwrap(Nil)
 
       state
@@ -672,16 +706,12 @@ fn handle_draining(
       actor.send(client, Error(ConnectionUnavailable))
       actor.continue(state)
     }
-    CheckIn(conn:, ..) -> {
-      let _ = state.pool.handle_close(conn)
-      actor.continue(state)
-    }
     Shutdown(client:) -> {
       actor.send(client, Error(ConnectionUnavailable))
       actor.continue(state)
     }
-    // Poll, Timeout, DeadlineExpired, RetryOpen, CloseIdle, PoolExit do
-    // nothing while draining.
+    // Checkin, Poll, Timeout, DeadlineExpired, RetryOpen, CloseIdle, PoolExit
+    // do nothing while draining.
     _ -> actor.continue(state)
   }
 }
@@ -787,32 +817,52 @@ fn do_checkin(
 ) -> State(conn, err) {
   dict.get(state.active, caller)
   |> result.map(fn(prev) {
-    case prev.conn == conn {
-      True -> Nil
-      False -> {
-        "(db_pool) unexpected connection checked in for the current process"
-        |> logging.log(logging.Warning, _)
+    let return = fn() {
+      case prev.depth > 1 {
+        True -> {
+          let active =
+            state.active
+            |> dict.insert(caller, Active(..prev, depth: prev.depth - 1))
+
+          State(..state, active:)
+        }
+        False -> {
+          let _ = process.cancel_timer(prev.deadline_timer)
+          process.demonitor_process(prev.monitor)
+          let active = dict.delete(state.active, caller)
+          let state = State(..state, active:)
+
+          let now = time.now(state.clock)
+          codel_dequeue(state, now, prev.conn)
+        }
       }
     }
 
-    case prev.depth > 1 {
-      True -> {
-        let active =
-          state.active
-          |> dict.insert(caller, Active(..prev, depth: prev.depth - 1))
+    use <- bool.lazy_guard(when: prev.conn == conn, return:)
 
-        State(..state, active:)
-      }
-      False -> {
-        let _ = process.cancel_timer(prev.deadline_timer)
-        process.demonitor_process(prev.monitor)
-        let active = dict.delete(state.active, caller)
-        let state = State(..state, active:)
+    "(db_pool) unexpected connection checked in for the current process"
+    |> logging.log(logging.Warning, _)
 
-        let now = time.now(state.clock)
-        codel_dequeue(state, now, prev.conn)
-      }
-    }
+    state
+  })
+  |> result.unwrap(state)
+}
+
+/// Called when a caller gives up a connection without returning it for reuse.
+/// `close_active` closes it and only serves a waiter with its replacement, so
+/// the discarded connection never re-enters the pool. Mismatched and stale
+/// discards are ignored.
+fn do_discard(
+  state: State(conn, err),
+  caller: Pid,
+  conn: conn,
+) -> State(conn, err) {
+  dict.get(state.active, caller)
+  |> result.map(fn(active) {
+    use <- bool.guard(when: active.conn != conn, return: state)
+
+    let _ = process.cancel_timer(active.deadline_timer)
+    close_active(state, active, caller)
   })
   |> result.unwrap(state)
 }
@@ -869,18 +919,21 @@ fn do_expire(
     let now = time.now(state.clock)
     let expires_at = time.advance(sent_at, by: timeout)
 
-    use <- bool.lazy_guard(
-      when: time.compare(now, expires_at) == order.Lt,
-      return: fn() {
-        let remaining_ms =
-          duration.to_milliseconds(time.since(from: now, to: expires_at))
+    let return = fn() {
+      let remaining_ms =
+        time.since(from: now, to: expires_at)
+        |> duration.to_milliseconds
+        |> int.max(1)
 
-        let _timer =
-          process.send_after(state.self, remaining_ms, Timeout(key, timeout))
+      let _timer =
+        process.send_after(state.self, remaining_ms, Timeout(key, timeout))
 
-        state
-      },
-    )
+      state
+    }
+
+    let not_expired = time.compare(now, expires_at) == order.Lt
+
+    use <- bool.lazy_guard(when: not_expired, return:)
 
     codel.delete(state.codel, key)
     |> result.map(fn(_) {
@@ -949,7 +1002,7 @@ fn close_active(
 
   let active_dict = dict.delete(state.active, pid)
 
-  let _ = state.pool.handle_close(active.conn)
+  close_conn(state, active.conn)
   let state =
     State(..state, active: active_dict, current_size: state.current_size - 1)
 
@@ -1014,6 +1067,19 @@ fn retry_if_demand(
   state
 }
 
+// Run `on_close` for a connection. A failed close is logged rather than
+// discarded: the connection is already gone from the pool's bookkeeping, so
+// the error is the only signal that a real connection may have leaked.
+fn close_conn(state: State(conn, err), conn: conn) -> Nil {
+  case state.pool.handle_close(conn) {
+    Ok(_) -> Nil
+    Error(err) -> {
+      let _ = log_error(state.pool.error_to_string, err)
+      Nil
+    }
+  }
+}
+
 /// Handles the outcome of an in-flight open. The opener is reconciled by
 /// pid: if it is unknown (already handled via its down signal) an `Ok`
 /// connection is closed to avoid a leak and an `Error` is ignored.
@@ -1046,7 +1112,7 @@ fn do_open_result(
   })
   |> result.lazy_unwrap(fn() {
     open_result
-    |> result.try(state.pool.handle_close)
+    |> result.map(close_conn(state, _))
     |> result.unwrap(Nil)
 
     state
@@ -1101,10 +1167,7 @@ fn do_close_idle(state: State(conn, err)) -> State(conn, err) {
           == order.Gt
         })
 
-      list.each(expired, fn(idle) {
-        let _ = state.pool.handle_close(idle.conn)
-        Nil
-      })
+      list.each(expired, fn(idle) { close_conn(state, idle.conn) })
 
       let _close_timer =
         process.send_after(
@@ -1166,7 +1229,7 @@ fn push_idle(
 ) -> State(conn, err) {
   case list.length(state.idle) >= max_idle(state.pool) {
     True -> {
-      let _ = state.pool.handle_close(conn)
+      close_conn(state, conn)
       State(..state, current_size: state.current_size - 1)
     }
     False -> {
@@ -1264,6 +1327,7 @@ fn log_error(
 ) -> String {
   let message = describe_error(error_to_string, pool_error)
   logging.log(logging.Error, message)
+
   message
 }
 
@@ -1286,7 +1350,7 @@ fn close_each_active(state: State(conn, err)) -> State(conn, err) {
 
     process.demonitor_process(active.monitor)
 
-    let _ = state.pool.handle_close(active.conn)
+    close_conn(state, active.conn)
 
     Nil
   })
@@ -1295,11 +1359,7 @@ fn close_each_active(state: State(conn, err)) -> State(conn, err) {
 }
 
 fn close_idle(state: State(conn, err)) -> State(conn, err) {
-  list.each(state.idle, fn(idle) {
-    let _ = state.pool.handle_close(idle.conn)
-
-    Nil
-  })
+  list.each(state.idle, fn(idle) { close_conn(state, idle.conn) })
 
   state
 }

@@ -1,5 +1,30 @@
 # Changelog
 
+## 3.1.0
+
+### Bug fixes
+
+- Connections opened at startup are closed if a later open fails.
+- A check-in that arrives while draining no longer closes the connection again.
+- Failed `on_close` results are logged.
+- The checkout timeout timer has a minimum remaining delay of 1 ms.
+- A check-in for a connection the caller no longer holds is logged and ignored.
+
+### New features
+
+- Added `max_idle_connections`. `size` becomes the ceiling for open connections.
+- Added `max_idle_time`. Closes connections idle longer than the given
+  milliseconds.
+- Added `discard`. Releases a checked-out connection without returning it for
+  reuse.
+- Shutdown and pool exit wait for in-flight opens and close the connections that
+  arrive.
+
+### Deprecations
+
+- `on_idle` and `on_active`, and `error_to_string` need to be handled by callers
+  in the next major version.
+
 ## 3.0.0
 
 ### Bug fixes

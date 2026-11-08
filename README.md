@@ -119,7 +119,7 @@ The pool is started with a `Transient` restart strategy — it is restarted only
 
 ## Reconnection
 
-When a connection is lost (caller crash, deadline expiry, or unexpected exit), the pool closes the old connection and immediately attempts to open a replacement. If the replacement fails, the pool retries with exponential backoff and jitter — initial delay of 500 ms–1 s, capped at 30 s. No user configuration is needed; reconnection is automatic.
+When a connection is discarded, its owner crashes, or its deadline expires, the pool closes the old connection and immediately attempts to open a replacement. If the replacement fails, the pool retries with exponential backoff and jitter — initial delay of 500 ms–1 s, capped at 30 s. No user configuration is needed; reconnection is automatic.
 
 ## Development
 
