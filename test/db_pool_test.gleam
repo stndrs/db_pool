@@ -1744,6 +1744,35 @@ pub fn pool_exit_abnormal_test() {
   assert process.is_alive(pid) == False
 }
 
+pub fn pool_killed_test() {
+  let logs = process.new_subject()
+  let name = process.new_name("db_pool_test")
+
+  let pool =
+    db_pool.new()
+    |> db_pool.size(2)
+    |> db_pool.on_open(fn() { Ok(Nil) })
+    |> db_pool.on_close(fn(_) { Ok(Nil) })
+    |> db_pool.on_idle(fn(_) { Nil })
+    |> db_pool.on_active(fn(_) { Nil })
+    |> db_pool.on_event(logger(logs))
+
+  let assert Ok(pool) = db_pool.start(pool, name, 200)
+  let pool = pool.data
+
+  let assert Ok(pid) = process.subject_owner(pool)
+
+  // `process.kill` is untrappable, so the pool could not log or clean up. A
+  // `killed` reason is trappable and lands in the `Killed` branch.
+  process.send_abnormal_exit(pid, atom.create("killed"))
+
+  assert_logged(logs, db_pool.Warning, "Pool Killed")
+
+  process.sleep(50)
+
+  assert process.is_alive(pid) == False
+}
+
 // Many callers enqueued in rapid succession used to be able to collide on the
 // queue's nanosecond timestamp key, making `queue.push` return Error and
 // crashing the whole pool actor via a `let assert`.
