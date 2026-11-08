@@ -6,7 +6,7 @@
 
 - Connections opened at startup are closed if a later open fails.
 - A check-in that arrives while draining no longer closes the connection again.
-- Failed `on_close` results are reported through `on_event`.
+- Failed `on_close` results are logged.
 - The checkout timeout timer has a minimum remaining delay of 1 ms.
 - A check-in for a connection the caller no longer holds is logged and ignored.
 
@@ -17,14 +17,9 @@
   milliseconds.
 - Added `discard`. Releases a checked-out connection without returning it for
   reuse.
-- Added `on_event`, `Event` and `LogLevel` for the pool's internal events.
 - Added `error_to_string` to render the wrapped `ConnectionError` payload.
 - Shutdown and pool exit wait for in-flight opens and close the connections that
   arrive.
-
-### Breaking changes
-
-- Removed the `logging` dependency. Events are delivered to `on_event`.
 
 ## 3.0.0
 

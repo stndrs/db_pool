@@ -14,6 +14,7 @@ import gleam/otp/supervision
 import gleam/result
 import gleam/string
 import gleam/time/duration.{type Duration}
+import logging
 
 fn reconnect_min() -> Duration {
   duration.milliseconds(1000)
@@ -43,21 +44,6 @@ pub type PoolError(err) {
   ConnectionUnavailable
 }
 
-pub type LogLevel {
-  Emergency
-  Alert
-  Critical
-  Err
-  Warning
-  Notice
-  Info
-  Debug
-}
-
-pub type Event {
-  Log(level: LogLevel, message: String)
-}
-
 /// A `Pool` configuration. Holds the size of the pool and functions
 /// for opening and closing connections.
 pub opaque type Pool(conn, err) {
@@ -71,7 +57,6 @@ pub opaque type Pool(conn, err) {
     handle_close: fn(conn) -> Result(Nil, PoolError(err)),
     handle_idle: fn(conn) -> Nil,
     handle_active: fn(conn) -> Nil,
-    handle_event: fn(Event) -> Nil,
     error_to_string: Option(fn(err) -> String),
   )
 }
@@ -91,7 +76,6 @@ pub fn new() -> Pool(conn, err) {
     handle_close:,
     handle_idle: fn(_) { Nil },
     handle_active: fn(_) { Nil },
-    handle_event: fn(_) { Nil },
     error_to_string: None,
   )
 }
@@ -175,15 +159,6 @@ pub fn on_active(
   handle_active: fn(conn) -> Nil,
 ) -> Pool(conn, err) {
   Pool(..pool, handle_active:)
-}
-
-/// Sets the `Pool`'s `on_event` function. The provided function is called
-/// with every event the pool logs.
-pub fn on_event(
-  pool: Pool(conn, err),
-  handle_event: fn(Event) -> Nil,
-) -> Pool(conn, err) {
-  Pool(..pool, handle_event:)
 }
 
 /// Sets the CoDel queue target in milliseconds. This is the maximum
@@ -495,7 +470,7 @@ fn initialise_pool(
 
   let connections =
     connect(pool, max_idle(pool), [])
-    |> result.map_error(log_error(pool, _))
+    |> result.map_error(log_error(pool.error_to_string, _))
 
   use conns <- result.map(connections)
 
@@ -641,7 +616,7 @@ fn handle_running(
       |> actor.continue
     }
     PoolExit(exit) -> {
-      let mode = exit_reason_to_drain_mode(exit.reason, state.pool.handle_event)
+      let mode = exit_reason_to_drain_mode(exit.reason)
 
       begin_shutdown(state, mode)
     }
@@ -649,18 +624,15 @@ fn handle_running(
   }
 }
 
-fn exit_reason_to_drain_mode(
-  reason: process.ExitReason,
-  handle_event: fn(Event) -> Nil,
-) -> DrainMode(err) {
+fn exit_reason_to_drain_mode(reason: process.ExitReason) -> DrainMode(err) {
   case reason {
     process.Normal -> {
-      Log(Info, "Normal Pool Exit") |> handle_event
+      logging.log(logging.Info, "Normal Pool Exit")
 
       DrainExitNormal
     }
     process.Killed -> {
-      Log(Warning, "Pool Killed") |> handle_event
+      logging.log(logging.Warning, "Pool Killed")
 
       DrainExitKilled
     }
@@ -675,8 +647,7 @@ fn exit_reason_to_drain_mode(
       |> decode.run(decoder)
       |> result.map(string.append("Abnormal Pool Exit: ", _))
       |> result.unwrap(or: "Abnormal Pool Exit")
-      |> Log(Warning, _)
-      |> handle_event
+      |> logging.log(logging.Warning, _)
 
       DrainExitAbnormal
     }
@@ -867,8 +838,7 @@ fn do_checkin(
     use <- bool.lazy_guard(when: prev.conn == conn, return:)
 
     "(db_pool) unexpected connection checked in for the current process"
-    |> Log(Warning, _)
-    |> state.pool.handle_event
+    |> logging.log(logging.Warning, _)
 
     state
   })
@@ -1101,7 +1071,7 @@ fn close_conn(state: State(conn, err), conn: conn) -> Nil {
   case state.pool.handle_close(conn) {
     Ok(_) -> Nil
     Error(err) -> {
-      let _ = log_error(state.pool, err)
+      let _ = log_error(state.pool.error_to_string, err)
       Nil
     }
   }
@@ -1132,7 +1102,7 @@ fn do_open_result(
       |> codel_dequeue(now, conn)
     })
     |> result.try_recover(fn(pool_error) {
-      let _ = log_error(state.pool, pool_error)
+      let _ = log_error(state.pool.error_to_string, pool_error)
 
       Ok(retry_if_demand(state, backoff))
     })
@@ -1348,9 +1318,12 @@ fn describe_error(
 
 // Logs a `PoolError` and returns the rendered message (used as the
 // `InitFailed` reason at startup).
-fn log_error(pool: Pool(conn, err), pool_error: PoolError(err)) -> String {
-  let message = describe_error(pool.error_to_string, pool_error)
-  Log(Err, message) |> pool.handle_event
+fn log_error(
+  error_to_string: Option(fn(err) -> String),
+  pool_error: PoolError(err),
+) -> String {
+  let message = describe_error(error_to_string, pool_error)
+  logging.log(logging.Error, message)
 
   message
 }
